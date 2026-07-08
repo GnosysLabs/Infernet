@@ -798,6 +798,72 @@ fn installed_model_manifests(cache_config: &ShardCacheConfig) -> Vec<ModelManife
     manifests
 }
 
+fn installed_model_ids(cache_config: &ShardCacheConfig) -> Vec<String> {
+    let mut ids = installed_model_manifests(cache_config)
+        .into_iter()
+        .map(|manifest| manifest.model_id)
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+fn discovered_model_manifests(registry: &ShardRegistry) -> Vec<ModelManifest> {
+    let mut by_model = BTreeMap::<String, ModelManifest>::new();
+    for shard in registry
+        .advertisements()
+        .iter()
+        .flat_map(|advertisement| advertisement.hosted_shards.iter())
+    {
+        by_model
+            .entry(shard.model_id.clone())
+            .and_modify(|manifest| {
+                manifest.layer_count = manifest.layer_count.max(shard.layers.end);
+            })
+            .or_insert_with(|| ModelManifest {
+                model_id: shard.model_id.clone(),
+                display_name: display_name_from_model_id(&shard.model_id),
+                architecture: shard
+                    .metadata
+                    .as_ref()
+                    .map(|metadata| metadata.architecture.clone())
+                    .unwrap_or_else(|| "unknown".to_owned()),
+                layer_count: shard.layers.end,
+                hidden_size: 0,
+                activation_dtype: "f16".to_owned(),
+                runtime_kind: shard.runtime_kind.clone(),
+            });
+    }
+
+    by_model.into_values().collect()
+}
+
+fn model_status(manifest: &ModelManifest, installed: bool, runnable: bool) -> String {
+    if runnable {
+        return "Ready to chat".to_owned();
+    }
+
+    if manifest.runtime_kind == RuntimeKind::Demo {
+        return "Ready to chat".to_owned();
+    }
+
+    if !installed {
+        return "Available on the network".to_owned();
+    }
+
+    let Some(source_path) = source_path_for_model(&cache_config_placeholder(), &manifest.model_id) else {
+        return "Installed for sharing. Token execution is not connected yet.".to_owned();
+    };
+    if std::fs::metadata(source_path)
+        .map(|metadata| metadata.len() > MAX_SAFE_LOCAL_GGUF_BYTES)
+        .unwrap_or(false)
+    {
+        return "Installed for sharing. This model is too large for local fallback execution.".to_owned();
+    }
+
+    "Installed for sharing. Configure the split GGUF runtime to chat.".to_owned()
+}
+
 fn peer_view_from_advertisement(advertisement: &NodeAdvertisement) -> PeerView {
     PeerView {
         peer_id: advertisement.peer_id.clone(),
