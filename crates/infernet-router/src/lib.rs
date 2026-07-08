@@ -1,0 +1,317 @@
+use std::{collections::BTreeMap, fmt};
+
+use infernet_model::{LayerRange, ModelError, ModelManifest, validate_contiguous_coverage};
+use infernet_protocol::{NodeAdvertisement, RouteHop};
+use thiserror::Error;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingRanges(pub Vec<LayerRange>);
+
+impl fmt::Display for MissingRanges {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, range) in self.0.iter().enumerate() {
+            if index > 0 {
+                write!(formatter, ", ")?;
+            }
+
+            write!(formatter, "{}:{}", range.start, range.end)?;
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum RouterError {
+    #[error("no complete route for model {model_id}; missing layer ranges: {missing_ranges}")]
+    MissingRanges {
+        model_id: String,
+        missing_ranges: MissingRanges,
+    },
+    #[error("route has invalid coverage: {0}")]
+    InvalidCoverage(#[from] ModelError),
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ShardRegistry {
+    advertisements: BTreeMap<String, NodeAdvertisement>,
+}
+
+impl ShardRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn upsert(&mut self, advertisement: NodeAdvertisement) {
+        self.advertisements
+            .insert(advertisement.peer_id.clone(), advertisement);
+    }
+
+    pub fn extend(&mut self, advertisements: impl IntoIterator<Item = NodeAdvertisement>) {
+        for advertisement in advertisements {
+            self.upsert(advertisement);
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.advertisements.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.advertisements.is_empty()
+    }
+
+    pub fn advertisements(&self) -> Vec<NodeAdvertisement> {
+        self.advertisements.values().cloned().collect()
+    }
+
+    pub fn route_for_model(&self, manifest: &ModelManifest) -> Result<Vec<RouteHop>, RouterError> {
+        build_greedy_route(manifest, &self.advertisements())
+    }
+}
+
+pub fn build_greedy_route(
+    manifest: &ModelManifest,
+    advertisements: &[NodeAdvertisement],
+) -> Result<Vec<RouteHop>, RouterError> {
+    let missing_ranges = missing_layer_ranges(manifest, advertisements);
+    if !missing_ranges.is_empty() {
+        return Err(RouterError::MissingRanges {
+            model_id: manifest.model_id.clone(),
+            missing_ranges: MissingRanges(missing_ranges),
+        });
+    }
+
+    let mut cursor = 0;
+    let mut route = Vec::new();
+
+    while cursor < manifest.layer_count {
+        let candidate = advertisements
+            .iter()
+            .flat_map(|advertisement| {
+                advertisement
+                    .hosted_shards
+                    .iter()
+                    .map(move |shard| (advertisement, shard))
+            })
+            .filter(|(_, shard)| {
+                shard.model_id == manifest.model_id
+                    && shard.runtime_kind == manifest.runtime_kind
+                    && shard.layers.start <= cursor
+                    && shard.layers.end > cursor
+                    && shard.layers.end <= manifest.layer_count
+            })
+            .min_by_key(|(advertisement, shard)| {
+                (
+                    advertisement.latency_hint_ms.unwrap_or(u32::MAX),
+                    u32::MAX - shard.layers.end,
+                )
+            })
+            .expect("missing ranges are checked before route construction");
+
+        let (advertisement, shard) = candidate;
+        let address = advertisement.addresses.first().cloned().unwrap_or_default();
+        let layers = LayerRange::new(cursor, shard.layers.end)?;
+
+        route.push(RouteHop {
+            peer_id: advertisement.peer_id.clone(),
+            address,
+            layers,
+        });
+
+        cursor = shard.layers.end;
+    }
+
+    validate_contiguous_coverage(manifest.layer_count, route.iter().map(|hop| hop.layers))?;
+
+    Ok(route)
+}
+
+pub fn route_ranges(route: &[RouteHop]) -> Vec<LayerRange> {
+    route.iter().map(|hop| hop.layers).collect()
+}
+
+pub fn missing_layer_ranges(
+    manifest: &ModelManifest,
+    advertisements: &[NodeAdvertisement],
+) -> Vec<LayerRange> {
+    let mut ranges = advertisements
+        .iter()
+        .flat_map(|advertisement| advertisement.hosted_shards.iter())
+        .filter(|shard| {
+            shard.model_id == manifest.model_id && shard.runtime_kind == manifest.runtime_kind
+        })
+        .filter_map(|shard| {
+            let start = shard.layers.start.min(manifest.layer_count);
+            let end = shard.layers.end.min(manifest.layer_count);
+
+            (start < end).then_some(LayerRange { start, end })
+        })
+        .collect::<Vec<_>>();
+
+    ranges.sort_by_key(|range| (range.start, range.end));
+
+    let mut cursor = 0;
+    let mut missing = Vec::new();
+
+    for range in ranges {
+        if range.end <= cursor {
+            continue;
+        }
+
+        if range.start > cursor {
+            missing.push(LayerRange {
+                start: cursor,
+                end: range.start,
+            });
+        }
+
+        cursor = cursor.max(range.end);
+    }
+
+    if cursor < manifest.layer_count {
+        missing.push(LayerRange {
+            start: cursor,
+            end: manifest.layer_count,
+        });
+    }
+
+    missing
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use infernet_model::{RuntimeKind, ShardDescriptor};
+
+    fn advertisement(peer_id: &str, model_id: &str, layers: LayerRange) -> NodeAdvertisement {
+        NodeAdvertisement {
+            protocol_version: 1,
+            peer_id: peer_id.to_owned(),
+            addresses: vec![format!("127.0.0.1:70{}", layers.start)],
+            available_ram_bytes: None,
+            available_vram_bytes: None,
+            latency_hint_ms: Some(layers.start + 1),
+            hosted_shards: vec![ShardDescriptor {
+                model_id: model_id.to_owned(),
+                layers,
+                runtime_kind: RuntimeKind::Demo,
+                tokenizer: None,
+                metadata: None,
+                shard_hash: None,
+            }],
+            model_shards: Vec::new(),
+        }
+    }
+
+    fn advertisement_for_manifest(
+        peer_id: &str,
+        manifest: &ModelManifest,
+        layers: LayerRange,
+    ) -> NodeAdvertisement {
+        NodeAdvertisement {
+            protocol_version: 1,
+            peer_id: peer_id.to_owned(),
+            addresses: vec![format!("127.0.0.1:80{}", layers.start)],
+            available_ram_bytes: None,
+            available_vram_bytes: None,
+            latency_hint_ms: Some(layers.start + 1),
+            hosted_shards: vec![ShardDescriptor::for_manifest(manifest, layers)],
+            model_shards: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn builds_route_for_demo_model() {
+        let manifest = ModelManifest::demo();
+        let ads = [0, 3, 6, 9]
+            .into_iter()
+            .map(|start| {
+                let end = start + 3;
+                advertisement(
+                    &format!("peer-{start}"),
+                    &manifest.model_id,
+                    LayerRange::new(start, end).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let route = build_greedy_route(&manifest, &ads).unwrap();
+
+        assert_eq!(route.len(), 4);
+        assert_eq!(route[0].layers, LayerRange::new(0, 3).unwrap());
+        assert_eq!(route[3].layers, LayerRange::new(9, 12).unwrap());
+    }
+
+    #[test]
+    fn rejects_missing_layer() {
+        let manifest = ModelManifest::demo();
+        let ads = vec![advertisement(
+            "peer-0",
+            &manifest.model_id,
+            LayerRange::new(0, 3).unwrap(),
+        )];
+
+        assert_eq!(
+            build_greedy_route(&manifest, &ads),
+            Err(RouterError::MissingRanges {
+                model_id: manifest.model_id,
+                missing_ranges: MissingRanges(vec![LayerRange::new(3, 12).unwrap()])
+            })
+        );
+    }
+
+    #[test]
+    fn reports_all_missing_ranges() {
+        let manifest = ModelManifest::demo();
+        let ads = vec![
+            advertisement("peer-0", &manifest.model_id, LayerRange::new(0, 3).unwrap()),
+            advertisement("peer-6", &manifest.model_id, LayerRange::new(6, 9).unwrap()),
+        ];
+
+        assert_eq!(
+            missing_layer_ranges(&manifest, &ads),
+            vec![
+                LayerRange::new(3, 6).unwrap(),
+                LayerRange::new(9, 12).unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn registry_builds_route() {
+        let manifest = ModelManifest::demo();
+        let mut registry = ShardRegistry::new();
+
+        for start in [0, 3, 6, 9] {
+            registry.upsert(advertisement(
+                &format!("peer-{start}"),
+                &manifest.model_id,
+                LayerRange::new(start, start + 3).unwrap(),
+            ));
+        }
+
+        assert_eq!(registry.route_for_model(&manifest).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn builds_route_for_llama_cpp_model() {
+        let manifest = ModelManifest::llama32_1b();
+        let ads = [0, 4, 8, 12]
+            .into_iter()
+            .map(|start| {
+                advertisement_for_manifest(
+                    &format!("llama-peer-{start}"),
+                    &manifest,
+                    LayerRange::new(start, start + 4).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let route = build_greedy_route(&manifest, &ads).unwrap();
+
+        assert_eq!(route.len(), 4);
+        assert_eq!(route[0].layers, LayerRange::new(0, 4).unwrap());
+        assert_eq!(route[3].layers, LayerRange::new(12, 16).unwrap());
+    }
+}

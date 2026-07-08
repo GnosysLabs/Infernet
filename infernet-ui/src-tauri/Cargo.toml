@@ -1,0 +1,27 @@
+[package]
+name = "infernet-ui"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "infernet_ui_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+infernet-model.workspace = true
+infernet-node.workspace = true
+infernet-protocol.workspace = true
+infernet-router.workspace = true
+futures.workspace = true
+libp2p.workspace = true
+reqwest = { version = "0.12.23", default-features = false, features = ["json", "rustls-tls", "stream"] }
+serde.workspace = true
+serde_json.workspace = true
+tauri.workspace = true
+tokio.workspace = true

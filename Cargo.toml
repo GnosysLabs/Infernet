@@ -1,0 +1,35 @@
+[workspace]
+members = [
+    "crates/infernet-model",
+    "crates/infernet-protocol",
+    "crates/infernet-runtime",
+    "crates/infernet-router",
+    "crates/infernet-node",
+    "crates/infernet-worker",
+    "infernet-ui/src-tauri",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/infernet/infernet"
+
+[workspace.dependencies]
+anyhow = "1.0.98"
+clap = { version = "4.5.41", features = ["derive"] }
+futures = "0.3.31"
+infernet-model = { path = "crates/infernet-model" }
+infernet-node = { path = "crates/infernet-node" }
+infernet-protocol = { path = "crates/infernet-protocol" }
+infernet-router = { path = "crates/infernet-router" }
+infernet-runtime = { path = "crates/infernet-runtime" }
+libp2p = { version = "0.56.0", features = ["gossipsub", "json", "macros", "mdns", "noise", "request-response", "tcp", "tokio", "yamux"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+sha2 = "0.10.9"
+tauri = "2"
+tauri-build = "2"
+thiserror = "2.0.12"
+tokio = { version = "1.46.1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "time"] }
+uuid = { version = "1.17.0", features = ["serde", "v4"] }
