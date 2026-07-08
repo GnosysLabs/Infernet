@@ -618,6 +618,9 @@ fn refresh_advertisement_model_shards(
                 .filter_map(|record| {
                     let payload = cache.read_payload(&record.info).ok()?;
                     let manifest = serde_json::from_slice::<SeedShardManifest>(&payload).ok()?;
+                    if !seed_record_is_executable(&manifest) {
+                        return None;
+                    }
                     Some(ShardDescriptor {
                         model_id: manifest.model_id,
                         layers: manifest.layers,
@@ -636,6 +639,10 @@ fn refresh_advertisement_model_shards(
     }
 
     Ok(())
+}
+
+fn seed_record_is_executable(manifest: &SeedShardManifest) -> bool {
+    manifest.runtime_kind == RuntimeKind::Demo || manifest.payload_kind != "metadata-only"
 }
 
 pub fn process_activation_step(

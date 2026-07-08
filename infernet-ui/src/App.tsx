@@ -139,6 +139,7 @@ export default function App() {
       const nextSelectedModel = modelStillExists
         ? modelId
         : nextSnapshot.selectedModel || nextSnapshot.availableModels[0]?.modelId || "";
+      const nextModel = nextSnapshot.availableModels.find((model) => model.modelId === nextSelectedModel);
       setSnapshot(nextSnapshot);
       setRoute(nextSnapshot.route);
       setLastError(nextSnapshot.missingRanges ?? null);
@@ -146,9 +147,9 @@ export default function App() {
       setStatus(
         nextSnapshot.availableModels.length === 0
           ? "No models"
-          : nextSnapshot.route.length > 0
-            ? "Connected"
-            : "Model unavailable",
+          : nextModel?.runnable
+            ? "Ready"
+            : "Connected",
       );
     } catch (error) {
       setLastError(String(error));
@@ -199,12 +200,6 @@ export default function App() {
       setStatus("No models");
       return;
     }
-    if (!selectedModelView.runnable) {
-      setLastError(selectedModelView.status);
-      setStatus("Runtime unavailable");
-      return;
-    }
-
     setMessages((current) => [
       ...current,
       { id: `user-${Date.now()}`, role: "user", text: userPrompt },
@@ -228,12 +223,10 @@ export default function App() {
       const message = String(error);
       const runtimePending = isRuntimePendingMessage(message);
       setLastError(message);
-      if (!runtimePending) {
-        setMessages((current) => [
-          ...current,
-          { id: `assistant-error-${Date.now()}`, role: "assistant", text: message },
-        ]);
-      }
+      setMessages((current) => [
+        ...current,
+        { id: `assistant-error-${Date.now()}`, role: "assistant", text: message },
+      ]);
       setStatus(runtimePending ? "Runtime pending" : "Needs attention");
     } finally {
       setIsRunning(false);
@@ -431,7 +424,7 @@ function ChatPage({
   onOpenModels: () => void;
 }) {
   const networkVisible = showNetwork || developerMode;
-  const modelReady = Boolean(model?.runnable);
+  const canSend = Boolean(model);
 
   return (
     <section className="chat-screen">
@@ -451,9 +444,9 @@ function ChatPage({
               <span>Open Models</span>
             </button>
           </div>
-        ) : !modelReady ? (
+        ) : !model.runnable ? (
           <div className="empty-chat-card warning">
-            <strong>{model.displayName} is not runnable yet</strong>
+            <strong>{model.displayName} is available</strong>
             <span>{model.status}</span>
             <button className="secondary-button" onClick={onOpenModels}>
               <Box size={16} />
@@ -494,10 +487,10 @@ function ChatPage({
               runInference();
             }
           }}
-          placeholder={modelReady ? "Message Infernet" : "Add a runnable model first"}
-          disabled={!modelReady}
+          placeholder={canSend ? "Message Infernet" : "Add a model first"}
+          disabled={!canSend}
         />
-        <button className="send-button" onClick={runInference} disabled={isRunning || !prompt.trim() || !modelReady}>
+        <button className="send-button" onClick={runInference} disabled={isRunning || !prompt.trim() || !canSend}>
           {isRunning ? <Activity size={18} /> : <Send size={18} />}
           <span>Send</span>
         </button>
@@ -766,13 +759,7 @@ function ModelsPage({
             <button
               className={selectedModel === model.modelId ? "library-card active" : "library-card"}
               key={model.modelId}
-              onClick={() => {
-                if (installed) {
-                  onModelChange(model.modelId);
-                } else {
-                  openImporter();
-                }
-              }}
+              onClick={() => onModelChange(model.modelId)}
             >
               <div>
                 <strong>{model.displayName}</strong>
@@ -1200,7 +1187,11 @@ function runtimeLabel(runtimeKind: string): string {
 }
 
 function isRuntimePendingMessage(message: string): boolean {
-  return message.toLowerCase().includes("gguf execution runtime is not connected yet");
+  const lower = message.toLowerCase();
+  return lower.includes("gguf execution runtime is not connected yet")
+    || lower.includes("split-gguf token execution")
+    || lower.includes("does not have executable gguf tensors")
+    || lower.includes("token generation is not connected yet");
 }
 
 function friendlyImportError(error: string): string {

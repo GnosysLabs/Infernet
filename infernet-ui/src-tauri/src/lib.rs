@@ -6,7 +6,7 @@ use std::{
     io::Write,
     net::{IpAddr, UdpSocket},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -17,10 +17,12 @@ use infernet_model::{
 };
 use infernet_node::{
     DiscoveryConfig, SeededModelSummary, ShardCache, ShardCacheConfig, discover_for,
-    empty_advertisement, import_seed_model_from_file_with_progress, infer_over_libp2p,
-    run_model_distribution_node,
+    empty_advertisement, fetch_model_shard_over_libp2p, import_seed_model_from_file_with_progress,
+    infer_over_libp2p, run_model_distribution_node,
 };
-use infernet_protocol::{NodeAdvertisement, PROTOCOL_VERSION, RouteHop, TraceEvent};
+use infernet_protocol::{
+    ModelShardInfo, NodeAdvertisement, PROTOCOL_VERSION, RouteHop, TraceEvent,
+};
 use infernet_router::ShardRegistry;
 use libp2p::{Multiaddr, PeerId, identity};
 use serde::{Deserialize, Serialize};
@@ -30,7 +32,8 @@ use tokio::process::Command;
 const DEFAULT_TOPIC: &str = "infernet/grid-demo/1";
 const DEFAULT_DISCOVERY_TIMEOUT_MS: u64 = 4_000;
 const DEFAULT_INFERENCE_TIMEOUT_MS: u64 = 6_000;
-const MAX_SAFE_LOCAL_GGUF_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+const DEFAULT_MODEL_FETCH_TIMEOUT_MS: u64 = 6_000;
+const MIN_LOCAL_GGUF_LIMIT_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 const UI_LISTEN_PORT: u16 = 9777;
 const DEFAULT_BOOTSTRAP_PEERS: &[&str] = &[
     "12D3KooWRJrnpHPQTWdThpDGZMwRCHhEBL4JCAxFMwYMfFavxa2h@/ip4/217.77.11.197/tcp/9777/p2p/12D3KooWRJrnpHPQTWdThpDGZMwRCHhEBL4JCAxFMwYMfFavxa2h",
@@ -326,8 +329,58 @@ async fn run_demo_inference(
 ) -> Result<RunDemoResponse, String> {
     let cache_config = cache_config_for_app(&app);
     ensure_model_distribution_service(&state, cache_config.clone())?;
-    let manifest = manifest_for_model(model_id.as_deref(), &cache_config, None)
+    let (registry, _, _) =
+        discover_registry(&app, &state, &cache_config, DEFAULT_DISCOVERY_TIMEOUT_MS).await?;
+    let manifest = manifest_for_model(model_id.as_deref(), &cache_config, Some(&registry))
         .map_err(|error| error.to_string())?;
+
+    if manifest.runtime_kind != RuntimeKind::Demo {
+        acquire_advertised_model_records(&app, &state, &cache_config, &manifest, &registry).await?;
+        let (refreshed_registry, local_peer_id, topic) =
+            discover_registry(&app, &state, &cache_config, DEFAULT_DISCOVERY_TIMEOUT_MS).await?;
+        let manifest = manifest_for_model(
+            Some(&manifest.model_id),
+            &cache_config,
+            Some(&refreshed_registry),
+        )
+        .map_err(|error| error.to_string())?;
+        let trace_id = format!("llama-{}", unix_ms());
+        let local_route = vec![RouteHopView {
+            peer_id: local_peer_id.clone(),
+            short_peer_id: short_peer_id(&local_peer_id),
+            address: "local".to_owned(),
+            layer_start: 0,
+            layer_end: manifest.layer_count,
+        }];
+        emit_progress(
+            &app,
+            ProgressEvent::RouteDiscovered {
+                route: local_route.clone(),
+            },
+        );
+        replay_route_progress(&app, &trace_id, &local_route, manifest.hidden_size).await;
+        let output = generate_with_llama_cli(&cache_config, &manifest, &prompt).await?;
+        emit_progress(
+            &app,
+            ProgressEvent::FinalOutput {
+                trace_id: trace_id.clone(),
+                output: output.clone(),
+            },
+        );
+        let snapshot = snapshot_from_registry(
+            local_peer_id,
+            topic,
+            &manifest,
+            &refreshed_registry,
+            &cache_config,
+        );
+        return Ok(RunDemoResponse {
+            output,
+            trace_id,
+            snapshot,
+        });
+    }
+
     let snapshot = collect_snapshot(
         &app,
         &state,
@@ -356,24 +409,6 @@ async fn run_demo_inference(
             route: snapshot.route.clone(),
         },
     );
-
-    if manifest.runtime_kind != RuntimeKind::Demo {
-        let trace_id = format!("llama-{}", unix_ms());
-        replay_route_progress(&app, &trace_id, &snapshot.route, manifest.hidden_size).await;
-        let output = generate_with_llama_cli(&cache_config, &manifest, &prompt).await?;
-        emit_progress(
-            &app,
-            ProgressEvent::FinalOutput {
-                trace_id: trace_id.clone(),
-                output: output.clone(),
-            },
-        );
-        return Ok(RunDemoResponse {
-            output,
-            trace_id,
-            snapshot,
-        });
-    }
 
     let (config, _) = discovery_config_from_state(&state)?;
     let hidden_size = manifest.hidden_size;
@@ -671,17 +706,9 @@ async fn collect_snapshot(
     discovery_timeout_ms: u64,
     model_id: Option<&str>,
 ) -> Result<GridSnapshot, String> {
-    let (mut config, local_peer_id) = discovery_config_from_state(state)?;
     let cache_config = cache_config_for_app(app);
-    let topic = config.topic.clone();
-    if let Some(local_advertisement) =
-        local_cache_advertisement(&cache_config, local_peer_id.clone())
-    {
-        config.advertisement = Some(local_advertisement);
-    }
-    let registry = discover_for(config, Duration::from_millis(discovery_timeout_ms))
-        .await
-        .map_err(|error| error.to_string())?;
+    let (registry, local_peer_id, topic) =
+        discover_registry(app, state, &cache_config, discovery_timeout_ms).await?;
     let manifest = match manifest_for_model(model_id, &cache_config, Some(&registry)) {
         Ok(manifest) => manifest,
         Err(error) => {
@@ -704,6 +731,105 @@ async fn collect_snapshot(
         &registry,
         &cache_config,
     ))
+}
+
+async fn discover_registry(
+    _app: &AppHandle,
+    state: &State<'_, UiState>,
+    cache_config: &ShardCacheConfig,
+    discovery_timeout_ms: u64,
+) -> Result<(ShardRegistry, String, String), String> {
+    let (mut config, local_peer_id) = discovery_config_from_state(state)?;
+    let topic = config.topic.clone();
+    if let Some(local_advertisement) =
+        local_cache_advertisement(cache_config, local_peer_id.clone())
+    {
+        config.advertisement = Some(local_advertisement);
+    }
+    let registry = discover_for(config, Duration::from_millis(discovery_timeout_ms))
+        .await
+        .map_err(|error| error.to_string())?;
+
+    Ok((registry, local_peer_id, topic))
+}
+
+async fn acquire_advertised_model_records(
+    app: &AppHandle,
+    state: &State<'_, UiState>,
+    cache_config: &ShardCacheConfig,
+    manifest: &ModelManifest,
+    registry: &ShardRegistry,
+) -> Result<(), String> {
+    if manifest.runtime_kind == RuntimeKind::Demo {
+        return Ok(());
+    }
+
+    let cache = ShardCache::new(cache_config.clone()).map_err(|error| error.to_string())?;
+    let plan = advertised_model_record_plan(registry, &manifest.model_id);
+    if plan.is_empty() {
+        return Ok(());
+    }
+
+    let missing_ranges = missing_ranges_from_layer_ranges(
+        manifest.layer_count,
+        plan.iter().map(|shard| shard.layers),
+    );
+    if !missing_ranges.is_empty() {
+        return Err(format!(
+            "{} is visible on the network, but its advertised model records are incomplete; missing layer ranges: {}",
+            manifest.display_name,
+            format_ranges(&missing_ranges),
+        ));
+    }
+
+    let mut static_peers = configured_static_peers(state)?;
+    merge_static_peer_advertisements(&mut static_peers, registry.advertisements());
+    for shard in plan {
+        if cache
+            .find(
+                &shard.model_id,
+                shard.layers,
+                Some(&shard.checksum),
+                Some(&shard.version),
+            )
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            continue;
+        }
+
+        emit_model_import_progress(
+            app,
+            &manifest.model_id,
+            "Downloading model record",
+            format!("layers {}:{}", shard.layers.start, shard.layers.end),
+            0,
+            Some(shard.size_bytes),
+        );
+        let (mut config, _) = discovery_config_from_state(state)?;
+        config.static_peers = static_peers.clone();
+        fetch_model_shard_over_libp2p(
+            config,
+            cache_config.clone(),
+            manifest.model_id.clone(),
+            shard.layers,
+            Some(shard.checksum.clone()),
+            Some(shard.version.clone()),
+            Duration::from_millis(DEFAULT_MODEL_FETCH_TIMEOUT_MS),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        emit_model_import_progress(
+            app,
+            &manifest.model_id,
+            "Model record ready",
+            format!("layers {}:{}", shard.layers.start, shard.layers.end),
+            shard.size_bytes,
+            Some(shard.size_bytes),
+        );
+    }
+
+    Ok(())
 }
 
 fn snapshot_from_registry(
@@ -776,9 +902,9 @@ fn model_view_from_manifest(
     let runnable = manifest.runtime_kind == RuntimeKind::Demo
         || (manifest.runtime_kind == RuntimeKind::LlamaCpp
             && installed
-            && source_path_for_model(cache_config, &manifest.model_id)
+            && local_source_path_for_model(cache_config, &manifest.model_id)
                 .and_then(|path| std::fs::metadata(path).ok())
-                .is_some_and(|metadata| metadata.len() <= MAX_SAFE_LOCAL_GGUF_BYTES)
+                .is_some_and(|metadata| metadata.len() <= local_gguf_size_limit_bytes())
             && find_llama_cli().is_some());
     ModelView {
         model_id: manifest.model_id.clone(),
@@ -969,18 +1095,17 @@ fn model_status(
         return "Available on the network".to_owned();
     }
 
-    let Some(source_path) = source_path_for_model(cache_config, &manifest.model_id) else {
-        return "Installed for sharing. Token execution is not connected yet.".to_owned();
+    let Some(source_path) = local_source_path_for_model(cache_config, &manifest.model_id) else {
+        return "Available for sharing. This machine has shard records, but not executable GGUF tensors yet.".to_owned();
     };
     if std::fs::metadata(source_path)
-        .map(|metadata| metadata.len() > MAX_SAFE_LOCAL_GGUF_BYTES)
+        .map(|metadata| metadata.len() > local_gguf_size_limit_bytes())
         .unwrap_or(false)
     {
-        return "Installed for sharing. This model is too large for local fallback execution."
-            .to_owned();
+        return "Installed locally. This machine does not have enough memory for safe local fallback execution.".to_owned();
     }
 
-    "Installed for sharing. Configure the split GGUF runtime to chat.".to_owned()
+    "Installed locally. Set INFERNET_LLAMA_CLI to a llama.cpp binary to chat.".to_owned()
 }
 
 fn peer_view_from_advertisement(advertisement: &NodeAdvertisement) -> PeerView {
@@ -1016,6 +1141,81 @@ fn peer_view_from_advertisement(advertisement: &NodeAdvertisement) -> PeerView {
         protocol_version: advertisement.protocol_version,
         shards,
     }
+}
+
+fn advertised_model_record_plan(registry: &ShardRegistry, model_id: &str) -> Vec<ModelShardInfo> {
+    let mut by_range = BTreeMap::<(u32, u32), ModelShardInfo>::new();
+    for shard in registry
+        .advertisements()
+        .into_iter()
+        .flat_map(|advertisement| advertisement.model_shards)
+        .filter(|shard| shard.model_id == model_id)
+    {
+        by_range
+            .entry((shard.layers.start, shard.layers.end))
+            .and_modify(|existing| {
+                if (
+                    shard.version.clone(),
+                    shard.size_bytes,
+                    shard.checksum.clone(),
+                ) < (
+                    existing.version.clone(),
+                    existing.size_bytes,
+                    existing.checksum.clone(),
+                ) {
+                    *existing = shard.clone();
+                }
+            })
+            .or_insert(shard);
+    }
+
+    by_range.into_values().collect()
+}
+
+fn missing_ranges_from_layer_ranges(
+    layer_count: u32,
+    ranges: impl IntoIterator<Item = LayerRange>,
+) -> Vec<LayerRange> {
+    let mut ranges = ranges
+        .into_iter()
+        .filter_map(|range| {
+            let start = range.start.min(layer_count);
+            let end = range.end.min(layer_count);
+            (start < end).then_some(LayerRange { start, end })
+        })
+        .collect::<Vec<_>>();
+    ranges.sort_by_key(|range| (range.start, range.end));
+
+    let mut cursor = 0;
+    let mut missing = Vec::new();
+    for range in ranges {
+        if range.end <= cursor {
+            continue;
+        }
+        if range.start > cursor {
+            missing.push(LayerRange {
+                start: cursor,
+                end: range.start,
+            });
+        }
+        cursor = cursor.max(range.end);
+    }
+    if cursor < layer_count {
+        missing.push(LayerRange {
+            start: cursor,
+            end: layer_count,
+        });
+    }
+
+    missing
+}
+
+fn format_ranges(ranges: &[LayerRange]) -> String {
+    ranges
+        .iter()
+        .map(|range| format!("{}:{}", range.start, range.end))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn route_hop_view(hop: &RouteHop) -> RouteHopView {
@@ -1154,14 +1354,16 @@ fn local_cache_advertisement(
     for record in records {
         let payload = cache.read_payload(&record.info).ok()?;
         let manifest = serde_json::from_slice::<SeedShardManifest>(&payload).ok()?;
-        hosted_shards.push(ShardDescriptor {
-            model_id: manifest.model_id,
-            layers: manifest.layers,
-            runtime_kind: manifest.runtime_kind,
-            tokenizer: Some(manifest.tokenizer),
-            metadata: Some(manifest.metadata),
-            shard_hash: Some(manifest.shard_hash),
-        });
+        if seed_record_is_executable(&manifest) {
+            hosted_shards.push(ShardDescriptor {
+                model_id: manifest.model_id,
+                layers: manifest.layers,
+                runtime_kind: manifest.runtime_kind,
+                tokenizer: Some(manifest.tokenizer),
+                metadata: Some(manifest.metadata),
+                shard_hash: Some(manifest.shard_hash),
+            });
+        }
         model_shards.push(record.info);
     }
 
@@ -1181,14 +1383,18 @@ fn local_cache_advertisement(
     })
 }
 
+fn seed_record_is_executable(manifest: &SeedShardManifest) -> bool {
+    manifest.runtime_kind == RuntimeKind::Demo || manifest.payload_kind != "metadata-only"
+}
+
 async fn generate_with_llama_cli(
     cache_config: &ShardCacheConfig,
     manifest: &ModelManifest,
     prompt: &str,
 ) -> Result<String, String> {
-    let model_path = source_path_for_model(cache_config, &manifest.model_id).ok_or_else(|| {
+    let model_path = local_source_path_for_model(cache_config, &manifest.model_id).ok_or_else(|| {
         format!(
-            "{} is installed, but the source GGUF path is missing",
+            "{} is available, but this machine does not have executable GGUF tensors yet. Infernet can share metadata records today; real split-GGUF token execution still needs the tensor shard runtime.",
             manifest.display_name
         )
     })?;
@@ -1199,12 +1405,13 @@ async fn generate_with_llama_cli(
         .map_err(|error| format!("failed to read {}: {error}", model_path.display()))?
         .len();
     let allow_large = env::var("INFERNET_ALLOW_LARGE_GGUF").as_deref() == Ok("1");
-    if model_size > MAX_SAFE_LOCAL_GGUF_BYTES && !allow_large {
+    let size_limit = local_gguf_size_limit_bytes();
+    if model_size > size_limit && !allow_large {
         return Err(format!(
-            "{} is {}. Infernet will not full-load models over {} in the UI. This model needs the split GGUF token runtime, not a local llama.cpp fallback.",
+            "{} is {}. This machine's local GGUF safety limit is {}. This model needs a smaller quantization, more memory, or the split GGUF token runtime.",
             model_path.display(),
             format_bytes(model_size),
-            format_bytes(MAX_SAFE_LOCAL_GGUF_BYTES),
+            format_bytes(size_limit),
         ));
     }
 
@@ -1243,7 +1450,7 @@ async fn generate_with_llama_cli(
     Ok(stdout)
 }
 
-fn source_path_for_model(cache_config: &ShardCacheConfig, model_id: &str) -> Option<PathBuf> {
+fn local_source_path_for_model(cache_config: &ShardCacheConfig, model_id: &str) -> Option<PathBuf> {
     let cache = ShardCache::new(cache_config.clone()).ok()?;
     let records = cache.list().ok()?;
 
@@ -1251,7 +1458,10 @@ fn source_path_for_model(cache_config: &ShardCacheConfig, model_id: &str) -> Opt
         let payload = cache.read_payload(&record.info).ok()?;
         let manifest = serde_json::from_slice::<SeedShardManifest>(&payload).ok()?;
         if manifest.model_id == model_id {
-            return Some(PathBuf::from(manifest.source.path));
+            let path = PathBuf::from(manifest.source.path);
+            if path.is_file() {
+                return Some(path);
+            }
         }
     }
 
@@ -1266,6 +1476,89 @@ fn find_llama_cli() -> Option<PathBuf> {
         }
     }
 
+    let executable_names = if cfg!(windows) {
+        vec!["llama-cli.exe", "llama.exe", "main.exe"]
+    } else {
+        vec!["llama-cli", "llama", "main"]
+    };
+    let mut search_dirs = Vec::new();
+    if let Ok(current_exe) = env::current_exe() {
+        if let Some(parent) = current_exe.parent() {
+            search_dirs.push(parent.to_path_buf());
+        }
+    }
+    if let Some(path) = env::var_os("PATH") {
+        search_dirs.extend(env::split_paths(&path));
+    }
+
+    for directory in search_dirs {
+        for name in &executable_names {
+            let candidate = directory.join(*name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+fn local_gguf_size_limit_bytes() -> u64 {
+    static LIMIT: OnceLock<u64> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        env::var("INFERNET_MAX_LOCAL_GGUF_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or_else(|| {
+                total_system_memory_bytes()
+                    .map(|bytes| (bytes.saturating_mul(45) / 100).max(MIN_LOCAL_GGUF_LIMIT_BYTES))
+                    .unwrap_or(MIN_LOCAL_GGUF_LIMIT_BYTES)
+            })
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn total_system_memory_bytes() -> Option<u64> {
+    let output = std::process::Command::new("sysctl")
+        .arg("-n")
+        .arg("hw.memsize")
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
+#[cfg(target_os = "linux")]
+fn total_system_memory_bytes() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = meminfo.lines().find(|line| line.starts_with("MemTotal:"))?;
+    let kib = line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|value| value.parse::<u64>().ok())?;
+    Some(kib.saturating_mul(1024))
+}
+
+#[cfg(target_os = "windows")]
+fn total_system_memory_bytes() -> Option<u64> {
+    let output = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory",
+        ])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn total_system_memory_bytes() -> Option<u64> {
     None
 }
 
@@ -1634,6 +1927,46 @@ fn configured_static_peers(state: &State<'_, UiState>) -> Result<Vec<NodeAdverti
     }
 
     Ok(by_peer.into_values().collect())
+}
+
+fn merge_static_peer_advertisements(
+    peers: &mut Vec<NodeAdvertisement>,
+    discovered: Vec<NodeAdvertisement>,
+) {
+    let mut by_peer = BTreeMap::<String, NodeAdvertisement>::new();
+    for peer in peers.drain(..).chain(discovered) {
+        by_peer
+            .entry(peer.peer_id.clone())
+            .and_modify(|existing| merge_peer_advertisement(existing, &peer))
+            .or_insert(peer);
+    }
+    *peers = by_peer.into_values().collect();
+}
+
+fn merge_peer_advertisement(existing: &mut NodeAdvertisement, peer: &NodeAdvertisement) {
+    for address in &peer.addresses {
+        if !existing.addresses.contains(address) {
+            existing.addresses.push(address.clone());
+        }
+    }
+    for shard in &peer.hosted_shards {
+        if !existing.hosted_shards.iter().any(|existing| {
+            existing.model_id == shard.model_id
+                && existing.layers == shard.layers
+                && existing.runtime_kind == shard.runtime_kind
+        }) {
+            existing.hosted_shards.push(shard.clone());
+        }
+    }
+    for shard in &peer.model_shards {
+        if !existing
+            .model_shards
+            .iter()
+            .any(|existing| existing == shard)
+        {
+            existing.model_shards.push(shard.clone());
+        }
+    }
 }
 
 fn default_bootstrap_peers() -> Result<Vec<NodeAdvertisement>, String> {
