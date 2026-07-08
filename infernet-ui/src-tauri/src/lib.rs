@@ -22,7 +22,7 @@ use infernet_protocol::{NodeAdvertisement, PROTOCOL_VERSION, RouteHop, TraceEven
 use infernet_router::ShardRegistry;
 use libp2p::identity;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::process::Command;
 
 const DEFAULT_TOPIC: &str = "infernet/grid-demo/1";
@@ -79,6 +79,9 @@ struct ModelView {
     runtime_kind: String,
     layer_count: u32,
     activation_dtype: String,
+    installed: bool,
+    runnable: bool,
+    status: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

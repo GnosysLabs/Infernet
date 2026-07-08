@@ -10,6 +10,9 @@ export interface ModelView {
   runtimeKind: string;
   layerCount: number;
   activationDtype: string;
+  installed: boolean;
+  runnable: boolean;
+  status: string;
 }
 
 export interface ShardView {

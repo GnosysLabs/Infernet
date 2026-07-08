@@ -24,17 +24,16 @@ import {
   addLocalGgufModel,
   chooseLocalModelFile,
   clearHuggingFaceToken,
+  emptySnapshot,
   getGridSnapshot,
   getHuggingFaceSettings,
   getLocalIdentity,
   inspectHuggingFaceRepo,
-  isTauriRuntime,
   listenForProgress,
   listenForModelImportProgress,
   runDistributedInference,
   saveHuggingFaceToken,
 } from "./api";
-import { runMockDemo, sampleSnapshot } from "./sampleData";
 import type {
   AddModelResponse,
   GridSnapshot,
@@ -65,19 +64,19 @@ export default function App() {
   const [developerMode, setDeveloperMode] = useState(false);
   const [showNetwork, setShowNetwork] = useState(false);
   const [identity, setIdentity] = useState<LocalIdentity | null>(null);
-  const [snapshot, setSnapshot] = useState<GridSnapshot>(sampleSnapshot);
-  const [selectedModel, setSelectedModel] = useState(sampleSnapshot.selectedModel);
+  const [snapshot, setSnapshot] = useState<GridSnapshot>(emptySnapshot);
+  const [selectedModel, setSelectedModel] = useState("");
   const [prompt, setPrompt] = useState(DEFAULT_PROMPT);
   const [messages, setMessages] = useState<Message[]>(INITIAL_MESSAGES);
-  const [status, setStatus] = useState("Connected");
+  const [status, setStatus] = useState("Starting");
   const [isRunning, setIsRunning] = useState(false);
   const [hops, setHops] = useState<HopProgress[]>([]);
-  const [route, setRoute] = useState<RouteHopView[]>(sampleSnapshot.route);
+  const [route, setRoute] = useState<RouteHopView[]>([]);
   const [lastError, setLastError] = useState<string | null>(null);
 
   const selectedModelView = useMemo(
-    () => snapshot.availableModels.find((model) => model.modelId === snapshot.selectedModel),
-    [snapshot.availableModels, snapshot.selectedModel],
+    () => snapshot.availableModels.find((model) => model.modelId === selectedModel),
+    [snapshot.availableModels, selectedModel],
   );
   const activeRoute = route.length > 0 ? route : snapshot.route;
   const peerCount = uniquePeerCount(activeRoute);
@@ -127,14 +126,26 @@ export default function App() {
     }
   }, []);
 
-  const refreshSnapshot = useCallback(async (modelId: string) => {
+  const refreshSnapshot = useCallback(async (modelId?: string) => {
     setStatus("Connecting");
     try {
       const nextSnapshot = await getGridSnapshot(4000, modelId);
+      const modelStillExists =
+        modelId && nextSnapshot.availableModels.some((model) => model.modelId === modelId);
+      const nextSelectedModel = modelStillExists
+        ? modelId
+        : nextSnapshot.selectedModel || nextSnapshot.availableModels[0]?.modelId || "";
       setSnapshot(nextSnapshot);
       setRoute(nextSnapshot.route);
       setLastError(nextSnapshot.missingRanges ?? null);
-      setStatus(nextSnapshot.route.length > 0 ? "Connected" : "Model unavailable");
+      setSelectedModel(nextSelectedModel);
+      setStatus(
+        nextSnapshot.availableModels.length === 0
+          ? "No models"
+          : nextSnapshot.route.length > 0
+            ? "Connected"
+            : "Model unavailable",
+      );
     } catch (error) {
       setLastError(String(error));
       setStatus("Offline");
@@ -179,6 +190,16 @@ export default function App() {
     if (!userPrompt || isRunning) {
       return;
     }
+    if (!selectedModelView) {
+      setLastError("Add a model before sending a message.");
+      setStatus("No models");
+      return;
+    }
+    if (!selectedModelView.runnable) {
+      setLastError(selectedModelView.status);
+      setStatus("Runtime unavailable");
+      return;
+    }
 
     setMessages((current) => [
       ...current,
@@ -192,9 +213,7 @@ export default function App() {
     setHops([]);
 
     try {
-      const output = isTauriRuntime
-        ? (await runDistributedInference(userPrompt, selectedModel)).output
-        : await runMockDemo(activeRoute, applyProgressEvent);
+      const output = (await runDistributedInference(userPrompt, selectedModel)).output;
 
       setMessages((current) => [
         ...current,
@@ -250,6 +269,7 @@ export default function App() {
             showNetwork={showNetwork}
             setShowNetwork={setShowNetwork}
             developerMode={developerMode}
+            onOpenModels={() => setPage("models")}
           />
         ) : null}
 
@@ -386,6 +406,7 @@ function ChatPage({
   showNetwork,
   setShowNetwork,
   developerMode,
+  onOpenModels,
 }: {
   messages: Message[];
   prompt: string;
@@ -401,8 +422,10 @@ function ChatPage({
   showNetwork: boolean;
   setShowNetwork: (show: boolean) => void;
   developerMode: boolean;
+  onOpenModels: () => void;
 }) {
   const networkVisible = showNetwork || developerMode;
+  const modelReady = Boolean(model?.runnable);
 
   return (
     <section className="chat-screen">
@@ -412,6 +435,26 @@ function ChatPage({
             <div className="message-bubble">{message.text}</div>
           </div>
         ))}
+
+        {!model ? (
+          <div className="empty-chat-card">
+            <strong>Add a model to start chatting</strong>
+            <span>This machine does not have any Infernet models installed yet.</span>
+            <button className="secondary-button" onClick={onOpenModels}>
+              <FilePlus2 size={16} />
+              <span>Open Models</span>
+            </button>
+          </div>
+        ) : !modelReady ? (
+          <div className="empty-chat-card warning">
+            <strong>{model.displayName} is not runnable yet</strong>
+            <span>{model.status}</span>
+            <button className="secondary-button" onClick={onOpenModels}>
+              <Box size={16} />
+              <span>Manage Models</span>
+            </button>
+          </div>
+        ) : null}
 
         {(isRunning || hops.length > 0 || lastError) ? (
           <RunStatusCard
@@ -445,9 +488,10 @@ function ChatPage({
               runInference();
             }
           }}
-          placeholder="Message Infernet"
+          placeholder={modelReady ? "Message Infernet" : "Add a runnable model first"}
+          disabled={!modelReady}
         />
-        <button className="send-button" onClick={runInference} disabled={isRunning || !prompt.trim()}>
+        <button className="send-button" onClick={runInference} disabled={isRunning || !prompt.trim() || !modelReady}>
           {isRunning ? <Activity size={18} /> : <Send size={18} />}
           <span>Send</span>
         </button>
@@ -703,10 +747,16 @@ function ModelsPage({
       </div>
 
       <div className="model-library">
-        {snapshot.availableModels.map((model) => {
-          const installed = snapshot.distribution.installedModels.includes(model.modelId);
-          const downloading = !installed && isAdding;
-          return (
+        {snapshot.availableModels.length === 0 ? (
+          <div className="empty-state library-empty">
+            No models are installed on this computer yet. Add a GGUF model to seed it into the network.
+          </div>
+        ) : (
+          snapshot.availableModels.map((model) => {
+            const installed = model.installed || snapshot.distribution.installedModels.includes(model.modelId);
+            const downloading = !installed && isAdding;
+            const status = downloading ? "Adding" : model.status;
+            return (
             <button
               className={selectedModel === model.modelId ? "library-card active" : "library-card"}
               key={model.modelId}
@@ -725,11 +775,12 @@ function ModelsPage({
               <div className="library-status">
                 <span>{installed ? "Installed" : downloading ? "Preparing" : "Available"}</span>
                 <ProgressBar progress={installed ? 100 : downloading ? 56 : 0} />
-                <small>{installed ? "Ready to use" : downloading ? "Adding" : "Click to add"}</small>
+                <small>{status}</small>
               </div>
             </button>
-          );
-        })}
+            );
+          })
+        )}
       </div>
 
       {showImporter ? (
