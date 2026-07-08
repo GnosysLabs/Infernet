@@ -1257,9 +1257,11 @@ fn add_advertisement_addresses(
         return;
     };
 
+    swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
     for address in &advertisement.addresses {
         if let Ok(address) = address.parse::<Multiaddr>() {
-            swarm.add_peer_address(peer_id, address);
+            swarm.add_peer_address(peer_id, address.clone());
+            let _ = swarm.dial(address);
         }
     }
 }

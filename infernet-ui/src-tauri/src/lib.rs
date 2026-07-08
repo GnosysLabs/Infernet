@@ -4,6 +4,7 @@ use std::{
     env,
     fs::File,
     io::Write,
+    net::{IpAddr, UdpSocket},
     path::{Path, PathBuf},
     sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
@@ -16,11 +17,12 @@ use infernet_model::{
 };
 use infernet_node::{
     DiscoveryConfig, SeededModelSummary, ShardCache, ShardCacheConfig, discover_for,
-    import_seed_model_from_file_with_progress, infer_over_libp2p, run_model_distribution_node,
+    empty_advertisement, import_seed_model_from_file_with_progress, infer_over_libp2p,
+    run_model_distribution_node,
 };
 use infernet_protocol::{NodeAdvertisement, PROTOCOL_VERSION, RouteHop, TraceEvent};
 use infernet_router::ShardRegistry;
-use libp2p::identity;
+use libp2p::{Multiaddr, PeerId, identity};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::process::Command;
@@ -29,12 +31,14 @@ const DEFAULT_TOPIC: &str = "infernet/grid-demo/1";
 const DEFAULT_DISCOVERY_TIMEOUT_MS: u64 = 4_000;
 const DEFAULT_INFERENCE_TIMEOUT_MS: u64 = 6_000;
 const MAX_SAFE_LOCAL_GGUF_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+const UI_LISTEN_PORT: u16 = 9777;
 
 struct UiState {
     keypair: Mutex<identity::Keypair>,
     topic: String,
     huggingface_token: Mutex<Option<String>>,
     model_distribution_started: Mutex<bool>,
+    manual_peers: Mutex<Vec<NodeAdvertisement>>,
 }
 
 impl Default for UiState {
@@ -44,6 +48,7 @@ impl Default for UiState {
             topic: DEFAULT_TOPIC.to_owned(),
             huggingface_token: Mutex::new(None),
             model_distribution_started: Mutex::new(false),
+            manual_peers: Mutex::new(Vec::new()),
         }
     }
 }
@@ -54,6 +59,7 @@ struct LocalIdentity {
     peer_id: String,
     topic: String,
     listen: String,
+    connect_addresses: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -249,12 +255,42 @@ enum ProgressEvent {
 #[tauri::command]
 async fn get_local_identity(state: State<'_, UiState>) -> Result<LocalIdentity, String> {
     let (peer_id, topic) = identity_from_state(&state)?;
+    let connect_addresses = local_connect_addresses(&peer_id);
 
     Ok(LocalIdentity {
-        peer_id,
+        peer_id: peer_id.clone(),
         topic,
-        listen: "/ip4/0.0.0.0/tcp/0".to_owned(),
+        listen: format!("/ip4/0.0.0.0/tcp/{UI_LISTEN_PORT}/p2p/{peer_id}"),
+        connect_addresses,
     })
+}
+
+#[tauri::command]
+fn get_manual_peers(state: State<'_, UiState>) -> Result<Vec<String>, String> {
+    manual_peer_addresses(&state)
+}
+
+#[tauri::command]
+fn add_manual_peer(state: State<'_, UiState>, address: String) -> Result<Vec<String>, String> {
+    let advertisement = parse_manual_peer(&address)?;
+    let mut manual_peers = state
+        .manual_peers
+        .lock()
+        .map_err(|_| "failed to lock manual peers".to_owned())?;
+
+    manual_peers.retain(|peer| peer.peer_id != advertisement.peer_id);
+    manual_peers.push(advertisement);
+    Ok(manual_peers.iter().flat_map(peer_address_labels).collect())
+}
+
+#[tauri::command]
+fn clear_manual_peers(state: State<'_, UiState>) -> Result<Vec<String>, String> {
+    state
+        .manual_peers
+        .lock()
+        .map_err(|_| "failed to lock manual peers".to_owned())?
+        .clear();
+    Ok(Vec::new())
 }
 
 #[tauri::command]
@@ -1511,6 +1547,12 @@ fn ensure_model_distribution_service(
         .clone();
     let mut discovery = DiscoveryConfig::new(state.topic.clone());
     discovery.keypair = keypair;
+    discovery.p2p_listen = format!("/ip4/0.0.0.0/tcp/{UI_LISTEN_PORT}");
+    discovery.static_peers = state
+        .manual_peers
+        .lock()
+        .map_err(|_| "failed to lock manual peers".to_owned())?
+        .clone();
     *started = true;
 
     tokio::spawn(async move {
@@ -1520,6 +1562,81 @@ fn ensure_model_distribution_service(
     });
 
     Ok(())
+}
+
+fn parse_manual_peer(input: &str) -> Result<NodeAdvertisement, String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err("Paste a peer address from the other computer.".to_owned());
+    }
+
+    let (peer_id, address) = if let Some((peer_id, address)) = input.split_once('@') {
+        (peer_id.trim().to_owned(), address.trim().to_owned())
+    } else if let Some((_, peer_id)) = input.rsplit_once("/p2p/") {
+        (peer_id.trim().to_owned(), input.to_owned())
+    } else {
+        return Err(
+            "Peer address must look like /ip4/192.168.1.10/tcp/9777/p2p/12D3...".to_owned(),
+        );
+    };
+
+    peer_id
+        .parse::<PeerId>()
+        .map_err(|_| format!("invalid peer id {peer_id}"))?;
+    address
+        .parse::<Multiaddr>()
+        .map_err(|_| format!("invalid peer address {address}"))?;
+
+    Ok(empty_advertisement(peer_id, address))
+}
+
+fn manual_peer_addresses(state: &State<'_, UiState>) -> Result<Vec<String>, String> {
+    Ok(state
+        .manual_peers
+        .lock()
+        .map_err(|_| "failed to lock manual peers".to_owned())?
+        .iter()
+        .flat_map(peer_address_labels)
+        .collect())
+}
+
+fn peer_address_labels(advertisement: &NodeAdvertisement) -> Vec<String> {
+    advertisement
+        .addresses
+        .iter()
+        .map(|address| format!("{}@{}", advertisement.peer_id, address))
+        .collect()
+}
+
+fn local_connect_addresses(peer_id: &str) -> Vec<String> {
+    let mut addresses = Vec::new();
+    if let Some(ip) = preferred_lan_ip() {
+        addresses.push(format!(
+            "/{}/{}/tcp/{}/p2p/{}",
+            ip_protocol(ip),
+            ip,
+            UI_LISTEN_PORT,
+            peer_id
+        ));
+    }
+    addresses.push(format!("/ip4/127.0.0.1/tcp/{UI_LISTEN_PORT}/p2p/{peer_id}"));
+    addresses.sort();
+    addresses.dedup();
+    addresses
+}
+
+fn preferred_lan_ip() -> Option<IpAddr> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    (!ip.is_loopback()).then_some(ip)
+}
+
+fn ip_protocol(ip: IpAddr) -> &'static str {
+    match ip {
+        IpAddr::V4(_) => "ip4",
+        IpAddr::V6(_) => "ip6",
+    }
 }
 
 fn huggingface_settings_from_token(token: Option<&str>) -> HuggingFaceSettings {
@@ -1710,6 +1827,11 @@ fn discovery_config_from_state(
     let local_peer_id = keypair.public().to_peer_id().to_string();
     let mut config = DiscoveryConfig::new(state.topic.clone());
     config.keypair = keypair;
+    config.static_peers = state
+        .manual_peers
+        .lock()
+        .map_err(|_| "failed to lock manual peers".to_owned())?
+        .clone();
 
     Ok((config, local_peer_id))
 }
@@ -1739,8 +1861,18 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(UiState::default())
+        .setup(|app| {
+            let state = app.state::<UiState>();
+            let cache_config = cache_config_for_app(app.handle());
+            ensure_model_distribution_service(&state, cache_config)
+                .map_err(|error| Box::<dyn std::error::Error>::from(error))?;
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             get_local_identity,
+            get_manual_peers,
+            add_manual_peer,
+            clear_manual_peers,
             get_grid_snapshot,
             run_demo_inference,
             add_local_gguf_model,

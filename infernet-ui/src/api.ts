@@ -37,6 +37,18 @@ export async function getLocalIdentity(): Promise<LocalIdentity> {
   return invoke<LocalIdentity>("get_local_identity");
 }
 
+export async function getManualPeers(): Promise<string[]> {
+  return invoke<string[]>("get_manual_peers");
+}
+
+export async function addManualPeer(address: string): Promise<string[]> {
+  return invoke<string[]>("add_manual_peer", { address });
+}
+
+export async function clearManualPeers(): Promise<string[]> {
+  return invoke<string[]>("clear_manual_peers");
+}
+
 export async function getGridSnapshot(
   discoveryTimeoutMs = 4000,
   modelId?: string,

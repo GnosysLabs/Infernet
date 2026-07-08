@@ -927,9 +927,11 @@ button:disabled {
 .download-metric span,
 .download-row span,
 .download-row small,
-.settings-row span {
+.settings-row span,
+.settings-row small {
   color: var(--muted);
   font-size: 13px;
+  overflow-wrap: anywhere;
 }
 
 .download-metric strong {
@@ -965,6 +967,23 @@ button:disabled {
 
 .huggingface-settings {
   max-width: 920px;
+}
+
+.manual-peer-settings {
+  max-width: 980px;
+  align-items: flex-start;
+}
+
+.manual-peer-controls {
+  width: min(560px, 100%);
+  display: grid !important;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.manual-peer-controls input {
+  min-width: 0;
 }
 
 .token-controls {

@@ -2,6 +2,7 @@ export interface LocalIdentity {
   peerId: string;
   topic: string;
   listen: string;
+  connectAddresses: string[];
 }
 
 export interface ModelView {

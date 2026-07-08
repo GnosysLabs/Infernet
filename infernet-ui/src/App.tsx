@@ -20,14 +20,17 @@ import {
   Wifi,
 } from "lucide-react";
 import {
+  addManualPeer,
   addHuggingFaceModel,
   addLocalGgufModel,
   chooseLocalModelFile,
   clearHuggingFaceToken,
+  clearManualPeers,
   emptySnapshot,
   getGridSnapshot,
   getHuggingFaceSettings,
   getLocalIdentity,
+  getManualPeers,
   inspectHuggingFaceRepo,
   listenForProgress,
   listenForModelImportProgress,
@@ -289,6 +292,7 @@ export default function App() {
             identity={identity}
             developerMode={developerMode}
             setDeveloperMode={setDeveloperMode}
+            onNetworkChanged={() => refreshSnapshot(selectedModel)}
           />
         ) : null}
       </main>
@@ -986,19 +990,27 @@ function SettingsPage({
   identity,
   developerMode,
   setDeveloperMode,
+  onNetworkChanged,
 }: {
   identity: LocalIdentity | null;
   developerMode: boolean;
   setDeveloperMode: (enabled: boolean) => void;
+  onNetworkChanged: () => void;
 }) {
   const [hfSettings, setHfSettings] = useState<HuggingFaceSettings>({ hasToken: false });
   const [token, setToken] = useState("");
   const [tokenStatus, setTokenStatus] = useState<string | null>(null);
+  const [manualPeer, setManualPeer] = useState("");
+  const [manualPeers, setManualPeers] = useState<string[]>([]);
+  const [manualPeerStatus, setManualPeerStatus] = useState<string | null>(null);
 
   useEffect(() => {
     getHuggingFaceSettings()
       .then(setHfSettings)
       .catch((error) => setTokenStatus(String(error)));
+    getManualPeers()
+      .then(setManualPeers)
+      .catch((error) => setManualPeerStatus(String(error)));
   }, []);
 
   async function saveToken() {
@@ -1019,6 +1031,29 @@ function SettingsPage({
       setTokenStatus("Token cleared.");
     } catch (error) {
       setTokenStatus(String(error));
+    }
+  }
+
+  async function connectPeer() {
+    try {
+      const peers = await addManualPeer(manualPeer);
+      setManualPeers(peers);
+      setManualPeer("");
+      setManualPeerStatus("Peer added. Refreshing network.");
+      onNetworkChanged();
+    } catch (error) {
+      setManualPeerStatus(String(error));
+    }
+  }
+
+  async function clearPeers() {
+    try {
+      const peers = await clearManualPeers();
+      setManualPeers(peers);
+      setManualPeerStatus("Manual peers cleared.");
+      onNetworkChanged();
+    } catch (error) {
+      setManualPeerStatus(String(error));
     }
   }
 
@@ -1045,6 +1080,35 @@ function SettingsPage({
           <div>
             <strong>Local node</strong>
             <span>{identity?.peerId ?? "Starting"}</span>
+          </div>
+        </div>
+        <div className="settings-row">
+          <div>
+            <strong>LAN address</strong>
+            <span>{identity?.connectAddresses[0] ?? "Starting network"}</span>
+          </div>
+        </div>
+        <div className="settings-row manual-peer-settings">
+          <div>
+            <strong>Connect to another computer</strong>
+            <span>Paste the LAN address from the other Infernet app if automatic discovery shows 0 peers.</span>
+            {manualPeers.length > 0 ? (
+              <small>{manualPeers.length === 1 ? manualPeers[0] : `${manualPeers.length} manual peers`}</small>
+            ) : null}
+            {manualPeerStatus ? <small>{manualPeerStatus}</small> : null}
+          </div>
+          <div className="manual-peer-controls">
+            <input
+              value={manualPeer}
+              onChange={(event) => setManualPeer(event.target.value)}
+              placeholder="/ip4/192.168.1.10/tcp/9777/p2p/12D3..."
+            />
+            <button className="secondary-button" onClick={connectPeer} disabled={!manualPeer.trim()}>
+              Connect
+            </button>
+            <button className="text-button" onClick={clearPeers} disabled={manualPeers.length === 0}>
+              Clear
+            </button>
           </div>
         </div>
         <div className="settings-row huggingface-settings">
