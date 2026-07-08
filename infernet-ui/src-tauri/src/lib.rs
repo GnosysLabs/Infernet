@@ -32,7 +32,10 @@ const DEFAULT_DISCOVERY_TIMEOUT_MS: u64 = 4_000;
 const DEFAULT_INFERENCE_TIMEOUT_MS: u64 = 6_000;
 const MAX_SAFE_LOCAL_GGUF_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 const UI_LISTEN_PORT: u16 = 9777;
-const DEFAULT_BOOTSTRAP_PEERS: &[&str] = &[];
+const DEFAULT_BOOTSTRAP_PEERS: &[&str] = &[
+    "12D3KooWRJrnpHPQTWdThpDGZMwRCHhEBL4JCAxFMwYMfFavxa2h@/ip4/217.77.11.197/tcp/9777/p2p/12D3KooWRJrnpHPQTWdThpDGZMwRCHhEBL4JCAxFMwYMfFavxa2h",
+    "12D3KooWRJrnpHPQTWdThpDGZMwRCHhEBL4JCAxFMwYMfFavxa2h@/dns4/infernet.gnosyslabs.xyz/tcp/9777/p2p/12D3KooWRJrnpHPQTWdThpDGZMwRCHhEBL4JCAxFMwYMfFavxa2h",
+];
 
 struct UiState {
     keypair: Mutex<identity::Keypair>,

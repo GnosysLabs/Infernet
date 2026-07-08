@@ -246,7 +246,7 @@ cargo run -p infernet-worker -- infer --model grid-demo-12 --prompt "hello infer
 The output includes a deterministic demo token and a trace showing each peer and
 layer range that participated.
 
-## LAN Run
+## LAN And Internet Discovery
 
 mDNS works across machines on the same LAN when local firewalls allow traffic.
 For cross-machine activation forwarding, bind libp2p to a LAN interface or use
@@ -266,9 +266,20 @@ cargo run -p infernet-worker -- route --model grid-demo-12
 cargo run -p infernet-worker -- infer --model grid-demo-12 --prompt "hello infernet"
 ```
 
+For internet discovery, the desktop app dials the public bootstrap node:
+
+```text
+/ip4/217.77.11.197/tcp/9777/p2p/12D3KooWRJrnpHPQTWdThpDGZMwRCHhEBL4JCAxFMwYMfFavxa2h
+```
+
+`infernet.gnosyslabs.xyz` is also configured as a DNS bootstrap address, but
+the DNS record must be DNS-only for raw libp2p TCP. If it is Cloudflare-proxied,
+clients will use the direct IP address instead.
+
 Current limitations:
 
-- mDNS is LAN/local only; WAN discovery still needs Kademlia/bootstrap work.
+- WAN discovery uses the public bootstrap node; private NAT-to-NAT activation
+  and model transfer still need circuit relay or hole punching.
 - Model distribution uses `/infernet/model/1`, but currently transfers one JSON
   encoded payload from one source. Binary streaming, resume, and multi-source
   downloads are future work.

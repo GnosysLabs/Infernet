@@ -1082,6 +1082,22 @@ fn handle_grid_event(
                 }
             }
         }
+        SwarmEvent::ConnectionEstablished {
+            peer_id, endpoint, ..
+        } => {
+            println!("libp2p_connected peer_id={} endpoint={:?}", peer_id, endpoint);
+        }
+        SwarmEvent::ConnectionClosed {
+            peer_id,
+            endpoint,
+            cause,
+            ..
+        } => {
+            println!(
+                "libp2p_disconnected peer_id={} endpoint={:?} cause={:?}",
+                peer_id, endpoint, cause
+            );
+        }
         SwarmEvent::Behaviour(GridBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
             for (peer_id, address) in peers {
                 swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
