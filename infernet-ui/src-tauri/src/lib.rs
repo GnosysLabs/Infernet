@@ -740,7 +740,7 @@ fn model_view_from_manifest(
         activation_dtype: manifest.activation_dtype.clone(),
         installed,
         runnable,
-        status: model_status(manifest, installed, runnable),
+        status: model_status(manifest, installed, runnable, cache_config),
     }
 }
 
@@ -838,7 +838,12 @@ fn discovered_model_manifests(registry: &ShardRegistry) -> Vec<ModelManifest> {
     by_model.into_values().collect()
 }
 
-fn model_status(manifest: &ModelManifest, installed: bool, runnable: bool) -> String {
+fn model_status(
+    manifest: &ModelManifest,
+    installed: bool,
+    runnable: bool,
+    cache_config: &ShardCacheConfig,
+) -> String {
     if runnable {
         return "Ready to chat".to_owned();
     }
@@ -851,7 +856,7 @@ fn model_status(manifest: &ModelManifest, installed: bool, runnable: bool) -> St
         return "Available on the network".to_owned();
     }
 
-    let Some(source_path) = source_path_for_model(&cache_config_placeholder(), &manifest.model_id) else {
+    let Some(source_path) = source_path_for_model(cache_config, &manifest.model_id) else {
         return "Installed for sharing. Token execution is not connected yet.".to_owned();
     };
     if std::fs::metadata(source_path)
