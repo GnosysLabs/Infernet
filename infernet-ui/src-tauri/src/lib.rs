@@ -74,6 +74,7 @@ struct GridSnapshot {
     selected_model: String,
     available_models: Vec<ModelView>,
     layer_count: u32,
+    network_peer_count: usize,
     peers: Vec<PeerView>,
     route: Vec<RouteHopView>,
     missing_ranges: Option<String>,
@@ -712,8 +713,10 @@ fn snapshot_from_registry(
     registry: &ShardRegistry,
     cache_config: &ShardCacheConfig,
 ) -> GridSnapshot {
+    let all_advertisements = registry.advertisements();
+    let network_peer_count = remote_network_peer_count(&local_peer_id, &all_advertisements);
     let advertisements =
-        ui_visible_advertisements(registry.advertisements(), Some(&manifest.model_id));
+        ui_visible_advertisements(all_advertisements.clone(), Some(&manifest.model_id));
     let route_result = registry.route_for_model(manifest);
     let (route, missing_ranges) = match route_result {
         Ok(route) => (route, None),
@@ -726,6 +729,7 @@ fn snapshot_from_registry(
         selected_model: manifest.model_id.clone(),
         available_models: available_model_views(cache_config, Some(registry)),
         layer_count: manifest.layer_count,
+        network_peer_count,
         peers: advertisements
             .iter()
             .map(peer_view_from_advertisement)
@@ -743,13 +747,16 @@ fn empty_snapshot(
     cache_config: &ShardCacheConfig,
     registry: &ShardRegistry,
 ) -> GridSnapshot {
-    let advertisements = ui_visible_advertisements(registry.advertisements(), None);
+    let all_advertisements = registry.advertisements();
+    let network_peer_count = remote_network_peer_count(&local_peer_id, &all_advertisements);
+    let advertisements = ui_visible_advertisements(all_advertisements, None);
     GridSnapshot {
         local_peer_id,
         topic,
         selected_model: String::new(),
         available_models: available_model_views(cache_config, Some(registry)),
         layer_count: 0,
+        network_peer_count,
         peers: advertisements
             .iter()
             .map(peer_view_from_advertisement)
@@ -924,6 +931,23 @@ fn ui_visible_advertisements(
                 Some(advertisement)
             }
         })
+        .collect()
+}
+
+fn remote_network_peer_count(local_peer_id: &str, advertisements: &[NodeAdvertisement]) -> usize {
+    let bootstrap_peer_ids = default_bootstrap_peer_ids();
+    advertisements
+        .iter()
+        .filter(|advertisement| advertisement.peer_id != local_peer_id)
+        .filter(|advertisement| !bootstrap_peer_ids.contains(&advertisement.peer_id))
+        .count()
+}
+
+fn default_bootstrap_peer_ids() -> Vec<String> {
+    DEFAULT_BOOTSTRAP_PEERS
+        .iter()
+        .filter_map(|address| parse_manual_peer(address).ok())
+        .map(|advertisement| advertisement.peer_id)
         .collect()
 }
 

@@ -18,6 +18,7 @@ export const emptySnapshot: GridSnapshot = {
   selectedModel: "",
   availableModels: [],
   layerCount: 0,
+  networkPeerCount: 0,
   peers: [],
   route: [],
   missingRanges: null,

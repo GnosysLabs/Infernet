@@ -248,6 +248,21 @@ async fn bootstrap(args: BootstrapArgs) -> Result<()> {
     let mut discovery = DiscoveryConfig::new(args.topic);
     discovery.keypair = keypair;
     discovery.p2p_listen = args.p2p_listen.clone();
+    discovery.advertise_listen_addresses = false;
+    discovery.dial_discovered_peers = false;
+
+    let mut bootstrap_advertisement = empty_advertisement(peer_id.clone(), String::new());
+    if let Some(ip) = args.public_ip.as_deref() {
+        bootstrap_advertisement
+            .addresses
+            .push(format!("/ip4/{ip}/tcp/{tcp_port}/p2p/{peer_id}"));
+    }
+    if let Some(domain) = args.public_domain.as_deref() {
+        bootstrap_advertisement
+            .addresses
+            .push(format!("/dns4/{domain}/tcp/{tcp_port}/p2p/{peer_id}"));
+    }
+    discovery.advertisement = Some(bootstrap_advertisement);
 
     println!("peer_id={peer_id}");
     println!("listen={}", args.p2p_listen);

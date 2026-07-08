@@ -79,6 +79,7 @@ export interface GridSnapshot {
   selectedModel: string;
   availableModels: ModelView[];
   layerCount: number;
+  networkPeerCount: number;
   peers: PeerView[];
   route: RouteHopView[];
   missingRanges?: string | null;

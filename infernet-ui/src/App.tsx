@@ -83,7 +83,7 @@ export default function App() {
   );
   const activeRoute = route.length > 0 ? route : snapshot.route;
   const peerCount = uniquePeerCount(activeRoute);
-  const remotePeerCount = snapshot.peers.filter((peer) => peer.peerId !== snapshot.localPeerId).length;
+  const remotePeerCount = snapshot.networkPeerCount;
   const completedHops = hops.filter((hop) => hop.status === "complete").length;
 
   const applyProgressEvent = useCallback((event: ProgressEvent) => {

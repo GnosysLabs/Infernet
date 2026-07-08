@@ -48,6 +48,8 @@ pub struct DiscoveryConfig {
     pub advertisement: Option<NodeAdvertisement>,
     pub static_peers: Vec<NodeAdvertisement>,
     pub publish_interval: Duration,
+    pub advertise_listen_addresses: bool,
+    pub dial_discovered_peers: bool,
 }
 
 impl DiscoveryConfig {
@@ -59,6 +61,8 @@ impl DiscoveryConfig {
             advertisement: None,
             static_peers: Vec::new(),
             publish_interval: Duration::from_millis(750),
+            advertise_listen_addresses: true,
+            dial_discovered_peers: true,
         }
     }
 
@@ -216,6 +220,8 @@ pub async fn run_worker_node(mut discovery: DiscoveryConfig, worker: WorkerConfi
                     &mut registry,
                     &mut discovery.advertisement,
                     &topic,
+                    discovery.advertise_listen_addresses,
+                    discovery.dial_discovered_peers,
                 )? {
                     match network_event {
                         GridNetworkEvent::Activation(event) => {
@@ -277,6 +283,8 @@ pub async fn run_model_distribution_node(
                     &mut registry,
                     &mut discovery.advertisement,
                     &topic,
+                    discovery.advertise_listen_addresses,
+                    discovery.dial_discovered_peers,
                 )? {
                     if let GridNetworkEvent::Model(event) = network_event {
                         handle_model_network_event(&mut swarm, Some(&shard_cache), &peer_id, event)?;
@@ -310,6 +318,8 @@ pub async fn discover_for(mut config: DiscoveryConfig, timeout: Duration) -> Res
                     &mut registry,
                     &mut config.advertisement,
                     &topic,
+                    config.advertise_listen_addresses,
+                    config.dial_discovered_peers,
                 )?;
             }
             _ = sleep_until(deadline) => {
@@ -391,6 +401,8 @@ pub async fn fetch_model_shard_over_libp2p(
                     &mut registry,
                     &mut config.advertisement,
                     &topic,
+                    config.advertise_listen_addresses,
+                    config.dial_discovered_peers,
                 )? {
                     match network_event {
                         GridNetworkEvent::Model(ModelNetworkEvent::Response { request_id, response }) => {
@@ -772,6 +784,8 @@ async fn discover_route_on_swarm(
                     registry,
                     &mut config.advertisement,
                     topic,
+                    config.advertise_listen_addresses,
+                    config.dial_discovered_peers,
                 )?;
             }
             _ = sleep_until(deadline) => {
@@ -800,6 +814,8 @@ async fn wait_for_client_response(
                     registry,
                     &mut config.advertisement,
                     topic,
+                    config.advertise_listen_addresses,
+                    config.dial_discovered_peers,
                 )? {
                     Some(GridNetworkEvent::Activation(ActivationNetworkEvent::Response { request_id, response }))
                         if request_id == outbound_id => return Ok(response),
@@ -1064,11 +1080,14 @@ fn handle_grid_event(
     registry: &mut ShardRegistry,
     advertisement: &mut Option<NodeAdvertisement>,
     topic: &gossipsub::IdentTopic,
+    advertise_listen_addresses: bool,
+    dial_discovered_peers: bool,
 ) -> Result<Option<GridNetworkEvent>> {
     match event {
         SwarmEvent::NewListenAddr { address, .. } => {
             let peer_id = *swarm.local_peer_id();
-            if update_listen_address(advertisement, peer_id, address) {
+            if advertise_listen_addresses && update_listen_address(advertisement, peer_id, address)
+            {
                 if let Some(advertisement) = advertisement {
                     println!(
                         "libp2p_listen={}",
@@ -1085,7 +1104,10 @@ fn handle_grid_event(
         SwarmEvent::ConnectionEstablished {
             peer_id, endpoint, ..
         } => {
-            println!("libp2p_connected peer_id={} endpoint={:?}", peer_id, endpoint);
+            println!(
+                "libp2p_connected peer_id={} endpoint={:?}",
+                peer_id, endpoint
+            );
         }
         SwarmEvent::ConnectionClosed {
             peer_id,
@@ -1099,9 +1121,11 @@ fn handle_grid_event(
             );
         }
         SwarmEvent::Behaviour(GridBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
-            for (peer_id, address) in peers {
-                swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                swarm.add_peer_address(peer_id, address);
+            if dial_discovered_peers {
+                for (peer_id, address) in peers {
+                    swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                    swarm.add_peer_address(peer_id, address);
+                }
             }
         }
         SwarmEvent::Behaviour(GridBehaviourEvent::Mdns(mdns::Event::Expired(peers))) => {
@@ -1118,7 +1142,9 @@ fn handle_grid_event(
         })) => {
             let advertisement = serde_json::from_slice::<NodeAdvertisement>(&message.data)?;
             if advertisement.protocol_version == PROTOCOL_VERSION {
-                add_advertisement_addresses(swarm, &advertisement);
+                if dial_discovered_peers {
+                    add_advertisement_addresses(swarm, &advertisement);
+                }
                 registry.upsert(advertisement);
             }
         }
