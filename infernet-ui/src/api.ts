@@ -12,9 +12,6 @@ import type {
   RunDemoResponse,
 } from "./types";
 
-export const isTauriRuntime =
-  "__TAURI_INTERNALS__" in window || "__TAURI__" in window;
-
 export const emptySnapshot: GridSnapshot = {
   localPeerId: "",
   topic: "infernet/grid-demo/1",
@@ -110,23 +107,23 @@ export async function addHuggingFaceModel(
 export async function listenForProgress(
   handler: (event: ProgressEvent) => void,
 ): Promise<() => void> {
-  if (!isTauriRuntime) {
+  try {
+    return await listen<ProgressEvent>("infernet-progress", (event) => {
+      handler(event.payload);
+    });
+  } catch {
     return () => undefined;
   }
-
-  return listen<ProgressEvent>("infernet-progress", (event) => {
-    handler(event.payload);
-  });
 }
 
 export async function listenForModelImportProgress(
   handler: (event: ModelImportProgress) => void,
 ): Promise<() => void> {
-  if (!isTauriRuntime) {
+  try {
+    return await listen<ModelImportProgress>("infernet-model-import-progress", (event) => {
+      handler(event.payload);
+    });
+  } catch {
     return () => undefined;
   }
-
-  return listen<ModelImportProgress>("infernet-model-import-progress", (event) => {
-    handler(event.payload);
-  });
 }
