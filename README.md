@@ -149,6 +149,12 @@ Run the repeatable dynamic discovery smoke test:
 scripts/smoke-demo.sh "hello infernet"
 ```
 
+On Windows PowerShell:
+
+```powershell
+.\scripts\smoke-demo.ps1 "hello infernet"
+```
+
 The script starts four independent workers, lets them discover one another over
 libp2p, and runs inference without a hardcoded route.
 
@@ -188,6 +194,12 @@ Start four workers and launch the desktop UI:
 
 ```sh
 scripts/ui-demo.sh
+```
+
+On Windows PowerShell:
+
+```powershell
+.\scripts\ui-demo.ps1
 ```
 
 For frontend-only visual development without Tauri commands:
