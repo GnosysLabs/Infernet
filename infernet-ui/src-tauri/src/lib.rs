@@ -629,26 +629,39 @@ async fn add_huggingface_model(
 }
 
 async fn collect_snapshot(
+    app: &AppHandle,
     state: &State<'_, UiState>,
     discovery_timeout_ms: u64,
     model_id: Option<&str>,
 ) -> Result<GridSnapshot, String> {
     let (mut config, local_peer_id) = discovery_config_from_state(state)?;
+    let cache_config = cache_config_for_app(app);
     let topic = config.topic.clone();
-    let manifest = manifest_for_model(model_id).map_err(|error| error.to_string())?;
-    if let Some(local_advertisement) = local_cache_advertisement(local_peer_id.clone()) {
+    if let Some(local_advertisement) =
+        local_cache_advertisement(&cache_config, local_peer_id.clone())
+    {
         config.static_peers.push(local_advertisement.clone());
         config.advertisement = Some(local_advertisement);
     }
     let registry = discover_for(config, Duration::from_millis(discovery_timeout_ms))
         .await
         .map_err(|error| error.to_string())?;
+    let manifest = match manifest_for_model(model_id, &cache_config, Some(&registry)) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            if model_id.is_none_or(|value| value.trim().is_empty()) {
+                return Ok(empty_snapshot(local_peer_id, topic, &cache_config, &registry));
+            }
+            return Err(error.to_string());
+        }
+    };
 
     Ok(snapshot_from_registry(
         local_peer_id,
         topic,
         &manifest,
         &registry,
+        &cache_config,
     ))
 }
 
@@ -657,6 +670,7 @@ fn snapshot_from_registry(
     topic: String,
     manifest: &ModelManifest,
     registry: &ShardRegistry,
+    cache_config: &ShardCacheConfig,
 ) -> GridSnapshot {
     let advertisements = registry.advertisements();
     let route_result = registry.route_for_model(manifest);
@@ -669,7 +683,7 @@ fn snapshot_from_registry(
         local_peer_id,
         topic,
         selected_model: manifest.model_id.clone(),
-        available_models: available_model_views(),
+        available_models: available_model_views(cache_config, Some(registry)),
         layer_count: manifest.layer_count,
         peers: advertisements
             .iter()
@@ -678,31 +692,75 @@ fn snapshot_from_registry(
         route: route.iter().map(route_hop_view).collect(),
         missing_ranges,
         coverage: build_coverage(manifest, &route, &advertisements),
-        distribution: build_distribution_snapshot(&advertisements),
+        distribution: build_distribution_snapshot(cache_config, &advertisements),
     }
 }
 
-fn model_view_from_manifest(manifest: &ModelManifest) -> ModelView {
+fn empty_snapshot(
+    local_peer_id: String,
+    topic: String,
+    cache_config: &ShardCacheConfig,
+    registry: &ShardRegistry,
+) -> GridSnapshot {
+    let advertisements = registry.advertisements();
+    GridSnapshot {
+        local_peer_id,
+        topic,
+        selected_model: String::new(),
+        available_models: available_model_views(cache_config, Some(registry)),
+        layer_count: 0,
+        peers: advertisements
+            .iter()
+            .map(peer_view_from_advertisement)
+            .collect(),
+        route: Vec::new(),
+        missing_ranges: None,
+        coverage: Vec::new(),
+        distribution: build_distribution_snapshot(cache_config, &advertisements),
+    }
+}
+
+fn model_view_from_manifest(manifest: &ModelManifest, installed: bool) -> ModelView {
+    let runnable = manifest.runtime_kind == RuntimeKind::Demo
+        || (manifest.runtime_kind == RuntimeKind::LlamaCpp
+            && installed
+            && source_path_for_model(&cache_config_for_current_dir(), &manifest.model_id)
+                .and_then(|path| std::fs::metadata(path).ok())
+                .is_some_and(|metadata| metadata.len() <= MAX_SAFE_LOCAL_GGUF_BYTES)
+            && find_llama_cli().is_some());
     ModelView {
         model_id: manifest.model_id.clone(),
         display_name: manifest.display_name.clone(),
         runtime_kind: manifest.runtime_kind.as_str().to_owned(),
         layer_count: manifest.layer_count,
         activation_dtype: manifest.activation_dtype.clone(),
+        installed,
+        runnable,
+        status: model_status(manifest, installed, runnable),
     }
 }
 
-fn available_model_views() -> Vec<ModelView> {
-    let mut manifests = installed_model_manifests();
+fn available_model_views(
+    cache_config: &ShardCacheConfig,
+    registry: Option<&ShardRegistry>,
+) -> Vec<ModelView> {
+    let installed_ids = installed_model_ids(cache_config);
+    let mut manifests = installed_model_manifests(cache_config);
+    if let Some(registry) = registry {
+        manifests.extend(discovered_model_manifests(registry));
+    }
     manifests.sort_by(|left, right| left.model_id.cmp(&right.model_id));
     manifests.dedup_by(|left, right| left.model_id == right.model_id);
     manifests.sort_by(|left, right| left.display_name.cmp(&right.display_name));
 
-    manifests.iter().map(model_view_from_manifest).collect()
+    manifests
+        .iter()
+        .map(|manifest| model_view_from_manifest(manifest, installed_ids.contains(&manifest.model_id)))
+        .collect()
 }
 
-fn installed_model_manifests() -> Vec<ModelManifest> {
-    let Ok(cache) = ShardCache::new(default_cache_config()) else {
+fn installed_model_manifests(cache_config: &ShardCacheConfig) -> Vec<ModelManifest> {
+    let Ok(cache) = ShardCache::new(cache_config.clone()) else {
         return Vec::new();
     };
     let Ok(records) = cache.list() else {
