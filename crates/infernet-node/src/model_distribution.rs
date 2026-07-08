@@ -344,6 +344,16 @@ pub fn import_seed_model_from_file(
     manifest: &ModelManifest,
     version: impl Into<String>,
 ) -> Result<SeededModelSummary> {
+    import_seed_model_from_file_with_progress(cache, source, manifest, version, |_, _| {})
+}
+
+pub fn import_seed_model_from_file_with_progress(
+    cache: &ShardCache,
+    source: &Path,
+    manifest: &ModelManifest,
+    version: impl Into<String>,
+    mut on_hash_progress: impl FnMut(u64, u64),
+) -> Result<SeededModelSummary> {
     if source.extension().and_then(|value| value.to_str()) != Some("gguf") {
         bail!(
             "{} must be a .gguf file for model bootstrap",
@@ -357,8 +367,9 @@ pub fn import_seed_model_from_file(
         bail!("{} is not a file", source.display());
     }
 
-    let source_checksum = sha256_file(source)?;
     let source_size_bytes = metadata.len();
+    let source_checksum =
+        sha256_file_with_progress(source, source_size_bytes, &mut on_hash_progress)?;
     let version = version.into();
     let ranges = manifest.automatic_layer_plan()?;
     let source_metadata = SeedSourceMetadata {
@@ -410,12 +421,26 @@ pub fn import_seed_model_from_file(
 }
 
 pub fn sha256_file(path: &Path) -> Result<String> {
+    let total_bytes = fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    sha256_file_with_progress(path, total_bytes, &mut |_, _| {})
+}
+
+fn sha256_file_with_progress(
+    path: &Path,
+    total_bytes: u64,
+    on_progress: &mut impl FnMut(u64, u64),
+) -> Result<String> {
     use std::io::Read;
 
     let mut file =
         fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buffer = [0; 1024 * 64];
+    let mut read_total = 0_u64;
+
+    on_progress(read_total, total_bytes);
 
     loop {
         let read = file.read(&mut buffer)?;
@@ -423,6 +448,8 @@ pub fn sha256_file(path: &Path) -> Result<String> {
             break;
         }
         hasher.update(&buffer[..read]);
+        read_total = read_total.saturating_add(read as u64);
+        on_progress(read_total, total_bytes);
     }
 
     Ok(hex_lower(&hasher.finalize()))

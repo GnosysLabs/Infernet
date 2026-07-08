@@ -22,7 +22,7 @@ use libp2p::{
 };
 pub use model_distribution::{
     CachedShardRecord, SeededModelSummary, ShardCache, ShardCacheConfig, ShardCacheStats,
-    import_seed_model_from_file, sha256_bytes,
+    import_seed_model_from_file, import_seed_model_from_file_with_progress, sha256_bytes,
 };
 use tokio::time::{Instant, interval, sleep};
 

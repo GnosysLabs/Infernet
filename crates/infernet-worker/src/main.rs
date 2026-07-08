@@ -1,12 +1,10 @@
-mod gguf;
-
 use std::{fs, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 use infernet_model::{
     GgufShardManifest, GgufSourceMetadata, LayerRange, ModelManifest, RuntimeKind, ShardMetadata,
-    TokenizerCompatibility,
+    TokenizerCompatibility, gguf,
 };
 use infernet_node::{
     DiscoveryConfig, ShardCache, ShardCacheConfig, WorkerConfig, discover_for, empty_advertisement,
@@ -97,7 +95,7 @@ enum ShardCommand {
 
 #[derive(Debug, Args)]
 struct ShardBuildArgs {
-    #[arg(long, default_value = "grid-llama-3.2-1b")]
+    #[arg(long, default_value = "llama-3.2-1b")]
     model: String,
     #[arg(long)]
     gguf: PathBuf,
@@ -127,8 +125,8 @@ enum ModelCommand {
 struct ModelAddLocalArgs {
     #[command(flatten)]
     cache: ModelCacheArgs,
-    #[arg(long, default_value = "grid-llama-3.2-1b")]
-    model: String,
+    #[arg(long)]
+    model: Option<String>,
     #[arg(long)]
     gguf: PathBuf,
     #[arg(long, default_value = "v1")]
@@ -224,7 +222,10 @@ async fn main() -> Result<()> {
 }
 
 fn add_local_model(args: ModelAddLocalArgs) -> Result<()> {
-    let manifest = manifest_for_model(&args.model)?;
+    let manifest = match args.model {
+        Some(model) => manifest_for_model(&model)?,
+        None => manifest_from_gguf_source(&args.gguf)?,
+    };
     let cache = ShardCache::new(cache_config(&args.cache))?;
     let summary = import_seed_model_from_file(&cache, &args.gguf, &manifest, args.version)?;
 
@@ -366,6 +367,91 @@ fn manifest_for_model(model: &str) -> Result<ModelManifest> {
             .join(", ");
         anyhow!("unknown model {model}; supported models are {supported}")
     })
+}
+
+fn manifest_from_gguf_source(source: &PathBuf) -> Result<ModelManifest> {
+    let info = gguf::parse_gguf_info(source)?;
+    let display_name =
+        display_name_from_source_path(source).unwrap_or_else(|| "Imported GGUF Model".to_owned());
+    let model_id = model_id_from_source_path(source);
+    Ok(ModelManifest::from_gguf_info(
+        model_id,
+        display_name,
+        &info,
+    )?)
+}
+
+fn display_name_from_source_path(path: &PathBuf) -> Option<String> {
+    let file_name = path.file_name()?.to_str()?;
+    let without_ext = file_name
+        .strip_suffix(".gguf")
+        .or_else(|| file_name.strip_suffix(".GGUF"))
+        .unwrap_or(file_name);
+    let name = without_ext
+        .replace(['_', '-', '.'], " ")
+        .split_whitespace()
+        .map(format_model_name_part)
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    (!name.is_empty()).then_some(name)
+}
+
+fn model_id_from_source_path(path: &PathBuf) -> String {
+    let name = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .or_else(|| path.file_name().and_then(|value| value.to_str()))
+        .unwrap_or("gguf-model");
+    model_id_from_name(name)
+}
+
+fn model_id_from_name(name: &str) -> String {
+    let mut output = String::new();
+    let mut last_was_separator = false;
+
+    for ch in name.chars().flat_map(|ch| ch.to_lowercase()) {
+        if ch.is_ascii_alphanumeric() || ch == '.' {
+            output.push(ch);
+            last_was_separator = false;
+        } else if !last_was_separator && !output.is_empty() {
+            output.push('-');
+            last_was_separator = true;
+        }
+    }
+
+    while output.ends_with('-') {
+        output.pop();
+    }
+
+    if output.is_empty() {
+        "gguf-model".to_owned()
+    } else {
+        output
+    }
+}
+
+fn format_model_name_part(part: &str) -> String {
+    let lower = part.to_ascii_lowercase();
+    match lower.as_str() {
+        "gguf" => "GGUF".to_owned(),
+        "llama" => "Llama".to_owned(),
+        "gemma" => "Gemma".to_owned(),
+        "qwen" => "Qwen".to_owned(),
+        "mistral" => "Mistral".to_owned(),
+        "instruct" => "Instruct".to_owned(),
+        "it" => "IT".to_owned(),
+        "q4" | "q5" | "q6" | "q8" | "k" | "m" | "s" | "xs" => lower.to_ascii_uppercase(),
+        value
+            if value.ends_with('b')
+                && value[..value.len() - 1]
+                    .chars()
+                    .all(|ch| ch.is_ascii_digit()) =>
+        {
+            value.to_ascii_uppercase()
+        }
+        _ => part.to_owned(),
+    }
 }
 
 fn parse_layer_range(input: &str) -> Result<LayerRange> {

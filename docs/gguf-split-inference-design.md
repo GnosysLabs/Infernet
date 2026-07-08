@@ -347,7 +347,7 @@ The UI should visualize:
 
 ## Immediate Implementation Sequence
 
-1. Add model-catalog metadata for `grid-llama-3.2-1b`.
+1. Add model metadata for `llama-3.2-1b` and derive imported model identities from GGUF metadata.
 2. Add shard metadata structures with tokenizer/checksum/runtime information.
 3. Add a shard-builder command that emits sidecar metadata for a GGUF layer
    range.

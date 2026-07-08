@@ -110,6 +110,14 @@ export interface HuggingFaceFileView {
   sizeBytes?: number | null;
 }
 
+export interface ModelImportProgress {
+  modelId: string;
+  stage: string;
+  detail: string;
+  downloadedBytes: number;
+  totalBytes?: number | null;
+}
+
 export type ProgressEvent =
   | { type: "routeDiscovered"; route: RouteHopView[] }
   | {

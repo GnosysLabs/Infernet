@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod gguf;
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ModelError {
     #[error("layer range {start}..{end} is empty")]
@@ -17,6 +19,8 @@ pub enum ModelError {
     IncompleteCoverage { actual: u32, expected: u32 },
     #[error("cannot plan shards for a model with zero layers")]
     EmptyModel,
+    #[error("GGUF metadata is missing required field {field}")]
+    MissingGgufMetadata { field: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,7 +117,7 @@ impl ModelManifest {
     pub fn demo() -> Self {
         Self {
             model_id: "grid-demo-12".to_owned(),
-            display_name: "Infernet Grid Demo 12 Layer Model".to_owned(),
+            display_name: "Infernet Demo 12 Layer Model".to_owned(),
             architecture: "demo-transformer".to_owned(),
             layer_count: 12,
             hidden_size: 16,
@@ -124,8 +128,8 @@ impl ModelManifest {
 
     pub fn llama32_1b() -> Self {
         Self {
-            model_id: "grid-llama-3.2-1b".to_owned(),
-            display_name: "Grid Llama 3.2 1B".to_owned(),
+            model_id: "llama-3.2-1b".to_owned(),
+            display_name: "Llama 3.2 1B".to_owned(),
             architecture: "llama".to_owned(),
             layer_count: 16,
             hidden_size: 2048,
@@ -142,6 +146,34 @@ impl ModelManifest {
         Self::catalog()
             .into_iter()
             .find(|manifest| manifest.model_id == model_id)
+    }
+
+    pub fn from_gguf_info(
+        model_id: String,
+        display_name: String,
+        info: &gguf::GgufInfo,
+    ) -> Result<Self, ModelError> {
+        Ok(Self {
+            model_id,
+            display_name,
+            architecture: info.architecture.clone().ok_or_else(|| {
+                ModelError::MissingGgufMetadata {
+                    field: "general.architecture".to_owned(),
+                }
+            })?,
+            layer_count: info
+                .layer_count
+                .ok_or_else(|| ModelError::MissingGgufMetadata {
+                    field: "block_count".to_owned(),
+                })?,
+            hidden_size: info
+                .hidden_size
+                .ok_or_else(|| ModelError::MissingGgufMetadata {
+                    field: "embedding_length".to_owned(),
+                })?,
+            activation_dtype: "f16".to_owned(),
+            runtime_kind: RuntimeKind::LlamaCpp,
+        })
     }
 
     pub fn automatic_layer_plan(&self) -> Result<Vec<LayerRange>, ModelError> {

@@ -22,7 +22,7 @@ Read the designs first:
 - [docs/gguf-split-inference-design.md](docs/gguf-split-inference-design.md)
 - [docs/model-distribution-design.md](docs/model-distribution-design.md)
 
-The next milestone targets `grid-llama-3.2-1b`, a Llama 3.2 1B GGUF model. The
+The next milestone targets `llama-3.2-1b`, a Llama 3.2 1B GGUF model. The
 repository can now build Infernet GGUF shard sidecar metadata, advertise
 LlamaCpp shard ranges, and route them by runtime kind. Real llama.cpp
 layer-range execution is intentionally guarded until the native bridge can load
@@ -158,10 +158,10 @@ Build a sidecar manifest for a Llama 3.2 1B GGUF layer range:
 
 ```sh
 cargo run -p infernet-worker -- shard build \
-  --model grid-llama-3.2-1b \
+  --model llama-3.2-1b \
   --gguf /path/to/Llama-3.2-1B-Instruct-Q4_K_M.gguf \
   --layers 0:4 \
-  --out /tmp/grid-llama-3.2-1b-0-4.infernet-shard.json
+  --out /tmp/llama-3.2-1b-0-4.infernet-shard.json
 ```
 
 The sidecar records model id, architecture, layer range, tokenizer checksum,
@@ -174,8 +174,9 @@ does not possess the full model file.
 
 The minimal desktop UI lives in `infernet-ui` and uses Tauri v2, React, and
 TypeScript. It visualizes the same P2P route used by the CLI. The UI no longer
-presents Local and AI Grid execution modes; it presents available models and the
-distributed route chosen for the selected model:
+presents Local and AI Grid execution modes or static test models; it presents
+installed/imported models and the distributed route chosen for the selected
+model:
 
 - model list and selected model;
 - local node identity as one peer in the network;

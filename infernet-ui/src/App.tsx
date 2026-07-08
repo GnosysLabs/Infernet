@@ -22,6 +22,7 @@ import {
 import {
   addHuggingFaceModel,
   addLocalGgufModel,
+  chooseLocalModelFile,
   clearHuggingFaceToken,
   getGridSnapshot,
   getHuggingFaceSettings,
@@ -29,6 +30,7 @@ import {
   inspectHuggingFaceRepo,
   isTauriRuntime,
   listenForProgress,
+  listenForModelImportProgress,
   runDistributedInference,
   saveHuggingFaceToken,
 } from "./api";
@@ -40,6 +42,7 @@ import type {
   HuggingFaceSettings,
   HopProgress,
   LocalIdentity,
+  ModelImportProgress,
   ModelView,
   ProgressEvent,
   RouteHopView,
@@ -200,12 +203,15 @@ export default function App() {
       setStatus("Connected");
     } catch (error) {
       const message = String(error);
+      const runtimePending = isRuntimePendingMessage(message);
       setLastError(message);
-      setMessages((current) => [
-        ...current,
-        { id: `assistant-error-${Date.now()}`, role: "assistant", text: message },
-      ]);
-      setStatus("Needs attention");
+      if (!runtimePending) {
+        setMessages((current) => [
+          ...current,
+          { id: `assistant-error-${Date.now()}`, role: "assistant", text: message },
+        ]);
+      }
+      setStatus(runtimePending ? "Runtime pending" : "Needs attention");
     } finally {
       setIsRunning(false);
     }
@@ -467,22 +473,25 @@ function RunStatusCard({
   showNetwork: boolean;
   setShowNetwork: (show: boolean) => void;
 }) {
+  const runtimePending = lastError ? isRuntimePendingMessage(lastError) : false;
   const label = lastError
-    ? "Needs attention"
+    ? runtimePending ? "Runtime pending" : "Needs attention"
     : isRunning
       ? "Thinking..."
       : "Response ready";
-  const detail = peerCount > 1
+  const detail = runtimePending
+    ? `${totalHops} shard groups ready`
+    : peerCount > 1
     ? `Connected to ${peerCount} peers`
     : "Running on Community Compute";
   const phase = lastError
-    ? lastError
+    ? runtimePending ? "Token generation runtime not connected yet." : lastError
     : isRunning
       ? phaseLabel(completedHops, totalHops)
       : "Done";
 
   return (
-    <div className={lastError ? "run-card error" : "run-card"}>
+    <div className={runtimePending ? "run-card notice" : lastError ? "run-card error" : "run-card"}>
       <div className="run-card-main">
         <span className="run-spinner" />
         <div>
@@ -556,7 +565,6 @@ function ModelsPage({
   const [showImporter, setShowImporter] = useState(false);
   const [source, setSource] = useState<"local" | "huggingface">("local");
   const [showTokenInput, setShowTokenInput] = useState(false);
-  const [draftModelId, setDraftModelId] = useState(defaultAddModelId(snapshot.availableModels));
   const [localPath, setLocalPath] = useState("");
   const [hfRepo, setHfRepo] = useState("bartowski/Llama-3.2-1B-Instruct-GGUF");
   const [hfToken, setHfToken] = useState("");
@@ -564,13 +572,27 @@ function ModelsPage({
   const [selectedHfFile, setSelectedHfFile] = useState("");
   const [isInspecting, setIsInspecting] = useState(false);
   const [isAdding, setIsAdding] = useState(false);
+  const [importProgress, setImportProgress] = useState<ModelImportProgress | null>(null);
   const [result, setResult] = useState<AddModelResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  function openImporter(modelId?: string) {
-    setDraftModelId(modelId ?? defaultAddModelId(snapshot.availableModels));
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listenForModelImportProgress((event) => {
+      setImportProgress(event);
+    }).then((dispose) => {
+      unlisten = dispose;
+    });
+
+    return () => {
+      unlisten?.();
+    };
+  }, []);
+
+  function openImporter() {
     setResult(null);
     setError(null);
+    setImportProgress(null);
     setShowImporter(true);
   }
 
@@ -591,16 +613,44 @@ function ModelsPage({
     }
   }
 
-  async function addModel() {
+  async function chooseFile(): Promise<string | null> {
+    setError(null);
+    try {
+      const selected = await chooseLocalModelFile();
+      if (selected) {
+        setLocalPath(selected);
+      }
+      return selected;
+    } catch (chooseError) {
+      setError(String(chooseError));
+      return null;
+    }
+  }
+
+  async function addModel(pathOverride?: string) {
     setIsAdding(true);
     setError(null);
     setResult(null);
+    setImportProgress({
+      modelId: "importing",
+      stage: source === "huggingface" ? "Starting download" : "Starting import",
+      detail: source === "huggingface" ? hfRepo : pathOverride ?? localPath,
+      downloadedBytes: 0,
+      totalBytes: null,
+    });
     try {
       const response = source === "local"
-        ? await addLocalGgufModel(draftModelId, localPath)
-        : await addHuggingFaceModel(hfRepo, selectedHfFile, draftModelId, hfToken);
+        ? await addLocalGgufModel(pathOverride ?? localPath)
+        : await addHuggingFaceModel(hfRepo, selectedHfFile, hfToken);
       setResult(response);
       setLocalPath("");
+      setImportProgress({
+        modelId: response.modelId,
+        stage: "Ready",
+        detail: "Infernet is sharing this model",
+        downloadedBytes: response.sourceSizeBytes,
+        totalBytes: response.sourceSizeBytes,
+      });
       await onModelImported(response.modelId);
     } catch (addError) {
       setError(String(addError));
@@ -609,9 +659,35 @@ function ModelsPage({
     }
   }
 
-  const canAdd = source === "local"
-    ? draftModelId.length > 0 && localPath.trim().length > 0
-    : draftModelId.length > 0 && hfRepo.trim().length > 0 && selectedHfFile.length > 0;
+  async function runPrimaryImportAction() {
+    if (source === "local" && !localPath.trim()) {
+      const selected = await chooseFile();
+      if (selected) {
+        await addModel(selected);
+      }
+      return;
+    }
+
+    if (source === "huggingface" && !selectedHfFile) {
+      await inspectRepo();
+      return;
+    }
+
+    await addModel();
+  }
+
+  const canRunPrimary = source === "local"
+    ? !isAdding
+    : hfRepo.trim().length > 0 && !isAdding && !isInspecting;
+  const primaryLabel = source === "local" && !localPath.trim()
+    ? "Choose File"
+    : source === "huggingface" && !selectedHfFile
+      ? isInspecting ? "Finding" : "Find Models"
+      : isAdding ? "Adding" : "Add Model";
+  const selectedFileParts = localPath.split(/[\\/]/).filter(Boolean);
+  const selectedFileName = localPath
+    ? selectedFileParts[selectedFileParts.length - 1] ?? localPath
+    : null;
 
   return (
     <section className="library-screen">
@@ -629,7 +705,7 @@ function ModelsPage({
       <div className="model-library">
         {snapshot.availableModels.map((model) => {
           const installed = snapshot.distribution.installedModels.includes(model.modelId);
-          const downloading = !installed && model.modelId === draftModelId && isAdding;
+          const downloading = !installed && isAdding;
           return (
             <button
               className={selectedModel === model.modelId ? "library-card active" : "library-card"}
@@ -638,7 +714,7 @@ function ModelsPage({
                 if (installed) {
                   onModelChange(model.modelId);
                 } else {
-                  openImporter(model.modelId);
+                  openImporter();
                 }
               }}
             >
@@ -732,16 +808,22 @@ function ModelsPage({
               </div>
             ) : (
               <div className="import-flow">
-                <label className="field">
-                  <span>Model file path</span>
-                  <input
-                    value={localPath}
-                    onChange={(event) => setLocalPath(event.target.value)}
-                    placeholder="/Users/christopher/Models/Llama-3.2-1B-Instruct-Q4_K_M.gguf"
-                  />
-                </label>
+                <div className={selectedFileName ? "local-file-picker selected" : "local-file-picker"}>
+                  <div>
+                    <strong>{selectedFileName ?? "Choose a model file"}</strong>
+                    <span>{selectedFileName ? localPath : "Select a .gguf file from this computer."}</span>
+                  </div>
+                  <button className="secondary-button" onClick={chooseFile}>
+                    <UploadCloud size={16} />
+                    <span>{selectedFileName ? "Change" : "Choose File"}</span>
+                  </button>
+                </div>
               </div>
             )}
+
+            {(isAdding || importProgress) && !result ? (
+              <ImportProgressCard progress={importProgress} />
+            ) : null}
 
             {result ? (
               <div className="import-result">
@@ -764,9 +846,9 @@ function ModelsPage({
             ) : null}
 
             <div className="import-actions">
-              <button className="send-button" onClick={addModel} disabled={!canAdd || isAdding}>
+              <button className="send-button" onClick={runPrimaryImportAction} disabled={!canRunPrimary}>
                 {source === "huggingface" ? <Cloud size={17} /> : <UploadCloud size={17} />}
-                <span>{isAdding ? "Adding" : "Add Model"}</span>
+                <span>{primaryLabel}</span>
               </button>
               <span>Infernet prepares the model and shares it automatically.</span>
             </div>
@@ -774,6 +856,30 @@ function ModelsPage({
         </div>
       ) : null}
     </section>
+  );
+}
+
+function ImportProgressCard({ progress }: { progress: ModelImportProgress | null }) {
+  const percent = progress?.totalBytes
+    ? Math.min(100, Math.round((progress.downloadedBytes / progress.totalBytes) * 100))
+    : null;
+
+  return (
+    <div className="import-progress-card">
+      <div className="run-spinner" />
+      <div>
+        <strong>{progress?.stage ?? "Working"}</strong>
+        <span>{progress?.detail ?? "Preparing the model"}</span>
+      </div>
+      <div className="import-progress-meter">
+        <ProgressBar progress={percent ?? 18} />
+        <small>
+          {percent !== null
+            ? `${percent}% - ${formatBytes(progress?.downloadedBytes ?? 0)} of ${formatBytes(progress?.totalBytes ?? 0)}`
+            : "This can take a while for large models."}
+        </small>
+      </div>
+    </div>
   );
 }
 
@@ -976,8 +1082,8 @@ function runtimeLabel(runtimeKind: string): string {
   return runtimeKind === "llama_cpp" ? "GGUF" : "Ready";
 }
 
-function defaultAddModelId(models: ModelView[]): string {
-  return models.find((model) => model.runtimeKind === "llama_cpp")?.modelId ?? models[0]?.modelId ?? "";
+function isRuntimePendingMessage(message: string): boolean {
+  return message.toLowerCase().includes("gguf execution runtime is not connected yet");
 }
 
 function friendlyImportError(error: string): string {

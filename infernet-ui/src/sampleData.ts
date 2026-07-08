@@ -6,28 +6,42 @@ const peers = [
     shortPeerId: "12D3KooW...f9a10",
     addresses: ["/ip4/127.0.0.1/tcp/63239/p2p/12D3KooWKZbL6YdYvS5o8jffzk8tudQHfY8b9Ztp9LmDkA1f9a10"],
     protocolVersion: 1,
-    shards: [{ modelId: "grid-demo-12", layerStart: 0, layerEnd: 3 }],
+    shards: [{ modelId: "gemma-4-12b-it-iq4-xs", layerStart: 0, layerEnd: 8 }],
   },
   {
     peerId: "12D3KooWAgjvMSzS57j4GsnWdxY5ef9oNAf4rs2pM7J3bQ9a1122",
     shortPeerId: "12D3KooW...a1122",
     addresses: ["/ip4/127.0.0.1/tcp/63240/p2p/12D3KooWAgjvMSzS57j4GsnWdxY5ef9oNAf4rs2pM7J3bQ9a1122"],
     protocolVersion: 1,
-    shards: [{ modelId: "grid-demo-12", layerStart: 3, layerEnd: 6 }],
+    shards: [{ modelId: "gemma-4-12b-it-iq4-xs", layerStart: 8, layerEnd: 16 }],
   },
   {
     peerId: "12D3KooWBV3ycoVdK4L2TuXNGwmaEZckVK9myuZogTn2Ru6b3344",
     shortPeerId: "12D3KooW...b3344",
     addresses: ["/ip4/127.0.0.1/tcp/63241/p2p/12D3KooWBV3ycoVdK4L2TuXNGwmaEZckVK9myuZogTn2Ru6b3344"],
     protocolVersion: 1,
-    shards: [{ modelId: "grid-demo-12", layerStart: 6, layerEnd: 9 }],
+    shards: [{ modelId: "gemma-4-12b-it-iq4-xs", layerStart: 16, layerEnd: 24 }],
   },
   {
     peerId: "12D3KooWPmvXuwgFcuQ7y56RtJgH8npCyQvFrw24Bg9AQ9c5566",
     shortPeerId: "12D3KooW...c5566",
     addresses: ["/ip4/127.0.0.1/tcp/63242/p2p/12D3KooWPmvXuwgFcuQ7y56RtJgH8npCyQvFrw24Bg9AQ9c5566"],
     protocolVersion: 1,
-    shards: [{ modelId: "grid-demo-12", layerStart: 9, layerEnd: 12 }],
+    shards: [{ modelId: "gemma-4-12b-it-iq4-xs", layerStart: 24, layerEnd: 32 }],
+  },
+  {
+    peerId: "12D3KooWE6mD9tG49ft1V5oZhyxVtf2rgV7uTXwrfPeerr7788",
+    shortPeerId: "12D3KooW...r7788",
+    addresses: ["/ip4/127.0.0.1/tcp/63243/p2p/12D3KooWE6mD9tG49ft1V5oZhyxVtf2rgV7uTXwrfPeerr7788"],
+    protocolVersion: 1,
+    shards: [{ modelId: "gemma-4-12b-it-iq4-xs", layerStart: 32, layerEnd: 40 }],
+  },
+  {
+    peerId: "12D3KooWFF9pZtMMSha9jR2wwCyJrG5kzzGridPeer9900",
+    shortPeerId: "12D3KooW...r9900",
+    addresses: ["/ip4/127.0.0.1/tcp/63244/p2p/12D3KooWFF9pZtMMSha9jR2wwCyJrG5kzzGridPeer9900"],
+    protocolVersion: 1,
+    shards: [{ modelId: "gemma-4-12b-it-iq4-xs", layerStart: 40, layerEnd: 48 }],
   },
 ];
 
@@ -40,24 +54,17 @@ export const sampleIdentity: LocalIdentity = {
 export const sampleSnapshot: GridSnapshot = {
   localPeerId: sampleIdentity.peerId,
   topic: sampleIdentity.topic,
-  selectedModel: "grid-demo-12",
+  selectedModel: "gemma-4-12b-it-iq4-xs",
   availableModels: [
     {
-      modelId: "grid-llama-3.2-1b",
-      displayName: "Grid Llama 3.2 1B",
+      modelId: "gemma-4-12b-it-iq4-xs",
+      displayName: "Gemma 4 12B IT IQ4 XS",
       runtimeKind: "llama_cpp",
-      layerCount: 16,
+      layerCount: 48,
       activationDtype: "f16",
     },
-    {
-      modelId: "grid-demo-12",
-      displayName: "Grid Demo 12",
-      runtimeKind: "demo",
-      layerCount: 12,
-      activationDtype: "f32",
-    },
   ],
-  layerCount: 12,
+  layerCount: 48,
   peers,
   route: peers.map((peer) => ({
     peerId: peer.peerId,
@@ -67,7 +74,7 @@ export const sampleSnapshot: GridSnapshot = {
     layerEnd: peer.shards[0].layerEnd,
   })),
   missingRanges: null,
-  coverage: Array.from({ length: 12 }, (_, layer) => {
+  coverage: Array.from({ length: 48 }, (_, layer) => {
     const owner = peers.find((peer) => {
       const shard = peer.shards[0];
       return shard.layerStart <= layer && layer < shard.layerEnd;
@@ -82,12 +89,12 @@ export const sampleSnapshot: GridSnapshot = {
     };
   }),
   distribution: {
-    installedModels: ["grid-demo-12"],
+    installedModels: ["gemma-4-12b-it-iq4-xs"],
     installedShards: [
       {
-        modelId: "grid-demo-12",
+        modelId: "gemma-4-12b-it-iq4-xs",
         layerStart: 0,
-        layerEnd: 3,
+        layerEnd: 8,
         checksum: "76fc3428fc95ccd2652606c8690997376b939a63a5a1a946b6d0fa5e7cc3aaf8",
         sizeBytes: 28,
         version: "v1",
@@ -98,8 +105,8 @@ export const sampleSnapshot: GridSnapshot = {
     currentUploads: 4,
     currentDownloads: 0,
     replicationHealth: [
-      { modelId: "grid-demo-12", layerStart: 0, layerEnd: 3, replicas: 2, targetReplicas: 10 },
-      { modelId: "grid-demo-12", layerStart: 3, layerEnd: 6, replicas: 1, targetReplicas: 10 },
+      { modelId: "gemma-4-12b-it-iq4-xs", layerStart: 0, layerEnd: 8, replicas: 2, targetReplicas: 10 },
+      { modelId: "gemma-4-12b-it-iq4-xs", layerStart: 8, layerEnd: 16, replicas: 1, targetReplicas: 10 },
     ],
   },
 };

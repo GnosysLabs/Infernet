@@ -1,5 +1,6 @@
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import { sampleIdentity, sampleSnapshot } from "./sampleData";
 import type {
   AddModelResponse,
@@ -7,6 +8,7 @@ import type {
   HuggingFaceFileView,
   HuggingFaceSettings,
   LocalIdentity,
+  ModelImportProgress,
   ProgressEvent,
   RunDemoResponse,
 } from "./types";
@@ -38,16 +40,31 @@ export async function runDistributedInference(prompt: string, modelId: string): 
 }
 
 export async function addLocalGgufModel(
-  modelId: string,
   path: string,
   version = "v1",
 ): Promise<AddModelResponse> {
   if (!isTauriRuntime) {
     await delay(620);
-    return mockAddModelResponse(modelId, path);
+    return mockAddModelResponse(path);
   }
 
-  return invoke<AddModelResponse>("add_local_gguf_model", { modelId, path, version });
+  return invoke<AddModelResponse>("add_local_gguf_model", { path, version });
+}
+
+export async function chooseLocalModelFile(): Promise<string | null> {
+  if (!isTauriRuntime) {
+    await delay(160);
+    return "/Users/christopher/Models/gemma-2b-it-Q4_K_M.gguf";
+  }
+
+  const selected = await open({
+    multiple: false,
+    directory: false,
+    title: "Choose a GGUF model",
+    filters: [{ name: "GGUF models", extensions: ["gguf"] }],
+  });
+
+  return typeof selected === "string" ? selected : null;
 }
 
 export async function getHuggingFaceSettings(): Promise<HuggingFaceSettings> {
@@ -94,20 +111,18 @@ export async function inspectHuggingFaceRepo(
 export async function addHuggingFaceModel(
   repoId: string,
   filename: string,
-  modelId: string,
   token?: string,
   revision = "main",
   version = "v1",
 ): Promise<AddModelResponse> {
   if (!isTauriRuntime) {
     await delay(900);
-    return mockAddModelResponse(modelId, `hf://${repoId}/${filename}`);
+    return mockAddModelResponse(`hf://${repoId}/${filename}`);
   }
 
   return invoke<AddModelResponse>("add_huggingface_model", {
     repoId,
     filename,
-    modelId,
     token,
     revision,
     version,
@@ -122,6 +137,18 @@ export async function listenForProgress(
   }
 
   return listen<ProgressEvent>("infernet-progress", (event) => {
+    handler(event.payload);
+  });
+}
+
+export async function listenForModelImportProgress(
+  handler: (event: ModelImportProgress) => void,
+): Promise<() => void> {
+  if (!isTauriRuntime) {
+    return () => undefined;
+  }
+
+  return listen<ModelImportProgress>("infernet-model-import-progress", (event) => {
     handler(event.payload);
   });
 }
@@ -159,14 +186,15 @@ function modelSnapshot(modelId: string): GridSnapshot {
   };
 }
 
-function mockAddModelResponse(modelId: string, source: string): AddModelResponse {
-  const model = sampleSnapshot.availableModels.find((item) => item.modelId === modelId) ?? sampleSnapshot.availableModels[0];
-  const shardSize = model.layerCount <= 12 ? 3 : 4;
+function mockAddModelResponse(source: string): AddModelResponse {
+  const modelId = modelIdFromSource(source);
+  const layerCount = source.toLowerCase().includes("gemma") ? 48 : 16;
+  const shardSize = layerCount <= 16 ? 4 : 8;
   const installedShards = Array.from(
-    { length: Math.ceil(model.layerCount / shardSize) },
+    { length: Math.ceil(layerCount / shardSize) },
     (_, index) => {
       const layerStart = index * shardSize;
-      const layerEnd = Math.min(model.layerCount, layerStart + shardSize);
+      const layerEnd = Math.min(layerCount, layerStart + shardSize);
       return {
         modelId,
         layerStart,
@@ -180,7 +208,7 @@ function mockAddModelResponse(modelId: string, source: string): AddModelResponse
 
   return {
     modelId,
-    displayName: model.displayName,
+    displayName: displayNameFromSource(source) ?? "Imported GGUF Model",
     source,
     sourceChecksum: "mock-source-checksum",
     sourceSizeBytes: 812_000_000,
@@ -189,4 +217,46 @@ function mockAddModelResponse(modelId: string, source: string): AddModelResponse
     installedShards,
     message: "Model seed records are being shared. Physical GGUF tensor shards still require the llama.cpp shard writer.",
   };
+}
+
+function modelIdFromSource(source: string): string {
+  const displayName = displayNameFromSource(source) ?? "gguf-model";
+  const modelId = displayName
+    .toLowerCase()
+    .replace(/[^a-z0-9.]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+
+  return modelId.length > 0 ? modelId : "gguf-model";
+}
+
+function displayNameFromSource(source: string): string | null {
+  const pathParts = source.split("/").filter(Boolean);
+  const fileName = pathParts[pathParts.length - 1];
+  if (!fileName) {
+    return null;
+  }
+
+  const withoutExtension = fileName.replace(/\.gguf$/i, "");
+  const displayName = withoutExtension
+    .replace(/[_\-.]+/g, " ")
+    .trim()
+    .split(/\s+/)
+    .map(formatModelNamePart)
+    .join(" ");
+
+  return displayName.length > 0 ? displayName : null;
+}
+
+function formatModelNamePart(part: string): string {
+  const lower = part.toLowerCase();
+  if (["gguf", "q4", "q5", "q6", "q8", "k", "m", "s", "it"].includes(lower)) {
+    return lower.toUpperCase();
+  }
+  if (lower === "llama") return "Llama";
+  if (lower === "gemma") return "Gemma";
+  if (lower === "qwen") return "Qwen";
+  if (lower === "mistral") return "Mistral";
+  if (lower === "instruct") return "Instruct";
+  if (/^\d+b$/.test(lower)) return lower.toUpperCase();
+  return part;
 }

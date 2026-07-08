@@ -5,6 +5,7 @@ infernet-ui/dist/
 infernet-ui/src-tauri/target/
 .infernet/
 **/.infernet/
+third_party/
 *.log
 .DS_Store
 .env

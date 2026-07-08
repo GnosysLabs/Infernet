@@ -484,7 +484,7 @@ hop completion appear in the UI at the exact moment each remote worker finishes.
 
 Current Phase 2 research and implementation notes live in
 [gguf-split-inference-design.md](gguf-split-inference-design.md). The selected
-first target is `grid-llama-3.2-1b`. The repository now supports GGUF sidecar
+first target is `llama-3.2-1b`. The repository now supports GGUF sidecar
 shard metadata and runtime-kind-aware routing, but real llama.cpp layer-range
 execution is deliberately blocked until a native bridge can load only the
 assigned layer range.

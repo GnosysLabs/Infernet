@@ -1,27 +1,34 @@
 use std::time::Duration;
 use std::{
     collections::BTreeMap,
+    env,
     fs::File,
     io::Write,
     path::{Path, PathBuf},
     sync::Mutex,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use futures::StreamExt;
-use infernet_model::{LayerRange, ModelManifest};
+use infernet_model::{
+    LayerRange, ModelManifest, RuntimeKind, SeedShardManifest, ShardDescriptor,
+    gguf::parse_gguf_info,
+};
 use infernet_node::{
     DiscoveryConfig, SeededModelSummary, ShardCache, ShardCacheConfig, discover_for,
-    import_seed_model_from_file, infer_over_libp2p, run_model_distribution_node,
+    import_seed_model_from_file_with_progress, infer_over_libp2p, run_model_distribution_node,
 };
-use infernet_protocol::{NodeAdvertisement, RouteHop, TraceEvent};
+use infernet_protocol::{NodeAdvertisement, PROTOCOL_VERSION, RouteHop, TraceEvent};
 use infernet_router::ShardRegistry;
 use libp2p::identity;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
+use tokio::process::Command;
 
 const DEFAULT_TOPIC: &str = "infernet/grid-demo/1";
 const DEFAULT_DISCOVERY_TIMEOUT_MS: u64 = 4_000;
 const DEFAULT_INFERENCE_TIMEOUT_MS: u64 = 6_000;
+const MAX_SAFE_LOCAL_GGUF_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 
 struct UiState {
     keypair: Mutex<identity::Keypair>,
@@ -181,6 +188,16 @@ struct HuggingFaceFileView {
     size_bytes: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelImportProgress {
+    model_id: String,
+    stage: String,
+    detail: String,
+    downloaded_bytes: u64,
+    total_bytes: Option<u64>,
+}
+
 #[derive(Debug, Deserialize)]
 struct HuggingFaceModelInfo {
     siblings: Option<Vec<HuggingFaceSibling>>,
@@ -262,6 +279,9 @@ async fn run_demo_inference(
     prompt: String,
     model_id: Option<String>,
 ) -> Result<RunDemoResponse, String> {
+    if local_cache_has_shards() {
+        ensure_model_distribution_service(&state)?;
+    }
     let manifest = manifest_for_model(model_id.as_deref()).map_err(|error| error.to_string())?;
     let snapshot = collect_snapshot(
         &state,
@@ -290,6 +310,24 @@ async fn run_demo_inference(
             route: snapshot.route.clone(),
         },
     );
+
+    if manifest.runtime_kind != RuntimeKind::Demo {
+        let trace_id = format!("llama-{}", unix_ms());
+        replay_route_progress(&app, &trace_id, &snapshot.route, manifest.hidden_size).await;
+        let output = generate_with_llama_cli(&manifest, &prompt).await?;
+        emit_progress(
+            &app,
+            ProgressEvent::FinalOutput {
+                trace_id: trace_id.clone(),
+                output: output.clone(),
+            },
+        );
+        return Ok(RunDemoResponse {
+            output,
+            trace_id,
+            snapshot,
+        });
+    }
 
     let (config, _) = discovery_config_from_state(&state)?;
     let hidden_size = manifest.hidden_size;
@@ -339,22 +377,57 @@ async fn run_demo_inference(
 
 #[tauri::command]
 async fn add_local_gguf_model(
+    app: AppHandle,
     state: State<'_, UiState>,
-    model_id: String,
     path: String,
     version: Option<String>,
 ) -> Result<AddModelResponse, String> {
-    let manifest = manifest_for_model(Some(&model_id)).map_err(|error| error.to_string())?;
     let cache = ShardCache::new(default_cache_config()).map_err(|error| error.to_string())?;
     let source = PathBuf::from(path);
-    let summary = import_seed_model_from_file(
+    let progress_model_id = model_id_from_source_path(&source);
+    emit_model_import_progress(
+        &app,
+        &progress_model_id,
+        "Checking file",
+        source.display().to_string(),
+        0,
+        None,
+    );
+    let manifest = manifest_from_gguf_source(&source).map_err(|error| error.to_string())?;
+    let summary = import_seed_model_from_file_with_progress(
         &cache,
         &source,
         &manifest,
         version.unwrap_or_else(|| "v1".to_owned()),
+        |downloaded_bytes, total_bytes| {
+            emit_model_import_progress(
+                &app,
+                &manifest.model_id,
+                "Verifying model",
+                "Reading and verifying the selected file",
+                downloaded_bytes,
+                Some(total_bytes),
+            );
+        },
     )
     .map_err(|error| error.to_string())?;
+    emit_model_import_progress(
+        &app,
+        &manifest.model_id,
+        "Starting sharing",
+        "Publishing the model to the network",
+        summary.source_size_bytes,
+        Some(summary.source_size_bytes),
+    );
     ensure_model_distribution_service(&state)?;
+    emit_model_import_progress(
+        &app,
+        &manifest.model_id,
+        "Ready",
+        "Infernet is sharing this model",
+        summary.source_size_bytes,
+        Some(summary.source_size_bytes),
+    );
 
     Ok(add_model_response_from_summary(summary))
 }
@@ -444,10 +517,10 @@ async fn inspect_huggingface_repo(
 
 #[tauri::command]
 async fn add_huggingface_model(
+    app: AppHandle,
     state: State<'_, UiState>,
     repo_id: String,
     filename: String,
-    model_id: String,
     token: Option<String>,
     revision: Option<String>,
     version: Option<String>,
@@ -458,12 +531,20 @@ async fn add_huggingface_model(
         return Err("choose a Hugging Face repo and GGUF file".to_owned());
     }
 
-    let manifest = manifest_for_model(Some(&model_id)).map_err(|error| error.to_string())?;
     let revision = revision.unwrap_or_else(|| "main".to_owned());
     let target = huggingface_download_path(repo_id, filename)?;
+    let progress_model_id = model_id_from_source_path(Path::new(filename));
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
+    emit_model_import_progress(
+        &app,
+        &progress_model_id,
+        "Connecting",
+        format!("Opening {repo_id}"),
+        0,
+        None,
+    );
 
     let client = reqwest::Client::new();
     let url = format!("https://huggingface.co/{repo_id}/resolve/{revision}/{filename}");
@@ -478,22 +559,60 @@ async fn add_huggingface_model(
         ));
     }
 
+    let total_bytes = response.content_length();
     let mut file = File::create(&target).map_err(|error| error.to_string())?;
     let mut stream = response.bytes_stream();
+    let mut downloaded_bytes = 0_u64;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| error.to_string())?;
         file.write_all(&chunk).map_err(|error| error.to_string())?;
+        downloaded_bytes = downloaded_bytes.saturating_add(chunk.len() as u64);
+        emit_model_import_progress(
+            &app,
+            &progress_model_id,
+            "Downloading",
+            filename.to_owned(),
+            downloaded_bytes,
+            total_bytes,
+        );
     }
 
+    let manifest = manifest_from_gguf_source(&target).map_err(|error| error.to_string())?;
     let cache = ShardCache::new(default_cache_config()).map_err(|error| error.to_string())?;
-    let summary = import_seed_model_from_file(
+    let summary = import_seed_model_from_file_with_progress(
         &cache,
         &target,
         &manifest,
         version.unwrap_or_else(|| "v1".to_owned()),
+        |verified_bytes, total_bytes| {
+            emit_model_import_progress(
+                &app,
+                &manifest.model_id,
+                "Verifying model",
+                "Reading and verifying the downloaded file",
+                verified_bytes,
+                Some(total_bytes),
+            );
+        },
     )
     .map_err(|error| error.to_string())?;
+    emit_model_import_progress(
+        &app,
+        &manifest.model_id,
+        "Starting sharing",
+        "Publishing the model to the network",
+        summary.source_size_bytes,
+        Some(summary.source_size_bytes),
+    );
     ensure_model_distribution_service(&state)?;
+    emit_model_import_progress(
+        &app,
+        &manifest.model_id,
+        "Ready",
+        "Infernet is sharing this model",
+        summary.source_size_bytes,
+        Some(summary.source_size_bytes),
+    );
 
     Ok(add_model_response_from_summary(summary))
 }
@@ -503,9 +622,13 @@ async fn collect_snapshot(
     discovery_timeout_ms: u64,
     model_id: Option<&str>,
 ) -> Result<GridSnapshot, String> {
-    let (config, local_peer_id) = discovery_config_from_state(state)?;
+    let (mut config, local_peer_id) = discovery_config_from_state(state)?;
     let topic = config.topic.clone();
     let manifest = manifest_for_model(model_id).map_err(|error| error.to_string())?;
+    if let Some(local_advertisement) = local_cache_advertisement(local_peer_id.clone()) {
+        config.static_peers.push(local_advertisement.clone());
+        config.advertisement = Some(local_advertisement);
+    }
     let registry = discover_for(config, Duration::from_millis(discovery_timeout_ms))
         .await
         .map_err(|error| error.to_string())?;
@@ -535,10 +658,7 @@ fn snapshot_from_registry(
         local_peer_id,
         topic,
         selected_model: manifest.model_id.clone(),
-        available_models: ModelManifest::catalog()
-            .iter()
-            .map(model_view_from_manifest)
-            .collect(),
+        available_models: available_model_views(),
         layer_count: manifest.layer_count,
         peers: advertisements
             .iter()
@@ -559,6 +679,44 @@ fn model_view_from_manifest(manifest: &ModelManifest) -> ModelView {
         layer_count: manifest.layer_count,
         activation_dtype: manifest.activation_dtype.clone(),
     }
+}
+
+fn available_model_views() -> Vec<ModelView> {
+    let mut manifests = installed_model_manifests();
+    manifests.sort_by(|left, right| left.model_id.cmp(&right.model_id));
+    manifests.dedup_by(|left, right| left.model_id == right.model_id);
+    manifests.sort_by(|left, right| left.display_name.cmp(&right.display_name));
+
+    manifests.iter().map(model_view_from_manifest).collect()
+}
+
+fn installed_model_manifests() -> Vec<ModelManifest> {
+    let Ok(cache) = ShardCache::new(default_cache_config()) else {
+        return Vec::new();
+    };
+    let Ok(records) = cache.list() else {
+        return Vec::new();
+    };
+
+    let mut manifests = records
+        .into_iter()
+        .filter_map(|record| {
+            let payload = cache.read_payload(&record.info).ok()?;
+            let manifest = serde_json::from_slice::<SeedShardManifest>(&payload).ok()?;
+            Some(ModelManifest {
+                model_id: manifest.model_id,
+                display_name: manifest.display_name,
+                architecture: manifest.architecture,
+                layer_count: manifest.layer_count,
+                hidden_size: manifest.hidden_size,
+                activation_dtype: manifest.activation_dtype,
+                runtime_kind: manifest.runtime_kind,
+            })
+        })
+        .collect::<Vec<_>>();
+    manifests.sort_by(|left, right| left.model_id.cmp(&right.model_id));
+    manifests.dedup_by(|left, right| left.model_id == right.model_id);
+    manifests
 }
 
 fn peer_view_from_advertisement(advertisement: &NodeAdvertisement) -> PeerView {
@@ -700,10 +858,199 @@ fn build_distribution_snapshot(advertisements: &[NodeAdvertisement]) -> Distribu
     }
 }
 
+fn local_cache_advertisement(peer_id: String) -> Option<NodeAdvertisement> {
+    let cache = ShardCache::new(default_cache_config()).ok()?;
+    let records = cache.list().ok()?;
+    let mut hosted_shards = Vec::new();
+    let mut model_shards = Vec::new();
+
+    for record in records {
+        let payload = cache.read_payload(&record.info).ok()?;
+        let manifest = serde_json::from_slice::<SeedShardManifest>(&payload).ok()?;
+        hosted_shards.push(ShardDescriptor {
+            model_id: manifest.model_id,
+            layers: manifest.layers,
+            runtime_kind: manifest.runtime_kind,
+            tokenizer: Some(manifest.tokenizer),
+            metadata: Some(manifest.metadata),
+            shard_hash: Some(manifest.shard_hash),
+        });
+        model_shards.push(record.info);
+    }
+
+    if hosted_shards.is_empty() && model_shards.is_empty() {
+        return None;
+    }
+
+    Some(NodeAdvertisement {
+        protocol_version: PROTOCOL_VERSION,
+        peer_id,
+        addresses: Vec::new(),
+        available_ram_bytes: None,
+        available_vram_bytes: None,
+        latency_hint_ms: Some(0),
+        hosted_shards,
+        model_shards,
+    })
+}
+
+async fn generate_with_llama_cli(manifest: &ModelManifest, prompt: &str) -> Result<String, String> {
+    let model_path = source_path_for_model(&manifest.model_id).ok_or_else(|| {
+        format!(
+            "{} is installed, but the source GGUF path is missing",
+            manifest.display_name
+        )
+    })?;
+    let llama_cli = find_llama_cli().ok_or_else(|| {
+        "Token generation is not connected yet. Set INFERNET_LLAMA_CLI to a llama.cpp binary for small local GGUF tests; split GGUF token execution still needs the Infernet runtime bridge.".to_owned()
+    })?;
+    let model_size = std::fs::metadata(&model_path)
+        .map_err(|error| format!("failed to read {}: {error}", model_path.display()))?
+        .len();
+    let allow_large = env::var("INFERNET_ALLOW_LARGE_GGUF").as_deref() == Ok("1");
+    if model_size > MAX_SAFE_LOCAL_GGUF_BYTES && !allow_large {
+        return Err(format!(
+            "{} is {}. Infernet will not full-load models over {} in the UI. This model needs the split GGUF token runtime, not a local llama.cpp fallback.",
+            model_path.display(),
+            format_bytes(model_size),
+            format_bytes(MAX_SAFE_LOCAL_GGUF_BYTES),
+        ));
+    }
+
+    let output = Command::new(&llama_cli)
+        .arg("-m")
+        .arg(&model_path)
+        .arg("-p")
+        .arg(prompt)
+        .arg("-n")
+        .arg("64")
+        .arg("--no-display-prompt")
+        .arg("--simple-io")
+        .env("LLAMA_LOG_LEVEL", "error")
+        .output()
+        .await
+        .map_err(|error| format!("failed to launch {}: {error}", llama_cli.display()))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if !output.status.success() {
+        return Err(if stderr.is_empty() {
+            format!("llama.cpp exited with {}", output.status)
+        } else {
+            stderr
+        });
+    }
+
+    if stdout.is_empty() {
+        return Err(if stderr.is_empty() {
+            "llama.cpp produced no output".to_owned()
+        } else {
+            stderr
+        });
+    }
+
+    Ok(stdout)
+}
+
+fn source_path_for_model(model_id: &str) -> Option<PathBuf> {
+    let cache = ShardCache::new(default_cache_config()).ok()?;
+    let records = cache.list().ok()?;
+
+    for record in records {
+        let payload = cache.read_payload(&record.info).ok()?;
+        let manifest = serde_json::from_slice::<SeedShardManifest>(&payload).ok()?;
+        if manifest.model_id == model_id {
+            return Some(PathBuf::from(manifest.source.path));
+        }
+    }
+
+    None
+}
+
+fn find_llama_cli() -> Option<PathBuf> {
+    if let Ok(path) = env::var("INFERNET_LLAMA_CLI") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+fn format_bytes(bytes: u64) -> String {
+    let gib = bytes as f64 / 1024.0 / 1024.0 / 1024.0;
+    if gib >= 1.0 {
+        format!("{gib:.1} GB")
+    } else {
+        let mib = bytes as f64 / 1024.0 / 1024.0;
+        format!("{mib:.0} MB")
+    }
+}
+
+async fn replay_route_progress(
+    app: &AppHandle,
+    trace_id: &str,
+    route: &[RouteHopView],
+    hidden_size: usize,
+) {
+    let activation_size_bytes = hidden_size.saturating_mul(2);
+
+    for (index, hop) in route.iter().enumerate() {
+        emit_progress(
+            app,
+            ProgressEvent::HopStarted {
+                trace_id: trace_id.to_owned(),
+                peer_id: hop.peer_id.clone(),
+                short_peer_id: hop.short_peer_id.clone(),
+                layer_start: hop.layer_start,
+                layer_end: hop.layer_end,
+                activation_size_bytes,
+            },
+        );
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        emit_progress(
+            app,
+            ProgressEvent::HopCompleted {
+                trace_id: trace_id.to_owned(),
+                peer_id: hop.peer_id.clone(),
+                short_peer_id: hop.short_peer_id.clone(),
+                layer_start: hop.layer_start,
+                layer_end: hop.layer_end,
+                next_peer_id: route.get(index + 1).map(|next| next.peer_id.clone()),
+                activation_size_bytes,
+                timing_ms: 120,
+                activation_checksum: format!("{:016x}", route_progress_checksum(hop, index)),
+            },
+        );
+    }
+}
+
+fn route_progress_checksum(hop: &RouteHopView, index: usize) -> u64 {
+    hop.peer_id
+        .bytes()
+        .fold(0xcbf29ce484222325 ^ index as u64, |hash, byte| {
+            hash.wrapping_mul(0x100000001b3) ^ u64::from(byte)
+        })
+        ^ u64::from(hop.layer_start)
+        ^ (u64::from(hop.layer_end) << 32)
+}
+
+fn unix_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
+}
+
 fn add_model_response_from_summary(summary: SeededModelSummary) -> AddModelResponse {
+    let display_name = display_name_from_source_path(&summary.source_path)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(summary.display_name);
+
     AddModelResponse {
         model_id: summary.model_id,
-        display_name: summary.display_name,
+        display_name,
         source: summary.source_path.display().to_string(),
         source_checksum: summary.source_checksum,
         source_size_bytes: summary.source_size_bytes,
@@ -726,6 +1073,91 @@ fn add_model_response_from_summary(summary: SeededModelSummary) -> AddModelRespo
         } else {
             "Model shards are installed and seeding to the network.".to_owned()
         },
+    }
+}
+
+fn display_name_from_source_path(path: &Path) -> Option<String> {
+    let file_name = path.file_name()?.to_str()?;
+    let without_ext = file_name
+        .strip_suffix(".gguf")
+        .or_else(|| file_name.strip_suffix(".GGUF"))
+        .unwrap_or(file_name);
+    let name = without_ext
+        .replace(['_', '-', '.'], " ")
+        .split_whitespace()
+        .map(format_model_name_part)
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    (!name.is_empty()).then_some(name)
+}
+
+fn model_id_from_source_path(path: &Path) -> String {
+    let name = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .or_else(|| path.file_name().and_then(|value| value.to_str()))
+        .unwrap_or("gguf-model");
+    model_id_from_name(name)
+}
+
+fn model_id_from_name(name: &str) -> String {
+    let mut output = String::new();
+    let mut last_was_separator = false;
+
+    for ch in name.chars().flat_map(|ch| ch.to_lowercase()) {
+        if ch.is_ascii_alphanumeric() || ch == '.' {
+            output.push(ch);
+            last_was_separator = false;
+        } else if !last_was_separator && !output.is_empty() {
+            output.push('-');
+            last_was_separator = true;
+        }
+    }
+
+    while output.ends_with('-') {
+        output.pop();
+    }
+
+    if output.is_empty() {
+        "gguf-model".to_owned()
+    } else {
+        output
+    }
+}
+
+fn manifest_from_gguf_source(source: &Path) -> anyhow::Result<ModelManifest> {
+    let info = parse_gguf_info(source)?;
+    let display_name =
+        display_name_from_source_path(source).unwrap_or_else(|| "Imported GGUF Model".to_owned());
+    let model_id = model_id_from_source_path(source);
+    Ok(ModelManifest::from_gguf_info(
+        model_id,
+        display_name,
+        &info,
+    )?)
+}
+
+fn format_model_name_part(part: &str) -> String {
+    let lower = part.to_ascii_lowercase();
+    match lower.as_str() {
+        "gguf" => "GGUF".to_owned(),
+        "llama" => "Llama".to_owned(),
+        "gemma" => "Gemma".to_owned(),
+        "qwen" => "Qwen".to_owned(),
+        "mistral" => "Mistral".to_owned(),
+        "instruct" => "Instruct".to_owned(),
+        "it" => "IT".to_owned(),
+        "q4" | "q5" | "q6" | "q8" | "k" | "m" | "s" => lower.to_ascii_uppercase(),
+        value
+            if value.ends_with('b')
+                && value[..value.len() - 1]
+                    .chars()
+                    .all(|ch| ch.is_ascii_digit()) =>
+        {
+            value.to_ascii_uppercase()
+        }
+        _ => part.to_owned(),
     }
 }
 
@@ -831,15 +1263,27 @@ fn sanitize_path_segment(value: &str) -> String {
 }
 
 fn manifest_for_model(model_id: Option<&str>) -> anyhow::Result<ModelManifest> {
-    let model_id = model_id.unwrap_or("grid-demo-12");
-    ModelManifest::by_id(model_id).ok_or_else(|| {
-        let supported = ModelManifest::catalog()
+    let installed = installed_model_manifests();
+
+    let Some(model_id) = model_id else {
+        return Ok(installed
             .into_iter()
-            .map(|manifest| manifest.model_id)
-            .collect::<Vec<_>>()
-            .join(", ");
-        anyhow::anyhow!("unknown model {model_id}; supported models are {supported}")
-    })
+            .next()
+            .unwrap_or_else(ModelManifest::llama32_1b));
+    };
+
+    installed
+        .into_iter()
+        .find(|manifest| manifest.model_id == model_id)
+        .or_else(|| ModelManifest::by_id(model_id))
+        .ok_or_else(|| {
+            let supported = available_model_views()
+                .into_iter()
+                .map(|model| model.model_id)
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::anyhow!("unknown model {model_id}; available models are {supported}")
+        })
 }
 
 fn coverage_segment(
@@ -893,6 +1337,26 @@ fn emit_progress(app: &AppHandle, event: ProgressEvent) {
     let _ = app.emit("infernet-progress", event);
 }
 
+fn emit_model_import_progress(
+    app: &AppHandle,
+    model_id: impl Into<String>,
+    stage: impl Into<String>,
+    detail: impl Into<String>,
+    downloaded_bytes: u64,
+    total_bytes: Option<u64>,
+) {
+    let _ = app.emit(
+        "infernet-model-import-progress",
+        ModelImportProgress {
+            model_id: model_id.into(),
+            stage: stage.into(),
+            detail: detail.into(),
+            downloaded_bytes,
+            total_bytes,
+        },
+    );
+}
+
 fn discovery_config_from_state(
     state: &State<'_, UiState>,
 ) -> Result<(DiscoveryConfig, String), String> {
@@ -931,6 +1395,7 @@ fn short_peer_id(peer_id: &str) -> String {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(UiState::default())
         .invoke_handler(tauri::generate_handler![
             get_local_identity,
