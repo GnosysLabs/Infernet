@@ -821,11 +821,29 @@ fn print_peers(registry: &ShardRegistry) {
     for advertisement in registry.advertisements() {
         for shard in advertisement.hosted_shards {
             println!(
-                "{} {} {}:{} {}",
+                "hosted_shard peer={} model={} layers={}:{} runtime={} address={}",
                 advertisement.peer_id,
                 shard.model_id,
                 shard.layers.start,
                 shard.layers.end,
+                shard.runtime_kind.as_str(),
+                advertisement
+                    .addresses
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("<no-address>")
+            );
+        }
+        for shard in advertisement.model_shards {
+            println!(
+                "model_shard peer={} model={} layers={}:{} checksum={} size={} version={} address={}",
+                advertisement.peer_id,
+                shard.model_id,
+                shard.layers.start,
+                shard.layers.end,
+                shard.checksum,
+                shard.size_bytes,
+                shard.version,
                 advertisement
                     .addresses
                     .first()

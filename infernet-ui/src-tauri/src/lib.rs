@@ -676,7 +676,6 @@ async fn collect_snapshot(
     if let Some(local_advertisement) =
         local_cache_advertisement(&cache_config, local_peer_id.clone())
     {
-        config.static_peers.push(local_advertisement.clone());
         config.advertisement = Some(local_advertisement);
     }
     let registry = discover_for(config, Duration::from_millis(discovery_timeout_ms))
@@ -1864,8 +1863,10 @@ pub fn run() {
         .setup(|app| {
             let state = app.state::<UiState>();
             let cache_config = cache_config_for_app(app.handle());
-            ensure_model_distribution_service(&state, cache_config)
-                .map_err(|error| Box::<dyn std::error::Error>::from(error))?;
+            if local_cache_has_shards(&cache_config) {
+                ensure_model_distribution_service(&state, cache_config)
+                    .map_err(|error| Box::<dyn std::error::Error>::from(error))?;
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

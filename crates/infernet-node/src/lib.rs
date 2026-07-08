@@ -254,6 +254,9 @@ pub async fn discover_for(mut config: DiscoveryConfig, timeout: Duration) -> Res
     let topic = gossipsub::IdentTopic::new(config.topic.clone());
     let mut registry = ShardRegistry::new();
     registry.extend(config.static_peers.clone());
+    if let Some(advertisement) = config.advertisement.clone() {
+        registry.upsert(advertisement);
+    }
 
     let mut swarm = build_grid_swarm(config.keypair.clone(), &topic)?;
     add_static_peer_addresses(&mut swarm, &config.static_peers);
