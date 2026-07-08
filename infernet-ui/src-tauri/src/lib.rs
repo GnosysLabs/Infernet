@@ -650,7 +650,12 @@ async fn collect_snapshot(
         Ok(manifest) => manifest,
         Err(error) => {
             if model_id.is_none_or(|value| value.trim().is_empty()) {
-                return Ok(empty_snapshot(local_peer_id, topic, &cache_config, &registry));
+                return Ok(empty_snapshot(
+                    local_peer_id,
+                    topic,
+                    &cache_config,
+                    &registry,
+                ));
             }
             return Err(error.to_string());
         }
@@ -863,7 +868,8 @@ fn model_status(
         .map(|metadata| metadata.len() > MAX_SAFE_LOCAL_GGUF_BYTES)
         .unwrap_or(false)
     {
-        return "Installed for sharing. This model is too large for local fallback execution.".to_owned();
+        return "Installed for sharing. This model is too large for local fallback execution."
+            .to_owned();
     }
 
     "Installed for sharing. Configure the split GGUF runtime to chat.".to_owned()
@@ -1252,6 +1258,21 @@ fn display_name_from_source_path(path: &Path) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
+fn display_name_from_model_id(model_id: &str) -> String {
+    let name = model_id
+        .replace(['_', '-', '.'], " ")
+        .split_whitespace()
+        .map(format_model_name_part)
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if name.is_empty() {
+        "Imported GGUF Model".to_owned()
+    } else {
+        name
+    }
+}
+
 fn model_id_from_source_path(path: &Path) -> String {
     let name = path
         .file_stem()
@@ -1465,7 +1486,9 @@ fn manifest_for_model(
                 .collect::<Vec<_>>()
                 .join(", ");
             if supported.is_empty() {
-                anyhow::anyhow!("unknown model {model_id}; no models are installed or discovered yet")
+                anyhow::anyhow!(
+                    "unknown model {model_id}; no models are installed or discovered yet"
+                )
             } else {
                 anyhow::anyhow!("unknown model {model_id}; available models are {supported}")
             }
