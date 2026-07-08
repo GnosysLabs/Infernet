@@ -259,15 +259,18 @@ async fn get_local_identity(state: State<'_, UiState>) -> Result<LocalIdentity, 
 
 #[tauri::command]
 async fn get_grid_snapshot(
+    app: AppHandle,
     state: State<'_, UiState>,
     discovery_timeout_ms: Option<u64>,
     model_id: Option<String>,
 ) -> Result<GridSnapshot, String> {
-    if local_cache_has_shards() {
-        ensure_model_distribution_service(&state)?;
+    let cache_config = cache_config_for_app(&app);
+    if local_cache_has_shards(&cache_config) {
+        ensure_model_distribution_service(&state, cache_config.clone())?;
     }
 
     collect_snapshot(
+        &app,
         &state,
         discovery_timeout_ms.unwrap_or(DEFAULT_DISCOVERY_TIMEOUT_MS),
         model_id.as_deref(),
@@ -282,11 +285,14 @@ async fn run_demo_inference(
     prompt: String,
     model_id: Option<String>,
 ) -> Result<RunDemoResponse, String> {
-    if local_cache_has_shards() {
-        ensure_model_distribution_service(&state)?;
+    let cache_config = cache_config_for_app(&app);
+    if local_cache_has_shards(&cache_config) {
+        ensure_model_distribution_service(&state, cache_config.clone())?;
     }
-    let manifest = manifest_for_model(model_id.as_deref()).map_err(|error| error.to_string())?;
+    let manifest = manifest_for_model(model_id.as_deref(), &cache_config, None)
+        .map_err(|error| error.to_string())?;
     let snapshot = collect_snapshot(
+        &app,
         &state,
         DEFAULT_DISCOVERY_TIMEOUT_MS,
         Some(&manifest.model_id),
@@ -317,7 +323,7 @@ async fn run_demo_inference(
     if manifest.runtime_kind != RuntimeKind::Demo {
         let trace_id = format!("llama-{}", unix_ms());
         replay_route_progress(&app, &trace_id, &snapshot.route, manifest.hidden_size).await;
-        let output = generate_with_llama_cli(&manifest, &prompt).await?;
+        let output = generate_with_llama_cli(&cache_config, &manifest, &prompt).await?;
         emit_progress(
             &app,
             ProgressEvent::FinalOutput {
@@ -385,7 +391,8 @@ async fn add_local_gguf_model(
     path: String,
     version: Option<String>,
 ) -> Result<AddModelResponse, String> {
-    let cache = ShardCache::new(default_cache_config()).map_err(|error| error.to_string())?;
+    let cache_config = cache_config_for_app(&app);
+    let cache = ShardCache::new(cache_config.clone()).map_err(|error| error.to_string())?;
     let source = PathBuf::from(path);
     let progress_model_id = model_id_from_source_path(&source);
     emit_model_import_progress(
@@ -422,7 +429,7 @@ async fn add_local_gguf_model(
         summary.source_size_bytes,
         Some(summary.source_size_bytes),
     );
-    ensure_model_distribution_service(&state)?;
+    ensure_model_distribution_service(&state, cache_config)?;
     emit_model_import_progress(
         &app,
         &manifest.model_id,
@@ -535,7 +542,7 @@ async fn add_huggingface_model(
     }
 
     let revision = revision.unwrap_or_else(|| "main".to_owned());
-    let target = huggingface_download_path(repo_id, filename)?;
+    let target = huggingface_download_path(&app, repo_id, filename)?;
     let progress_model_id = model_id_from_source_path(Path::new(filename));
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
@@ -581,7 +588,8 @@ async fn add_huggingface_model(
     }
 
     let manifest = manifest_from_gguf_source(&target).map_err(|error| error.to_string())?;
-    let cache = ShardCache::new(default_cache_config()).map_err(|error| error.to_string())?;
+    let cache_config = cache_config_for_app(&app);
+    let cache = ShardCache::new(cache_config.clone()).map_err(|error| error.to_string())?;
     let summary = import_seed_model_from_file_with_progress(
         &cache,
         &target,
@@ -607,7 +615,7 @@ async fn add_huggingface_model(
         summary.source_size_bytes,
         Some(summary.source_size_bytes),
     );
-    ensure_model_distribution_service(&state)?;
+    ensure_model_distribution_service(&state, cache_config)?;
     emit_model_import_progress(
         &app,
         &manifest.model_id,
