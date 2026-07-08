@@ -720,11 +720,15 @@ fn empty_snapshot(
     }
 }
 
-fn model_view_from_manifest(manifest: &ModelManifest, installed: bool) -> ModelView {
+fn model_view_from_manifest(
+    manifest: &ModelManifest,
+    installed: bool,
+    cache_config: &ShardCacheConfig,
+) -> ModelView {
     let runnable = manifest.runtime_kind == RuntimeKind::Demo
         || (manifest.runtime_kind == RuntimeKind::LlamaCpp
             && installed
-            && source_path_for_model(&cache_config_for_current_dir(), &manifest.model_id)
+            && source_path_for_model(cache_config, &manifest.model_id)
                 .and_then(|path| std::fs::metadata(path).ok())
                 .is_some_and(|metadata| metadata.len() <= MAX_SAFE_LOCAL_GGUF_BYTES)
             && find_llama_cli().is_some());
@@ -755,7 +759,13 @@ fn available_model_views(
 
     manifests
         .iter()
-        .map(|manifest| model_view_from_manifest(manifest, installed_ids.contains(&manifest.model_id)))
+        .map(|manifest| {
+            model_view_from_manifest(
+                manifest,
+                installed_ids.contains(&manifest.model_id),
+                cache_config,
+            )
+        })
         .collect()
 }
 
