@@ -677,7 +677,8 @@ fn snapshot_from_registry(
     registry: &ShardRegistry,
     cache_config: &ShardCacheConfig,
 ) -> GridSnapshot {
-    let advertisements = registry.advertisements();
+    let advertisements =
+        ui_visible_advertisements(registry.advertisements(), Some(&manifest.model_id));
     let route_result = registry.route_for_model(manifest);
     let (route, missing_ranges) = match route_result {
         Ok(route) => (route, None),
@@ -707,7 +708,7 @@ fn empty_snapshot(
     cache_config: &ShardCacheConfig,
     registry: &ShardRegistry,
 ) -> GridSnapshot {
-    let advertisements = registry.advertisements();
+    let advertisements = ui_visible_advertisements(registry.advertisements(), None);
     GridSnapshot {
         local_peer_id,
         topic,
@@ -758,6 +759,7 @@ fn available_model_views(
     if let Some(registry) = registry {
         manifests.extend(discovered_model_manifests(registry));
     }
+    manifests.retain(|manifest| manifest.runtime_kind != RuntimeKind::Demo);
     manifests.sort_by(|left, right| left.model_id.cmp(&right.model_id));
     manifests.dedup_by(|left, right| left.model_id == right.model_id);
     manifests.sort_by(|left, right| left.display_name.cmp(&right.display_name));
@@ -819,6 +821,7 @@ fn discovered_model_manifests(registry: &ShardRegistry) -> Vec<ModelManifest> {
         .advertisements()
         .iter()
         .flat_map(|advertisement| advertisement.hosted_shards.iter())
+        .filter(|shard| shard.runtime_kind != RuntimeKind::Demo)
     {
         by_model
             .entry(shard.model_id.clone())
@@ -841,6 +844,30 @@ fn discovered_model_manifests(registry: &ShardRegistry) -> Vec<ModelManifest> {
     }
 
     by_model.into_values().collect()
+}
+
+fn ui_visible_advertisements(
+    advertisements: Vec<NodeAdvertisement>,
+    model_id: Option<&str>,
+) -> Vec<NodeAdvertisement> {
+    advertisements
+        .into_iter()
+        .filter_map(|mut advertisement| {
+            advertisement.hosted_shards.retain(|shard| {
+                shard.runtime_kind != RuntimeKind::Demo
+                    && model_id.is_none_or(|model_id| shard.model_id == model_id)
+            });
+            advertisement
+                .model_shards
+                .retain(|shard| model_id.is_none_or(|model_id| shard.model_id == model_id));
+
+            if advertisement.hosted_shards.is_empty() && advertisement.model_shards.is_empty() {
+                None
+            } else {
+                Some(advertisement)
+            }
+        })
+        .collect()
 }
 
 fn model_status(
@@ -1349,7 +1376,74 @@ fn app_data_dir(app: &AppHandle) -> PathBuf {
 }
 
 fn cache_config_for_app(app: &AppHandle) -> ShardCacheConfig {
-    ShardCacheConfig::new(app_data_dir(app).join("shards"))
+    let config = ShardCacheConfig::new(app_data_dir(app).join("shards"));
+    if let Err(error) = migrate_legacy_caches(&config) {
+        eprintln!("failed to migrate legacy Infernet cache: {error}");
+    }
+    config
+}
+
+fn migrate_legacy_caches(target_config: &ShardCacheConfig) -> anyhow::Result<usize> {
+    migrate_legacy_cache_roots(target_config, legacy_cache_roots())
+}
+
+fn migrate_legacy_cache_roots(
+    target_config: &ShardCacheConfig,
+    legacy_roots: impl IntoIterator<Item = PathBuf>,
+) -> anyhow::Result<usize> {
+    let target_cache = ShardCache::new(target_config.clone())?;
+    let target_root = target_config.root.clone();
+    let mut migrated = 0_usize;
+
+    for legacy_root in legacy_roots {
+        if same_path(&legacy_root, &target_root) || !legacy_root.join("meta").is_dir() {
+            continue;
+        }
+
+        let legacy_cache = ShardCache::new(ShardCacheConfig::new(legacy_root))?;
+        for record in legacy_cache.list()? {
+            if target_cache
+                .find(
+                    &record.info.model_id,
+                    record.info.layers,
+                    Some(&record.info.checksum),
+                    Some(&record.info.version),
+                )?
+                .is_some()
+            {
+                continue;
+            }
+
+            let payload = legacy_cache.read_payload(&record.info)?;
+            target_cache.store_downloaded(&record.info, payload)?;
+            migrated += 1;
+        }
+    }
+
+    Ok(migrated)
+}
+
+fn legacy_cache_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    roots.push(PathBuf::from(".infernet/shards"));
+    if let Ok(current_dir) = env::current_dir() {
+        roots.push(current_dir.join(".infernet/shards"));
+    }
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    roots.push(manifest_dir.join(".infernet/shards"));
+    roots.push(manifest_dir.join("../../.infernet/shards"));
+
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
 }
 
 fn local_cache_has_shards(cache_config: &ShardCacheConfig) -> bool {
@@ -1619,4 +1713,63 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Infernet UI");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_cache_does_not_publish_builtin_models() {
+        let root = std::env::temp_dir().join(format!("infernet-ui-empty-{}", unix_ms()));
+        let cache_config = ShardCacheConfig::new(root.clone());
+
+        assert!(available_model_views(&cache_config, None).is_empty());
+        assert!(manifest_for_model(None, &cache_config, None).is_err());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_cache_is_migrated_to_app_cache() {
+        let root = std::env::temp_dir().join(format!("infernet-ui-migrate-{}", unix_ms()));
+        let legacy_root = root.join("legacy").join(".infernet").join("shards");
+        let target_root = root.join("app-data").join("shards");
+        let legacy_config = ShardCacheConfig::new(legacy_root.clone());
+        let target_config = ShardCacheConfig::new(target_root.clone());
+        let range = LayerRange::new(0, 8).unwrap();
+
+        let legacy_cache = ShardCache::new(legacy_config).unwrap();
+        let legacy_record = legacy_cache
+            .import_payload(
+                b"legacy gemma metadata".to_vec(),
+                "gemma-4-12b-it-iq4-xs",
+                range,
+                "v1",
+            )
+            .unwrap();
+
+        let migrated =
+            migrate_legacy_cache_roots(&target_config, vec![legacy_root.clone()]).unwrap();
+        assert_eq!(migrated, 1);
+
+        let target_cache = ShardCache::new(target_config).unwrap();
+        let migrated_record = target_cache
+            .find(
+                "gemma-4-12b-it-iq4-xs",
+                range,
+                Some(&legacy_record.info.checksum),
+                Some("v1"),
+            )
+            .unwrap()
+            .expect("migrated shard should exist in app cache");
+
+        assert!(migrated_record.path.starts_with(&target_root));
+        assert_eq!(
+            target_cache.read_payload(&legacy_record.info).unwrap(),
+            b"legacy gemma metadata"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
