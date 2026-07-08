@@ -931,8 +931,11 @@ fn build_coverage(
         .collect()
 }
 
-fn build_distribution_snapshot(advertisements: &[NodeAdvertisement]) -> DistributionSnapshot {
-    let cache = ShardCache::new(default_cache_config());
+fn build_distribution_snapshot(
+    cache_config: &ShardCacheConfig,
+    advertisements: &[NodeAdvertisement],
+) -> DistributionSnapshot {
+    let cache = ShardCache::new(cache_config.clone());
     let (installed_shards, storage_used_bytes, max_storage_bytes) = match cache {
         Ok(cache) => {
             let records = cache.list().unwrap_or_default();
@@ -1008,8 +1011,11 @@ fn build_distribution_snapshot(advertisements: &[NodeAdvertisement]) -> Distribu
     }
 }
 
-fn local_cache_advertisement(peer_id: String) -> Option<NodeAdvertisement> {
-    let cache = ShardCache::new(default_cache_config()).ok()?;
+fn local_cache_advertisement(
+    cache_config: &ShardCacheConfig,
+    peer_id: String,
+) -> Option<NodeAdvertisement> {
+    let cache = ShardCache::new(cache_config.clone()).ok()?;
     let records = cache.list().ok()?;
     let mut hosted_shards = Vec::new();
     let mut model_shards = Vec::new();
@@ -1044,8 +1050,12 @@ fn local_cache_advertisement(peer_id: String) -> Option<NodeAdvertisement> {
     })
 }
 
-async fn generate_with_llama_cli(manifest: &ModelManifest, prompt: &str) -> Result<String, String> {
-    let model_path = source_path_for_model(&manifest.model_id).ok_or_else(|| {
+async fn generate_with_llama_cli(
+    cache_config: &ShardCacheConfig,
+    manifest: &ModelManifest,
+    prompt: &str,
+) -> Result<String, String> {
+    let model_path = source_path_for_model(cache_config, &manifest.model_id).ok_or_else(|| {
         format!(
             "{} is installed, but the source GGUF path is missing",
             manifest.display_name
@@ -1102,8 +1112,8 @@ async fn generate_with_llama_cli(manifest: &ModelManifest, prompt: &str) -> Resu
     Ok(stdout)
 }
 
-fn source_path_for_model(model_id: &str) -> Option<PathBuf> {
-    let cache = ShardCache::new(default_cache_config()).ok()?;
+fn source_path_for_model(cache_config: &ShardCacheConfig, model_id: &str) -> Option<PathBuf> {
+    let cache = ShardCache::new(cache_config.clone()).ok()?;
     let records = cache.list().ok()?;
 
     for record in records {
@@ -1311,18 +1321,27 @@ fn format_model_name_part(part: &str) -> String {
     }
 }
 
-fn default_cache_config() -> ShardCacheConfig {
-    ShardCacheConfig::new(".infernet/shards")
+fn app_data_dir(app: &AppHandle) -> PathBuf {
+    app.path()
+        .app_data_dir()
+        .unwrap_or_else(|_| PathBuf::from(".infernet"))
 }
 
-fn local_cache_has_shards() -> bool {
-    ShardCache::new(default_cache_config())
+fn cache_config_for_app(app: &AppHandle) -> ShardCacheConfig {
+    ShardCacheConfig::new(app_data_dir(app).join("shards"))
+}
+
+fn local_cache_has_shards(cache_config: &ShardCacheConfig) -> bool {
+    ShardCache::new(cache_config.clone())
         .and_then(|cache| cache.list())
         .map(|records| !records.is_empty())
         .unwrap_or(false)
 }
 
-fn ensure_model_distribution_service(state: &State<'_, UiState>) -> Result<(), String> {
+fn ensure_model_distribution_service(
+    state: &State<'_, UiState>,
+    cache_config: ShardCacheConfig,
+) -> Result<(), String> {
     let mut started = state
         .model_distribution_started
         .lock()
@@ -1341,7 +1360,7 @@ fn ensure_model_distribution_service(state: &State<'_, UiState>) -> Result<(), S
     *started = true;
 
     tokio::spawn(async move {
-        if let Err(error) = run_model_distribution_node(discovery, default_cache_config()).await {
+        if let Err(error) = run_model_distribution_node(discovery, cache_config).await {
             eprintln!("model distribution node stopped: {error}");
         }
     });
@@ -1387,13 +1406,17 @@ fn apply_huggingface_auth(
     })
 }
 
-fn huggingface_download_path(repo_id: &str, filename: &str) -> Result<PathBuf, String> {
+fn huggingface_download_path(
+    app: &AppHandle,
+    repo_id: &str,
+    filename: &str,
+) -> Result<PathBuf, String> {
     let file_name = Path::new(filename)
         .file_name()
         .and_then(|value| value.to_str())
         .ok_or_else(|| "Hugging Face filename is invalid".to_owned())?;
 
-    Ok(PathBuf::from(".infernet")
+    Ok(app_data_dir(app)
         .join("imports")
         .join(sanitize_path_segment(repo_id))
         .join(sanitize_path_segment(file_name)))
@@ -1412,27 +1435,40 @@ fn sanitize_path_segment(value: &str) -> String {
         .collect()
 }
 
-fn manifest_for_model(model_id: Option<&str>) -> anyhow::Result<ModelManifest> {
-    let installed = installed_model_manifests();
+fn manifest_for_model(
+    model_id: Option<&str>,
+    cache_config: &ShardCacheConfig,
+    registry: Option<&ShardRegistry>,
+) -> anyhow::Result<ModelManifest> {
+    let mut available = installed_model_manifests(cache_config);
+    if let Some(registry) = registry {
+        available.extend(discovered_model_manifests(registry));
+    }
+    available.sort_by(|left, right| left.model_id.cmp(&right.model_id));
+    available.dedup_by(|left, right| left.model_id == right.model_id);
 
-    let Some(model_id) = model_id else {
-        return Ok(installed
+    let requested = model_id.map(str::trim).filter(|value| !value.is_empty());
+    let Some(model_id) = requested else {
+        return available
             .into_iter()
             .next()
-            .unwrap_or_else(ModelManifest::llama32_1b));
+            .ok_or_else(|| anyhow::anyhow!("no models are installed or discovered yet"));
     };
 
-    installed
+    available
         .into_iter()
         .find(|manifest| manifest.model_id == model_id)
-        .or_else(|| ModelManifest::by_id(model_id))
         .ok_or_else(|| {
-            let supported = available_model_views()
+            let supported = available_model_views(cache_config, registry)
                 .into_iter()
                 .map(|model| model.model_id)
                 .collect::<Vec<_>>()
                 .join(", ");
-            anyhow::anyhow!("unknown model {model_id}; available models are {supported}")
+            if supported.is_empty() {
+                anyhow::anyhow!("unknown model {model_id}; no models are installed or discovered yet")
+            } else {
+                anyhow::anyhow!("unknown model {model_id}; available models are {supported}")
+            }
         })
 }
 
