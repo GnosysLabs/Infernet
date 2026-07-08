@@ -2,7 +2,11 @@ pub mod model_distribution;
 
 use std::collections::HashMap;
 use std::mem;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::time::Duration;
+use std::{fs, io};
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
@@ -60,6 +64,39 @@ impl DiscoveryConfig {
 
     pub fn peer_id(&self) -> PeerId {
         self.keypair.public().to_peer_id()
+    }
+}
+
+pub fn load_or_generate_keypair(path: impl AsRef<Path>) -> Result<identity::Keypair> {
+    let path = path.as_ref();
+    match fs::read(path) {
+        Ok(bytes) => identity::Keypair::from_protobuf_encoding(&bytes)
+            .with_context(|| format!("failed to decode libp2p identity {}", path.display())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("failed to create identity directory {}", parent.display())
+                })?;
+            }
+
+            let keypair = identity::Keypair::generate_ed25519();
+            let bytes = keypair
+                .to_protobuf_encoding()
+                .context("failed to encode libp2p identity")?;
+            fs::write(path, bytes)
+                .with_context(|| format!("failed to write libp2p identity {}", path.display()))?;
+            #[cfg(unix)]
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).with_context(|| {
+                format!(
+                    "failed to restrict libp2p identity permissions {}",
+                    path.display()
+                )
+            })?;
+            Ok(keypair)
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to read libp2p identity {}", path.display()))
+        }
     }
 }
 
@@ -1163,6 +1200,7 @@ fn build_grid_swarm(
             noise::Config::new,
             yamux::Config::default,
         )?
+        .with_dns()?
         .with_behaviour(|key| {
             let gossipsub = gossipsub::Behaviour::new(
                 gossipsub::MessageAuthenticity::Signed(key.clone()),

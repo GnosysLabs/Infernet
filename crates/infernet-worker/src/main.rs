@@ -9,7 +9,7 @@ use infernet_model::{
 use infernet_node::{
     DiscoveryConfig, ShardCache, ShardCacheConfig, WorkerConfig, discover_for, empty_advertisement,
     fetch_model_shard_over_libp2p, import_seed_model_from_file, infer_over_libp2p,
-    run_model_distribution_node, run_worker_node, shard_advertisement,
+    load_or_generate_keypair, run_model_distribution_node, run_worker_node, shard_advertisement,
 };
 use infernet_protocol::{ModelShardInfo, NodeAdvertisement, RouteHop};
 use infernet_router::ShardRegistry;
@@ -28,12 +28,31 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    Bootstrap(BootstrapArgs),
     Serve(ServeArgs),
     Peers(DiscoveryArgs),
     Route(RouteArgs),
     Infer(InferArgs),
     Shard(ShardArgs),
     Model(ModelArgs),
+}
+
+#[derive(Debug, Args)]
+struct BootstrapArgs {
+    #[arg(long, default_value = DEFAULT_TOPIC)]
+    topic: String,
+    #[arg(long, default_value = "/ip4/0.0.0.0/tcp/9777")]
+    p2p_listen: String,
+    #[arg(long, default_value = "/var/lib/infernet-bootstrap/identity.key")]
+    identity_file: PathBuf,
+    #[arg(long, default_value = "/var/lib/infernet-bootstrap/shards")]
+    cache_dir: PathBuf,
+    #[arg(long, default_value_t = 10 * 1024 * 1024 * 1024_u64)]
+    max_storage_bytes: u64,
+    #[arg(long)]
+    public_domain: Option<String>,
+    #[arg(long)]
+    public_ip: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -192,6 +211,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Command::Bootstrap(args) => bootstrap(args).await,
         Command::Serve(args) => serve(args).await,
         Command::Peers(args) => {
             let manifest = ModelManifest::demo();
@@ -219,6 +239,40 @@ async fn main() -> Result<()> {
             ModelCommand::Mirror(args) => fetch_model_shard(args, true).await,
         },
     }
+}
+
+async fn bootstrap(args: BootstrapArgs) -> Result<()> {
+    let keypair = load_or_generate_keypair(&args.identity_file)?;
+    let peer_id = keypair.public().to_peer_id().to_string();
+    let tcp_port = tcp_port_from_multiaddr(&args.p2p_listen).unwrap_or("9777");
+    let mut discovery = DiscoveryConfig::new(args.topic);
+    discovery.keypair = keypair;
+    discovery.p2p_listen = args.p2p_listen.clone();
+
+    println!("peer_id={peer_id}");
+    println!("listen={}", args.p2p_listen);
+    println!("model_protocol=/infernet/model/1");
+    println!("activation_protocol=/infernet/activation/1");
+    println!("identity_file={}", args.identity_file.display());
+    println!("cache={}", args.cache_dir.display());
+    if let Some(domain) = args.public_domain.as_deref() {
+        println!("public_multiaddr=/dns4/{domain}/tcp/{tcp_port}/p2p/{peer_id}");
+    }
+    if let Some(ip) = args.public_ip.as_deref() {
+        println!("public_multiaddr=/ip4/{ip}/tcp/{tcp_port}/p2p/{peer_id}");
+    }
+
+    run_model_distribution_node(
+        discovery,
+        ShardCacheConfig {
+            root: args.cache_dir,
+            max_storage_bytes: args.max_storage_bytes,
+            preferred_models: Vec::new(),
+            pinned_models: Vec::new(),
+            automatic_cleanup: true,
+        },
+    )
+    .await
 }
 
 fn add_local_model(args: ModelAddLocalArgs) -> Result<()> {
@@ -467,6 +521,16 @@ fn parse_layer_range(input: &str) -> Result<LayerRange> {
         .with_context(|| format!("invalid range end {end}"))?;
 
     LayerRange::new(start, end).map_err(Into::into)
+}
+
+fn tcp_port_from_multiaddr(address: &str) -> Option<&str> {
+    let mut parts = address.split('/');
+    while let Some(part) = parts.next() {
+        if part == "tcp" {
+            return parts.next();
+        }
+    }
+    None
 }
 
 fn parse_static_peer(input: &str, manifest: &ModelManifest) -> Result<NodeAdvertisement> {

@@ -32,6 +32,7 @@ const DEFAULT_DISCOVERY_TIMEOUT_MS: u64 = 4_000;
 const DEFAULT_INFERENCE_TIMEOUT_MS: u64 = 6_000;
 const MAX_SAFE_LOCAL_GGUF_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 const UI_LISTEN_PORT: u16 = 9777;
+const DEFAULT_BOOTSTRAP_PEERS: &[&str] = &[];
 
 struct UiState {
     keypair: Mutex<identity::Keypair>,
@@ -301,9 +302,7 @@ async fn get_grid_snapshot(
     model_id: Option<String>,
 ) -> Result<GridSnapshot, String> {
     let cache_config = cache_config_for_app(&app);
-    if local_cache_has_shards(&cache_config) {
-        ensure_model_distribution_service(&state, cache_config.clone())?;
-    }
+    ensure_model_distribution_service(&state, cache_config.clone())?;
 
     collect_snapshot(
         &app,
@@ -322,9 +321,7 @@ async fn run_demo_inference(
     model_id: Option<String>,
 ) -> Result<RunDemoResponse, String> {
     let cache_config = cache_config_for_app(&app);
-    if local_cache_has_shards(&cache_config) {
-        ensure_model_distribution_service(&state, cache_config.clone())?;
-    }
+    ensure_model_distribution_service(&state, cache_config.clone())?;
     let manifest = manifest_for_model(model_id.as_deref(), &cache_config, None)
         .map_err(|error| error.to_string())?;
     let snapshot = collect_snapshot(
@@ -1520,13 +1517,6 @@ fn same_path(left: &Path, right: &Path) -> bool {
     }
 }
 
-fn local_cache_has_shards(cache_config: &ShardCacheConfig) -> bool {
-    ShardCache::new(cache_config.clone())
-        .and_then(|cache| cache.list())
-        .map(|records| !records.is_empty())
-        .unwrap_or(false)
-}
-
 fn ensure_model_distribution_service(
     state: &State<'_, UiState>,
     cache_config: ShardCacheConfig,
@@ -1547,11 +1537,7 @@ fn ensure_model_distribution_service(
     let mut discovery = DiscoveryConfig::new(state.topic.clone());
     discovery.keypair = keypair;
     discovery.p2p_listen = format!("/ip4/0.0.0.0/tcp/{UI_LISTEN_PORT}");
-    discovery.static_peers = state
-        .manual_peers
-        .lock()
-        .map_err(|_| "failed to lock manual peers".to_owned())?
-        .clone();
+    discovery.static_peers = configured_static_peers(state)?;
     *started = true;
 
     tauri::async_runtime::spawn(async move {
@@ -1597,6 +1583,47 @@ fn manual_peer_addresses(state: &State<'_, UiState>) -> Result<Vec<String>, Stri
         .iter()
         .flat_map(peer_address_labels)
         .collect())
+}
+
+fn configured_static_peers(state: &State<'_, UiState>) -> Result<Vec<NodeAdvertisement>, String> {
+    let mut by_peer = BTreeMap::<String, NodeAdvertisement>::new();
+    for peer in default_bootstrap_peers()?.into_iter().chain(
+        state
+            .manual_peers
+            .lock()
+            .map_err(|_| "failed to lock manual peers".to_owned())?
+            .clone(),
+    ) {
+        by_peer
+            .entry(peer.peer_id.clone())
+            .and_modify(|existing| {
+                for address in &peer.addresses {
+                    if !existing.addresses.contains(address) {
+                        existing.addresses.push(address.clone());
+                    }
+                }
+            })
+            .or_insert(peer);
+    }
+
+    Ok(by_peer.into_values().collect())
+}
+
+fn default_bootstrap_peers() -> Result<Vec<NodeAdvertisement>, String> {
+    let mut peers = Vec::new();
+    for address in DEFAULT_BOOTSTRAP_PEERS {
+        peers.push(parse_manual_peer(address)?);
+    }
+    if let Ok(addresses) = env::var("INFERNET_BOOTSTRAP_PEERS") {
+        for address in addresses
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            peers.push(parse_manual_peer(address)?);
+        }
+    }
+    Ok(peers)
 }
 
 fn peer_address_labels(advertisement: &NodeAdvertisement) -> Vec<String> {
@@ -1826,11 +1853,7 @@ fn discovery_config_from_state(
     let local_peer_id = keypair.public().to_peer_id().to_string();
     let mut config = DiscoveryConfig::new(state.topic.clone());
     config.keypair = keypair;
-    config.static_peers = state
-        .manual_peers
-        .lock()
-        .map_err(|_| "failed to lock manual peers".to_owned())?
-        .clone();
+    config.static_peers = configured_static_peers(state)?;
 
     Ok((config, local_peer_id))
 }
@@ -1863,10 +1886,8 @@ pub fn run() {
         .setup(|app| {
             let state = app.state::<UiState>();
             let cache_config = cache_config_for_app(app.handle());
-            if local_cache_has_shards(&cache_config) {
-                ensure_model_distribution_service(&state, cache_config)
-                    .map_err(|error| Box::<dyn std::error::Error>::from(error))?;
-            }
+            ensure_model_distribution_service(&state, cache_config)
+                .map_err(|error| Box::<dyn std::error::Error>::from(error))?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

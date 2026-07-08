@@ -13,9 +13,7 @@ infernet-node.workspace = true
 infernet-protocol.workspace = true
 infernet-router.workspace = true
 infernet-runtime.workspace = true
+libp2p.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
-
-[dev-dependencies]
-libp2p.workspace = true

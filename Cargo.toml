@@ -24,7 +24,7 @@ infernet-node = { path = "crates/infernet-node" }
 infernet-protocol = { path = "crates/infernet-protocol" }
 infernet-router = { path = "crates/infernet-router" }
 infernet-runtime = { path = "crates/infernet-runtime" }
-libp2p = { version = "0.56.0", features = ["gossipsub", "json", "macros", "mdns", "noise", "request-response", "tcp", "tokio", "yamux"] }
+libp2p = { version = "0.56.0", features = ["dns", "gossipsub", "json", "macros", "mdns", "noise", "request-response", "tcp", "tokio", "yamux"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 sha2 = "0.10.9"

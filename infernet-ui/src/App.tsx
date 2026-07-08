@@ -83,6 +83,7 @@ export default function App() {
   );
   const activeRoute = route.length > 0 ? route : snapshot.route;
   const peerCount = uniquePeerCount(activeRoute);
+  const remotePeerCount = snapshot.peers.filter((peer) => peer.peerId !== snapshot.localPeerId).length;
   const completedHops = hops.filter((hop) => hop.status === "complete").length;
 
   const applyProgressEvent = useCallback((event: ProgressEvent) => {
@@ -252,7 +253,7 @@ export default function App() {
         <AppHeader
           model={selectedModelView}
           status={status}
-          peerCount={snapshot.peers.length}
+          peerCount={remotePeerCount}
           onRefresh={() => refreshSnapshot(selectedModel)}
         />
 
@@ -385,7 +386,7 @@ function AppHeader({
       <div className="header-actions">
         <span className="connection-pill">
           <Wifi size={15} />
-          {peerCount === 1 ? "1 peer" : `${peerCount} peers`}
+          {peerCount === 0 ? "No remote peers" : peerCount === 1 ? "1 remote peer" : `${peerCount} remote peers`}
         </span>
         <span className="status-pill">{status}</span>
         <button className="icon-button" aria-label="Refresh network" onClick={onRefresh}>
