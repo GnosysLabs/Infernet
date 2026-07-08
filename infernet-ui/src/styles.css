@@ -215,6 +215,19 @@ button:disabled {
   color: var(--accent);
 }
 
+.status-pill {
+  min-height: 34px;
+  border: 1px solid var(--border-soft);
+  border-radius: 9px;
+  background: transparent;
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  padding: 0 10px;
+  font-size: 13px;
+  font-weight: 700;
+}
+
 .icon-button {
   width: 34px;
   height: 34px;

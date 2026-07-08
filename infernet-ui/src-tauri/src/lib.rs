@@ -842,6 +842,27 @@ fn discovered_model_manifests(registry: &ShardRegistry) -> Vec<ModelManifest> {
                 runtime_kind: shard.runtime_kind.clone(),
             });
     }
+    for shard in registry
+        .advertisements()
+        .iter()
+        .flat_map(|advertisement| advertisement.model_shards.iter())
+        .filter(|shard| shard.model_id != ModelManifest::demo().model_id)
+    {
+        by_model
+            .entry(shard.model_id.clone())
+            .and_modify(|manifest| {
+                manifest.layer_count = manifest.layer_count.max(shard.layers.end);
+            })
+            .or_insert_with(|| ModelManifest {
+                model_id: shard.model_id.clone(),
+                display_name: display_name_from_model_id(&shard.model_id),
+                architecture: "unknown".to_owned(),
+                layer_count: shard.layers.end,
+                hidden_size: 0,
+                activation_dtype: "f16".to_owned(),
+                runtime_kind: RuntimeKind::LlamaCpp,
+            });
+    }
 
     by_model.into_values().collect()
 }
@@ -857,9 +878,10 @@ fn ui_visible_advertisements(
                 shard.runtime_kind != RuntimeKind::Demo
                     && model_id.is_none_or(|model_id| shard.model_id == model_id)
             });
-            advertisement
-                .model_shards
-                .retain(|shard| model_id.is_none_or(|model_id| shard.model_id == model_id));
+            advertisement.model_shards.retain(|shard| {
+                shard.model_id != ModelManifest::demo().model_id
+                    && model_id.is_none_or(|model_id| shard.model_id == model_id)
+            });
 
             if advertisement.hosted_shards.is_empty() && advertisement.model_shards.is_empty() {
                 None
@@ -903,20 +925,37 @@ fn model_status(
 }
 
 fn peer_view_from_advertisement(advertisement: &NodeAdvertisement) -> PeerView {
+    let mut shards = advertisement
+        .hosted_shards
+        .iter()
+        .map(|shard| ShardView {
+            model_id: shard.model_id.clone(),
+            layer_start: shard.layers.start,
+            layer_end: shard.layers.end,
+        })
+        .collect::<Vec<_>>();
+    for shard in &advertisement.model_shards {
+        if shards.iter().any(|existing| {
+            existing.model_id == shard.model_id
+                && existing.layer_start == shard.layers.start
+                && existing.layer_end == shard.layers.end
+        }) {
+            continue;
+        }
+        shards.push(ShardView {
+            model_id: shard.model_id.clone(),
+            layer_start: shard.layers.start,
+            layer_end: shard.layers.end,
+        });
+    }
+    shards.sort_by_key(|shard| (shard.model_id.clone(), shard.layer_start, shard.layer_end));
+
     PeerView {
         peer_id: advertisement.peer_id.clone(),
         short_peer_id: short_peer_id(&advertisement.peer_id),
         addresses: advertisement.addresses.clone(),
         protocol_version: advertisement.protocol_version,
-        shards: advertisement
-            .hosted_shards
-            .iter()
-            .map(|shard| ShardView {
-                model_id: shard.model_id.clone(),
-                layer_start: shard.layers.start,
-                layer_end: shard.layers.end,
-            })
-            .collect(),
+        shards,
     }
 }
 

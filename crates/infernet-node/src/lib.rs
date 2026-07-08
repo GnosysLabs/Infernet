@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
-use infernet_model::{LayerRange, ModelManifest, RuntimeKind, ShardDescriptor};
+use infernet_model::{LayerRange, ModelManifest, RuntimeKind, SeedShardManifest, ShardDescriptor};
 use infernet_protocol::{
     ACTIVATION_PROTOCOL, ActivationRequest, ActivationResponse, MODEL_PROTOCOL, ModelShardInfo,
     ModelShardRequest, ModelShardResponse, NodeAdvertisement, PROTOCOL_VERSION, PromptMetadata,
@@ -557,10 +557,31 @@ fn refresh_advertisement_model_shards(
         return Ok(());
     };
 
-    advertisement.model_shards = match cache {
-        Some(cache) => cache.shard_infos()?,
-        None => Vec::new(),
-    };
+    match cache {
+        Some(cache) => {
+            let records = cache.list()?;
+            advertisement.model_shards = records.iter().map(|record| record.info.clone()).collect();
+            advertisement.hosted_shards = records
+                .iter()
+                .filter_map(|record| {
+                    let payload = cache.read_payload(&record.info).ok()?;
+                    let manifest = serde_json::from_slice::<SeedShardManifest>(&payload).ok()?;
+                    Some(ShardDescriptor {
+                        model_id: manifest.model_id,
+                        layers: manifest.layers,
+                        runtime_kind: manifest.runtime_kind,
+                        tokenizer: Some(manifest.tokenizer),
+                        metadata: Some(manifest.metadata),
+                        shard_hash: Some(manifest.shard_hash),
+                    })
+                })
+                .collect();
+        }
+        None => {
+            advertisement.model_shards = Vec::new();
+            advertisement.hosted_shards = Vec::new();
+        }
+    }
 
     Ok(())
 }

@@ -381,8 +381,9 @@ function AppHeader({
       <div className="header-actions">
         <span className="connection-pill">
           <Wifi size={15} />
-          {peerCount > 0 ? `${peerCount} peers` : status}
+          {peerCount === 1 ? "1 peer" : `${peerCount} peers`}
         </span>
+        <span className="status-pill">{status}</span>
         <button className="icon-button" aria-label="Refresh network" onClick={onRefresh}>
           <RefreshCw size={16} />
         </button>
