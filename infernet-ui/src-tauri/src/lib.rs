@@ -1555,7 +1555,7 @@ fn ensure_model_distribution_service(
         .clone();
     *started = true;
 
-    tokio::spawn(async move {
+    tauri::async_runtime::spawn(async move {
         if let Err(error) = run_model_distribution_node(discovery, cache_config).await {
             eprintln!("model distribution node stopped: {error}");
         }
