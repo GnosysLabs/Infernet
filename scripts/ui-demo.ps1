@@ -8,7 +8,10 @@ $Processes = @()
 
 Set-Location $RootDir
 
-cargo build -p infernet-worker | Out-Null
+cargo build -p infernet-worker
+if ($LASTEXITCODE -ne 0) {
+  throw "cargo build failed with exit code $LASTEXITCODE"
+}
 
 try {
   $Peers = @(
@@ -32,9 +35,15 @@ try {
 
   if (-not (Test-Path (Join-Path $UiDir "node_modules"))) {
     npm --prefix $UiDir install
+    if ($LASTEXITCODE -ne 0) {
+      throw "npm install failed with exit code $LASTEXITCODE"
+    }
   }
 
   npm --prefix $UiDir run tauri dev
+  if ($LASTEXITCODE -ne 0) {
+    throw "npm run tauri dev failed with exit code $LASTEXITCODE"
+  }
 }
 finally {
   foreach ($Process in $Processes) {

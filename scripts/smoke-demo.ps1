@@ -11,7 +11,10 @@ $Processes = @()
 
 Set-Location $RootDir
 
-cargo build -p infernet-worker | Out-Null
+cargo build -p infernet-worker
+if ($LASTEXITCODE -ne 0) {
+  throw "cargo build failed with exit code $LASTEXITCODE"
+}
 
 try {
   $Peers = @(
@@ -38,6 +41,9 @@ try {
     --prompt $Prompt `
     --topic $Topic `
     --discovery-timeout-ms 6000
+  if ($LASTEXITCODE -ne 0) {
+    throw "infernet-worker infer failed with exit code $LASTEXITCODE"
+  }
 }
 finally {
   foreach ($Process in $Processes) {
