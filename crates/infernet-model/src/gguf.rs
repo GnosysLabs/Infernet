@@ -2,8 +2,8 @@ use std::{
     collections::BTreeMap,
     fmt,
     fs::File,
-    io::{self, BufReader, Read},
-    path::Path,
+    io::{self, BufReader, Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -21,6 +21,21 @@ pub struct GgufInfo {
     pub tokenizer_checksum: String,
     pub quantization: Option<String>,
     pub tensor_names: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GgufLayerShardSummary {
+    pub path: PathBuf,
+    pub tensor_names: Vec<String>,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+struct TensorInfo {
+    name: String,
+    dimensions: Vec<u64>,
+    tensor_type: u32,
+    offset: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +151,277 @@ pub fn parse_gguf_info(path: &Path) -> Result<GgufInfo> {
         quantization,
         tensor_names,
     })
+}
+
+pub fn write_layer_shard(
+    source: &Path,
+    destination: &Path,
+    layers: crate::LayerRange,
+    layer_count: u32,
+) -> Result<GgufLayerShardSummary> {
+    layers.validate_for_model(layer_count)?;
+
+    let parsed = parse_gguf_layout(source)?;
+    let kept_tensors = parsed
+        .tensors
+        .iter()
+        .filter(|tensor| tensor_required_for_layers(&tensor.name, layers))
+        .collect::<Vec<_>>();
+
+    if kept_tensors.is_empty() {
+        bail!(
+            "GGUF shard {}:{} selected no tensors from {}",
+            layers.start,
+            layers.end,
+            source.display()
+        );
+    }
+
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let mut source_file =
+        File::open(source).with_context(|| format!("failed to open {}", source.display()))?;
+    let mut output = File::create(destination)
+        .with_context(|| format!("failed to create {}", destination.display()))?;
+
+    let mut tensor_spans = BTreeMap::<u64, u64>::new();
+    let mut offsets = parsed
+        .tensors
+        .iter()
+        .map(|tensor| tensor.offset)
+        .collect::<Vec<_>>();
+    offsets.sort_unstable();
+    offsets.dedup();
+    for (index, offset) in offsets.iter().enumerate() {
+        let next = offsets
+            .get(index + 1)
+            .copied()
+            .unwrap_or(parsed.file_size.saturating_sub(parsed.data_start));
+        if next < *offset {
+            bail!("GGUF tensor offsets are not sorted in {}", source.display());
+        }
+        tensor_spans.insert(*offset, next - *offset);
+    }
+
+    let mut new_offsets = BTreeMap::<String, u64>::new();
+    let mut next_data_offset = 0_u64;
+    for tensor in &kept_tensors {
+        next_data_offset = align_up(next_data_offset, parsed.alignment)?;
+        new_offsets.insert(tensor.name.clone(), next_data_offset);
+        let span = tensor_spans
+            .get(&tensor.offset)
+            .copied()
+            .ok_or_else(|| anyhow!("missing span for tensor {}", tensor.name))?;
+        next_data_offset = next_data_offset
+            .checked_add(span)
+            .ok_or_else(|| anyhow!("GGUF shard data offset overflow"))?;
+    }
+
+    output.write_all(b"GGUF")?;
+    write_u32(&mut output, parsed.version)?;
+    write_u64(&mut output, kept_tensors.len() as u64)?;
+    write_u64(&mut output, parsed.metadata_kv_count)?;
+    output.write_all(&parsed.metadata_bytes)?;
+    for tensor in &kept_tensors {
+        write_string(&mut output, &tensor.name)?;
+        write_u32(&mut output, tensor.dimensions.len() as u32)?;
+        for dimension in &tensor.dimensions {
+            write_u64(&mut output, *dimension)?;
+        }
+        write_u32(&mut output, tensor.tensor_type)?;
+        write_u64(
+            &mut output,
+            *new_offsets
+                .get(&tensor.name)
+                .expect("new offset inserted before writing"),
+        )?;
+    }
+
+    let header_end = output.stream_position()?;
+    let new_data_start = align_up(header_end, parsed.alignment)?;
+    write_zero_padding(&mut output, new_data_start - header_end)?;
+
+    for tensor in &kept_tensors {
+        let new_offset = *new_offsets
+            .get(&tensor.name)
+            .expect("new offset inserted before copying");
+        let target_position = new_data_start
+            .checked_add(new_offset)
+            .ok_or_else(|| anyhow!("GGUF shard output offset overflow"))?;
+        let current_position = output.stream_position()?;
+        if current_position > target_position {
+            bail!(
+                "GGUF shard writer overran tensor offset for {}; current={}, target={}",
+                tensor.name,
+                current_position,
+                target_position
+            );
+        }
+        write_zero_padding(&mut output, target_position - current_position)?;
+
+        let old_position = parsed
+            .data_start
+            .checked_add(tensor.offset)
+            .ok_or_else(|| anyhow!("GGUF source tensor offset overflow"))?;
+        let span = tensor_spans
+            .get(&tensor.offset)
+            .copied()
+            .ok_or_else(|| anyhow!("missing span for tensor {}", tensor.name))?;
+        copy_range(&mut source_file, &mut output, old_position, span)
+            .with_context(|| format!("failed to copy tensor {}", tensor.name))?;
+    }
+
+    output.flush()?;
+    let size_bytes = output.metadata()?.len();
+    Ok(GgufLayerShardSummary {
+        path: destination.to_path_buf(),
+        tensor_names: kept_tensors
+            .into_iter()
+            .map(|tensor| tensor.name.clone())
+            .collect(),
+        size_bytes,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct GgufLayout {
+    version: u32,
+    metadata_kv_count: u64,
+    metadata_bytes: Vec<u8>,
+    tensors: Vec<TensorInfo>,
+    alignment: u64,
+    data_start: u64,
+    file_size: u64,
+}
+
+fn parse_gguf_layout(path: &Path) -> Result<GgufLayout> {
+    let mut file =
+        File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let file_size = file.metadata()?.len();
+
+    let mut magic = [0; 4];
+    file.read_exact(&mut magic)?;
+    if &magic != b"GGUF" {
+        bail!("{} is not a GGUF file", path.display());
+    }
+
+    let version = read_u32(&mut file)?;
+    let tensor_count = read_u64(&mut file)?;
+    let metadata_kv_count = read_u64(&mut file)?;
+    let metadata_start = file.stream_position()?;
+    let mut alignment = 32_u64;
+
+    for _ in 0..metadata_kv_count {
+        let key = read_string(&mut file)?;
+        let value_type = read_u32(&mut file)?;
+        let value = read_value(&mut file, value_type)
+            .with_context(|| format!("failed to read GGUF metadata value {key}"))?;
+        if key == "general.alignment" {
+            alignment = value.as_u64().unwrap_or(alignment).max(1);
+        }
+    }
+
+    let metadata_end = file.stream_position()?;
+    file.seek(SeekFrom::Start(metadata_start))?;
+    let metadata_len = usize::try_from(metadata_end - metadata_start)
+        .context("GGUF metadata is too large to fit in memory")?;
+    let mut metadata_bytes = vec![0; metadata_len];
+    file.read_exact(&mut metadata_bytes)?;
+    file.seek(SeekFrom::Start(metadata_end))?;
+
+    let mut tensors = Vec::with_capacity(tensor_count.min(usize::MAX as u64) as usize);
+    for _ in 0..tensor_count {
+        let name = read_string(&mut file)?;
+        let dimensions_len = read_u32(&mut file)?;
+        let mut dimensions = Vec::with_capacity(dimensions_len as usize);
+        for _ in 0..dimensions_len {
+            dimensions.push(read_u64(&mut file)?);
+        }
+        let tensor_type = read_u32(&mut file)?;
+        let offset = read_u64(&mut file)?;
+        tensors.push(TensorInfo {
+            name,
+            dimensions,
+            tensor_type,
+            offset,
+        });
+    }
+
+    let tensor_info_end = file.stream_position()?;
+    let data_start = align_up(tensor_info_end, alignment)?;
+    if data_start > file_size {
+        bail!("GGUF data section starts past EOF in {}", path.display());
+    }
+
+    Ok(GgufLayout {
+        version,
+        metadata_kv_count,
+        metadata_bytes,
+        tensors,
+        alignment,
+        data_start,
+        file_size,
+    })
+}
+
+fn tensor_required_for_layers(name: &str, layers: crate::LayerRange) -> bool {
+    match tensor_layer_index(name) {
+        Some(layer) => layers.start <= layer && layer < layers.end,
+        None => true,
+    }
+}
+
+fn tensor_layer_index(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix("blk.")?;
+    let (layer, _) = rest.split_once('.')?;
+    layer.parse::<u32>().ok()
+}
+
+fn align_up(value: u64, alignment: u64) -> Result<u64> {
+    if alignment == 0 {
+        bail!("alignment must be greater than zero");
+    }
+    let remainder = value % alignment;
+    if remainder == 0 {
+        Ok(value)
+    } else {
+        value
+            .checked_add(alignment - remainder)
+            .ok_or_else(|| anyhow!("alignment overflow"))
+    }
+}
+
+fn copy_range(input: &mut File, output: &mut File, offset: u64, len: u64) -> Result<()> {
+    input.seek(SeekFrom::Start(offset))?;
+    let mut remaining = len;
+    let mut buffer = [0; 1024 * 1024];
+    while remaining > 0 {
+        let read_len = buffer.len().min(remaining as usize);
+        let read = input.read(&mut buffer[..read_len])?;
+        if read == 0 {
+            bail!("unexpected EOF while copying GGUF tensor data");
+        }
+        output.write_all(&buffer[..read])?;
+        remaining -= read as u64;
+    }
+    Ok(())
+}
+
+fn write_zero_padding(output: &mut File, len: u64) -> io::Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    const ZEROES: [u8; 4096] = [0; 4096];
+    let mut remaining = len;
+    while remaining > 0 {
+        let write_len = ZEROES.len().min(remaining as usize);
+        output.write_all(&ZEROES[..write_len])?;
+        remaining -= write_len as u64;
+    }
+    Ok(())
 }
 
 fn gguf_file_type_name(value: u64) -> String {
@@ -353,10 +639,107 @@ fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
     Ok(u64::from_le_bytes(bytes))
 }
 
+fn write_string(writer: &mut impl Write, value: &str) -> io::Result<()> {
+    write_u64(writer, value.len() as u64)?;
+    writer.write_all(value.as_bytes())
+}
+
+fn write_u32(writer: &mut impl Write, value: u32) -> io::Result<()> {
+    writer.write_all(&value.to_le_bytes())
+}
+
+fn write_u64(writer: &mut impl Write, value: u64) -> io::Result<()> {
+    writer.write_all(&value.to_le_bytes())
+}
+
 fn read_i64(reader: &mut impl Read) -> io::Result<i64> {
     let mut bytes = [0; 8];
     reader.read_exact(&mut bytes)?;
     Ok(i64::from_le_bytes(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::LayerRange;
+    use std::fs;
+
+    #[test]
+    fn writes_layer_shard_with_only_selected_block_tensors() {
+        let root = std::env::temp_dir().join(format!(
+            "infernet-gguf-shard-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.gguf");
+        let shard = root.join("shard.gguf");
+        write_test_gguf(&source).unwrap();
+
+        let summary =
+            write_layer_shard(&source, &shard, LayerRange::new(1, 2).unwrap(), 3).unwrap();
+        let info = parse_gguf_info(&shard).unwrap();
+
+        assert_eq!(summary.size_bytes, fs::metadata(&shard).unwrap().len());
+        assert_eq!(
+            info.tensor_names,
+            vec![
+                "token_embd.weight".to_owned(),
+                "blk.1.attn_norm.weight".to_owned(),
+                "output_norm.weight".to_owned()
+            ]
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn write_test_gguf(path: &Path) -> Result<()> {
+        let mut output = File::create(path)?;
+        output.write_all(b"GGUF")?;
+        write_u32(&mut output, 3)?;
+        write_u64(&mut output, 5)?;
+        write_u64(&mut output, 4)?;
+
+        write_string(&mut output, "general.architecture")?;
+        write_u32(&mut output, 8)?;
+        write_string(&mut output, "llama")?;
+        write_string(&mut output, "llama.block_count")?;
+        write_u32(&mut output, 4)?;
+        write_u32(&mut output, 3)?;
+        write_string(&mut output, "llama.embedding_length")?;
+        write_u32(&mut output, 4)?;
+        write_u32(&mut output, 1)?;
+        write_string(&mut output, "general.alignment")?;
+        write_u32(&mut output, 4)?;
+        write_u32(&mut output, 32)?;
+
+        let tensors = [
+            ("token_embd.weight", 0_u64),
+            ("blk.0.attn_norm.weight", 32),
+            ("blk.1.attn_norm.weight", 64),
+            ("blk.2.attn_norm.weight", 96),
+            ("output_norm.weight", 128),
+        ];
+        for (name, offset) in tensors {
+            write_string(&mut output, name)?;
+            write_u32(&mut output, 1)?;
+            write_u64(&mut output, 1)?;
+            write_u32(&mut output, 0)?;
+            write_u64(&mut output, offset)?;
+        }
+
+        let header_end = output.stream_position()?;
+        let data_start = align_up(header_end, 32)?;
+        write_zero_padding(&mut output, data_start - header_end)?;
+        for value in 0_u8..5 {
+            output.write_all(&[value; 4])?;
+            write_zero_padding(&mut output, 28)?;
+        }
+
+        Ok(())
+    }
 }
 
 fn read_f64(reader: &mut impl Read) -> io::Result<f64> {

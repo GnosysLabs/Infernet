@@ -22,6 +22,8 @@ pub struct ModelBlobRequest {
     pub protocol_version: u32,
     pub request_id: Uuid,
     pub model_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layers: Option<LayerRange>,
     pub source_checksum: String,
     pub offset: u64,
     pub max_bytes: u32,
@@ -38,7 +40,26 @@ impl ModelBlobRequest {
             protocol_version: PROTOCOL_VERSION,
             request_id: Uuid::new_v4(),
             model_id: model_id.into(),
+            layers: None,
             source_checksum: source_checksum.into(),
+            offset,
+            max_bytes,
+        }
+    }
+
+    pub fn new_shard(
+        model_id: impl Into<String>,
+        layers: LayerRange,
+        shard_checksum: impl Into<String>,
+        offset: u64,
+        max_bytes: u32,
+    ) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: Uuid::new_v4(),
+            model_id: model_id.into(),
+            layers: Some(layers),
+            source_checksum: shard_checksum.into(),
             offset,
             max_bytes,
         }
@@ -51,6 +72,8 @@ pub struct ModelBlobResponse {
     pub request_id: Uuid,
     pub peer_id: String,
     pub model_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layers: Option<LayerRange>,
     pub source_checksum: String,
     pub offset: u64,
     pub total_size_bytes: u64,
@@ -70,6 +93,7 @@ impl ModelBlobResponse {
             request_id: request.request_id,
             peer_id: peer_id.into(),
             model_id: request.model_id.clone(),
+            layers: request.layers,
             source_checksum: request.source_checksum.clone(),
             offset: request.offset,
             total_size_bytes,
@@ -88,6 +112,7 @@ impl ModelBlobResponse {
             request_id: request.request_id,
             peer_id: peer_id.into(),
             model_id: request.model_id.clone(),
+            layers: request.layers,
             source_checksum: request.source_checksum.clone(),
             offset: request.offset,
             total_size_bytes: 0,

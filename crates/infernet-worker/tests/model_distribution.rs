@@ -1,6 +1,8 @@
 use std::{
     fs,
+    io::{self, Seek, Write},
     net::TcpListener,
+    path::Path,
     process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -27,23 +29,21 @@ fn shard_downloaders_become_seeders() {
     let seed_cache = temp.join("seed-cache");
     let mirror_cache = temp.join("mirror-cache");
     let third_cache = temp.join("third-cache");
-    let seed_file = temp.join("seed.shard");
+    let seed_file = temp.join("seed.gguf");
     let seed_log = temp.join("seed.stdout");
     let mirror_log = temp.join("mirror.stdout");
     fs::create_dir_all(&temp).unwrap();
-    fs::write(&seed_file, b"infernet model shard payload").unwrap();
+    write_test_gguf(&seed_file).unwrap();
 
     let import_output = Command::new(binary)
         .args([
             "model",
-            "import",
+            "add-local",
             "--cache-dir",
             seed_cache.to_str().unwrap(),
             "--model",
             "grid-demo-12",
-            "--layers",
-            "0:3",
-            "--file",
+            "--gguf",
             seed_file.to_str().unwrap(),
             "--version",
             "v1",
@@ -56,8 +56,8 @@ fn shard_downloaders_become_seeders() {
         String::from_utf8_lossy(&import_output.stdout),
         String::from_utf8_lossy(&import_output.stderr)
     );
-    let checksum = parse_checksum(&String::from_utf8_lossy(&import_output.stdout));
-    let shard_size = fs::metadata(&seed_file).unwrap().len();
+    let (checksum, shard_size) =
+        parse_model_shard_info(&String::from_utf8_lossy(&import_output.stdout), "0:3");
     let seed_port = free_tcp_port();
 
     let seed_stdout = fs::File::create(&seed_log).unwrap();
@@ -160,12 +160,27 @@ fn shard_downloaders_become_seeders() {
     let _ = fs::remove_dir_all(temp);
 }
 
-fn parse_checksum(stdout: &str) -> String {
-    stdout
-        .split_whitespace()
-        .find_map(|part| part.strip_prefix("checksum="))
-        .expect("import output should include checksum")
-        .to_owned()
+fn parse_model_shard_info(stdout: &str, layers: &str) -> (String, u64) {
+    for line in stdout.lines() {
+        if !line.starts_with("model_shard ") || !line.contains(&format!("layers={layers}")) {
+            continue;
+        }
+
+        let checksum = line
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix("checksum="))
+            .expect("model_shard output should include checksum")
+            .to_owned();
+        let size = line
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix("size="))
+            .expect("model_shard output should include size")
+            .parse::<u64>()
+            .expect("model_shard size should be numeric");
+        return (checksum, size);
+    }
+
+    panic!("model_shard output should include layers={layers}\n{stdout}");
 }
 
 struct PeerAddress {
@@ -265,4 +280,82 @@ fn cache_has_meta(cache: &std::path::Path) -> bool {
         .ok()
         .map(|mut entries| entries.any(|entry| entry.is_ok()))
         .unwrap_or(false)
+}
+
+fn write_test_gguf(path: &Path) -> io::Result<()> {
+    let mut output = fs::File::create(path)?;
+    output.write_all(b"GGUF")?;
+    write_u32(&mut output, 3)?;
+    write_u64(&mut output, 14)?;
+    write_u64(&mut output, 4)?;
+
+    write_string(&mut output, "general.architecture")?;
+    write_u32(&mut output, 8)?;
+    write_string(&mut output, "demo-transformer")?;
+    write_string(&mut output, "demo-transformer.block_count")?;
+    write_u32(&mut output, 4)?;
+    write_u32(&mut output, 12)?;
+    write_string(&mut output, "demo-transformer.embedding_length")?;
+    write_u32(&mut output, 4)?;
+    write_u32(&mut output, 16)?;
+    write_string(&mut output, "general.alignment")?;
+    write_u32(&mut output, 4)?;
+    write_u32(&mut output, 32)?;
+
+    let mut tensor_index = 0_u64;
+    write_test_tensor_info(&mut output, "token_embd.weight", tensor_index * 32)?;
+    tensor_index += 1;
+    for layer in 0..12 {
+        write_test_tensor_info(
+            &mut output,
+            &format!("blk.{layer}.attn_norm.weight"),
+            tensor_index * 32,
+        )?;
+        tensor_index += 1;
+    }
+    write_test_tensor_info(&mut output, "output_norm.weight", tensor_index * 32)?;
+
+    let header_end = output.stream_position()?;
+    let data_start = align_up(header_end, 32);
+    write_zero_padding(&mut output, data_start - header_end)?;
+    for value in 0_u8..14 {
+        output.write_all(&[value; 4])?;
+        write_zero_padding(&mut output, 28)?;
+    }
+
+    Ok(())
+}
+
+fn write_test_tensor_info(output: &mut impl Write, name: &str, offset: u64) -> io::Result<()> {
+    write_string(output, name)?;
+    write_u32(output, 1)?;
+    write_u64(output, 1)?;
+    write_u32(output, 0)?;
+    write_u64(output, offset)
+}
+
+fn write_string(output: &mut impl Write, value: &str) -> io::Result<()> {
+    write_u64(output, value.len() as u64)?;
+    output.write_all(value.as_bytes())
+}
+
+fn write_u32(output: &mut impl Write, value: u32) -> io::Result<()> {
+    output.write_all(&value.to_le_bytes())
+}
+
+fn write_u64(output: &mut impl Write, value: u64) -> io::Result<()> {
+    output.write_all(&value.to_le_bytes())
+}
+
+fn write_zero_padding(output: &mut impl Write, len: u64) -> io::Result<()> {
+    output.write_all(&vec![0; len as usize])
+}
+
+fn align_up(value: u64, alignment: u64) -> u64 {
+    let remainder = value % alignment;
+    if remainder == 0 {
+        value
+    } else {
+        value + (alignment - remainder)
+    }
 }

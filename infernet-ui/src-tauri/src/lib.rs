@@ -15,10 +15,10 @@ use infernet_model::{
     gguf::parse_gguf_info,
 };
 use infernet_node::{
-    DiscoveryConfig, SeededModelSummary, ShardCache, ShardCacheConfig, discover_for,
-    empty_advertisement, executable_source_path_for_manifest, fetch_model_shard_over_libp2p,
-    fetch_model_source_over_libp2p, import_seed_model_from_file_with_progress, infer_over_libp2p,
-    run_model_distribution_node, sha256_bytes,
+    DiscoveryConfig, PAYLOAD_KIND_GGUF_SHARD, SeededModelSummary, ShardCache, ShardCacheConfig,
+    discover_for, empty_advertisement, fetch_model_shard_over_libp2p,
+    import_seed_model_from_file_with_progress, infer_over_libp2p, is_executable_shard_record,
+    run_model_distribution_node,
 };
 use infernet_protocol::{
     ModelShardInfo, NodeAdvertisement, PROTOCOL_VERSION, RouteHop, TraceEvent,
@@ -31,8 +31,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 const DEFAULT_TOPIC: &str = "infernet/grid-demo/1";
 const DEFAULT_DISCOVERY_TIMEOUT_MS: u64 = 4_000;
 const DEFAULT_INFERENCE_TIMEOUT_MS: u64 = 30_000;
-const DEFAULT_MODEL_FETCH_TIMEOUT_MS: u64 = 6_000;
-const DEFAULT_MODEL_SOURCE_FETCH_TIMEOUT_MS: u64 = 60 * 60 * 1_000;
+const DEFAULT_MODEL_FETCH_TIMEOUT_MS: u64 = 60 * 60 * 1_000;
 const UI_LISTEN_PORT: u16 = 9777;
 const DEFAULT_BOOTSTRAP_PEERS: &[&str] = &[
     "12D3KooWRJrnpHPQTWdThpDGZMwRCHhEBL4JCAxFMwYMfFavxa2h@/ip4/217.77.11.197/tcp/9777/p2p/12D3KooWRJrnpHPQTWdThpDGZMwRCHhEBL4JCAxFMwYMfFavxa2h",
@@ -759,6 +758,15 @@ async fn acquire_advertised_model_records(
         ));
     }
 
+    let local_peer_id = identity_from_state(state)?.0;
+    let plan = model_records_to_download_for_local_contribution(
+        &cache,
+        &manifest.model_id,
+        &local_peer_id,
+        plan,
+    )
+    .map_err(|error| error.to_string())?;
+
     let mut static_peers = configured_static_peers(state)?;
     merge_static_peer_advertisements(&mut static_peers, registry.advertisements());
     for record in plan {
@@ -775,33 +783,6 @@ async fn acquire_advertised_model_records(
             continue;
         }
 
-        if let Some(seed_manifest) = record.seed_manifest.as_ref() {
-            emit_model_import_progress(
-                app,
-                &manifest.model_id,
-                "Installing model record",
-                format!(
-                    "layers {}:{}",
-                    record.info.layers.start, record.info.layers.end
-                ),
-                0,
-                Some(record.info.size_bytes),
-            );
-            install_advertised_seed_record(&cache, &record.info, seed_manifest)?;
-            emit_model_import_progress(
-                app,
-                &manifest.model_id,
-                "Model record ready",
-                format!(
-                    "layers {}:{}",
-                    record.info.layers.start, record.info.layers.end
-                ),
-                record.info.size_bytes,
-                Some(record.info.size_bytes),
-            );
-            continue;
-        }
-
         if !allow_direct_fetch {
             continue;
         }
@@ -809,7 +790,7 @@ async fn acquire_advertised_model_records(
         emit_model_import_progress(
             app,
             &manifest.model_id,
-            "Downloading model record",
+            "Downloading shard",
             format!(
                 "layers {}:{}",
                 record.info.layers.start, record.info.layers.end
@@ -826,14 +807,14 @@ async fn acquire_advertised_model_records(
             record.info.layers,
             Some(record.info.checksum.clone()),
             Some(record.info.version.clone()),
-            Duration::from_millis(DEFAULT_MODEL_FETCH_TIMEOUT_MS),
+            Duration::from_millis(model_shard_fetch_timeout_ms(record.info.size_bytes)),
         )
         .await
         .map_err(|error| error.to_string())?;
         emit_model_import_progress(
             app,
             &manifest.model_id,
-            "Model record ready",
+            "Shard ready",
             format!(
                 "layers {}:{}",
                 record.info.layers.start, record.info.layers.end
@@ -843,119 +824,57 @@ async fn acquire_advertised_model_records(
         );
     }
 
-    if allow_direct_fetch {
-        acquire_advertised_model_source(app, state, cache_config, manifest, registry).await?;
-    }
-
     Ok(())
 }
 
-async fn acquire_advertised_model_source(
-    app: &AppHandle,
-    state: &State<'_, UiState>,
-    cache_config: &ShardCacheConfig,
-    manifest: &ModelManifest,
-    registry: &ShardRegistry,
-) -> Result<(), String> {
-    if local_source_path_for_model(cache_config, &manifest.model_id).is_some() {
-        return Ok(());
-    }
-
-    let seed_manifest = local_seed_manifest_for_model(cache_config, &manifest.model_id)
-        .or_else(|| advertised_seed_manifest_for_model(registry, &manifest.model_id));
-    let Some(seed_manifest) = seed_manifest else {
-        return Err(format!(
-            "{} is visible on the network, but no peer advertised a verifiable GGUF source yet.",
-            manifest.display_name
-        ));
-    };
-
-    let source_checksum = seed_manifest.source.checksum_sha256.clone();
-    let source_size_bytes = seed_manifest.source.file_size_bytes;
-    let mut static_peers = configured_static_peers(state)?;
-    merge_static_peer_advertisements(&mut static_peers, registry.advertisements());
-    let (mut config, _) = discovery_config_from_state(state)?;
-    config.static_peers = static_peers;
-    emit_model_import_progress(
-        app,
-        &manifest.model_id,
-        "Downloading model",
-        format!("Fetching {} from peers", manifest.display_name),
-        0,
-        Some(source_size_bytes),
-    );
-
-    let progress_app = app.clone();
-    let progress_model_id = manifest.model_id.clone();
-    let progress_name = manifest.display_name.clone();
-    fetch_model_source_over_libp2p(
-        config,
-        cache_config.clone(),
-        manifest.model_id.clone(),
-        source_checksum,
-        source_size_bytes,
-        Duration::from_millis(model_source_fetch_timeout_ms(source_size_bytes)),
-        move |downloaded_bytes, total_bytes| {
-            emit_model_import_progress(
-                &progress_app,
-                &progress_model_id,
-                "Downloading model",
-                format!("Fetching {progress_name} from peers"),
-                downloaded_bytes,
-                Some(total_bytes),
-            );
-        },
-    )
-    .await
-    .map_err(|error| error.to_string())?;
-
-    emit_model_import_progress(
-        app,
-        &manifest.model_id,
-        "Ready",
-        "Model downloaded, verified, and available for sharing",
-        source_size_bytes,
-        Some(source_size_bytes),
-    );
-
-    Ok(())
-}
-
-fn local_seed_manifest_for_model(
-    cache_config: &ShardCacheConfig,
+fn model_records_to_download_for_local_contribution(
+    cache: &ShardCache,
     model_id: &str,
-) -> Option<SeedShardManifest> {
-    let cache = ShardCache::new(cache_config.clone()).ok()?;
-    let records = cache.list().ok()?;
-    records.into_iter().find_map(|record| {
-        let payload = cache.read_payload(&record.info).ok()?;
-        let manifest = serde_json::from_slice::<SeedShardManifest>(&payload).ok()?;
-        (manifest.model_id == model_id).then_some(manifest)
-    })
-}
-
-fn advertised_seed_manifest_for_model(
-    registry: &ShardRegistry,
-    model_id: &str,
-) -> Option<SeedShardManifest> {
-    registry
-        .advertisements()
+    local_peer_id: &str,
+    mut plan: Vec<AdvertisedModelRecord>,
+) -> anyhow::Result<Vec<AdvertisedModelRecord>> {
+    plan.sort_by_key(|record| (record.info.layers.start, record.info.layers.end));
+    let local_executable = cache
+        .list()?
         .into_iter()
-        .flat_map(|advertisement| advertisement.hosted_shards.into_iter())
-        .find_map(|descriptor| {
-            if descriptor.model_id != model_id {
-                return None;
-            }
-            descriptor.seed_manifest.map(|manifest| *manifest)
-        })
+        .filter(|record| record.info.model_id == model_id && is_executable_shard_record(record))
+        .map(|record| record.info.layers)
+        .collect::<Vec<_>>();
+
+    if !local_executable.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let parity = stable_peer_parity(local_peer_id);
+    let mut selected = plan
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| index % 2 == parity)
+        .map(|(_, record)| record.clone())
+        .collect::<Vec<_>>();
+
+    if selected.is_empty() {
+        if let Some(first) = plan.into_iter().next() {
+            selected.push(first);
+        }
+    }
+
+    Ok(selected)
 }
 
-fn model_source_fetch_timeout_ms(size_bytes: u64) -> u64 {
+fn stable_peer_parity(peer_id: &str) -> usize {
+    peer_id
+        .bytes()
+        .fold(0_u8, |accumulator, byte| accumulator.wrapping_add(byte)) as usize
+        % 2
+}
+
+fn model_shard_fetch_timeout_ms(size_bytes: u64) -> u64 {
     let one_megabyte_per_second = size_bytes
         .saturating_div(1024 * 1024)
         .saturating_mul(1_000)
         .saturating_mul(2);
-    DEFAULT_MODEL_SOURCE_FETCH_TIMEOUT_MS.max(one_megabyte_per_second)
+    DEFAULT_MODEL_FETCH_TIMEOUT_MS.max(one_megabyte_per_second)
 }
 
 fn snapshot_from_registry(
@@ -1082,8 +1001,7 @@ fn installed_model_manifests(cache_config: &ShardCacheConfig) -> Vec<ModelManife
     let mut manifests = records
         .into_iter()
         .filter_map(|record| {
-            let payload = cache.read_payload(&record.info).ok()?;
-            let manifest = serde_json::from_slice::<SeedShardManifest>(&payload).ok()?;
+            let manifest = record.manifest?;
             Some(ModelManifest {
                 model_id: manifest.model_id,
                 display_name: manifest.display_name,
@@ -1261,7 +1179,7 @@ fn model_status(
     }
 
     if local_source_path_for_model(cache_config, &manifest.model_id).is_none() {
-        return "Model records installed. Infernet will download the verified GGUF source from peers before chat.".to_owned();
+        return "Model records installed. Infernet will download executable layer shards from peers before chat.".to_owned();
     }
 
     "Installed locally. Ready for distributed inference.".to_owned()
@@ -1394,41 +1312,6 @@ fn advertised_model_record_plan(
     }
 
     by_range.into_values().collect()
-}
-
-fn verify_advertised_seed_payload(info: &ModelShardInfo, payload: &[u8]) -> Result<(), String> {
-    let actual_checksum = sha256_bytes(payload);
-    if actual_checksum != info.checksum {
-        return Err(format!(
-            "advertised model record checksum mismatch for {} {}:{}; expected {}, got {}",
-            info.model_id, info.layers.start, info.layers.end, info.checksum, actual_checksum
-        ));
-    }
-    if payload.len() as u64 != info.size_bytes {
-        return Err(format!(
-            "advertised model record size mismatch for {} {}:{}; expected {}, got {}",
-            info.model_id,
-            info.layers.start,
-            info.layers.end,
-            info.size_bytes,
-            payload.len()
-        ));
-    }
-
-    Ok(())
-}
-
-fn install_advertised_seed_record(
-    cache: &ShardCache,
-    info: &ModelShardInfo,
-    seed_manifest: &SeedShardManifest,
-) -> Result<(), String> {
-    let payload = serde_json::to_vec_pretty(seed_manifest).map_err(|error| error.to_string())?;
-    verify_advertised_seed_payload(info, &payload)?;
-    cache
-        .store_downloaded(info, payload)
-        .map(|_| ())
-        .map_err(|error| error.to_string())
 }
 
 fn missing_ranges_from_layer_ranges(
@@ -1611,9 +1494,11 @@ fn local_cache_advertisement(
     let mut model_shards = Vec::new();
 
     for record in records {
-        let payload = cache.read_payload(&record.info).ok()?;
-        let manifest = serde_json::from_slice::<SeedShardManifest>(&payload).ok()?;
-        if seed_record_is_executable(cache_config, &manifest) {
+        let Some(manifest) = record.manifest.clone() else {
+            continue;
+        };
+        if is_executable_shard_record(&record) && seed_record_is_executable(cache_config, &manifest)
+        {
             let seed_manifest = Box::new(manifest.clone());
             hosted_shards.push(ShardDescriptor {
                 model_id: manifest.model_id.clone(),
@@ -1625,7 +1510,9 @@ fn local_cache_advertisement(
                 seed_manifest: Some(seed_manifest),
             });
         }
-        model_shards.push(record.info);
+        if is_executable_shard_record(&record) {
+            model_shards.push(record.info);
+        }
     }
 
     if hosted_shards.is_empty() && model_shards.is_empty() {
@@ -1645,9 +1532,8 @@ fn local_cache_advertisement(
 }
 
 fn seed_record_is_executable(config: &ShardCacheConfig, manifest: &SeedShardManifest) -> bool {
-    manifest.runtime_kind == RuntimeKind::Demo
-        || manifest.payload_kind != "metadata-only"
-        || executable_source_path_for_manifest(config, manifest).is_some()
+    let _ = config;
+    manifest.runtime_kind == RuntimeKind::Demo || manifest.payload_kind == PAYLOAD_KIND_GGUF_SHARD
 }
 
 fn local_source_path_for_model(cache_config: &ShardCacheConfig, model_id: &str) -> Option<PathBuf> {
@@ -1655,11 +1541,12 @@ fn local_source_path_for_model(cache_config: &ShardCacheConfig, model_id: &str) 
     let records = cache.list().ok()?;
 
     for record in records {
-        let payload = cache.read_payload(&record.info).ok()?;
-        let manifest = serde_json::from_slice::<SeedShardManifest>(&payload).ok()?;
+        let Some(manifest) = record.manifest.as_ref() else {
+            continue;
+        };
         if manifest.model_id == model_id {
-            if let Some(path) = executable_source_path_for_manifest(cache_config, &manifest) {
-                return Some(path);
+            if is_executable_shard_record(&record) {
+                return Some(record.path);
             }
         }
     }
@@ -1701,7 +1588,7 @@ fn add_model_response_from_summary(summary: SeededModelSummary) -> AddModelRespo
             })
             .collect(),
         message: if summary.metadata_only {
-            "Model seed records are being shared. Physical GGUF tensor shards still require the llama.cpp shard writer.".to_owned()
+            "This import did not create executable GGUF shards and will not be advertised for inference.".to_owned()
         } else {
             "Model shards are installed and seeding to the network.".to_owned()
         },
@@ -2398,13 +2285,13 @@ mod tests {
     }
 
     #[test]
-    fn local_seed_record_with_source_file_advertises_route_and_quantization() {
+    fn local_physical_shard_advertises_route_and_quantization() {
         let root = std::env::temp_dir().join(format!("infernet-ui-local-gguf-{}", unix_ms()));
         let cache_config = ShardCacheConfig::new(root.join("shards"));
         let cache = ShardCache::new(cache_config.clone()).unwrap();
         let source = root.join("gemma-4-12b-it-IQ4_XS.gguf");
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(&source, b"local gguf placeholder").unwrap();
+        std::fs::write(&source, b"local physical gguf shard placeholder").unwrap();
 
         let layers = LayerRange::new(0, 48).unwrap();
         let seed_manifest = SeedShardManifest {
@@ -2432,14 +2319,15 @@ mod tests {
                 file_size_bytes: 123,
             },
             shard_hash: "hash".to_owned(),
-            payload_kind: "metadata-only".to_owned(),
+            payload_kind: PAYLOAD_KIND_GGUF_SHARD.to_owned(),
         };
         cache
-            .import_payload(
-                serde_json::to_vec(&seed_manifest).unwrap(),
+            .import_physical_shard_file(
+                &source,
                 seed_manifest.model_id.clone(),
                 layers,
                 "v1",
+                seed_manifest,
             )
             .unwrap();
 
@@ -2470,10 +2358,14 @@ mod tests {
     }
 
     #[test]
-    fn advertised_seed_manifest_installs_verified_model_record() {
+    fn physical_shard_record_keeps_manifest_and_payload() {
         let root = std::env::temp_dir().join(format!("infernet-ui-advertised-{}", unix_ms()));
         let cache_config = ShardCacheConfig::new(root.join("shards"));
         let cache = ShardCache::new(cache_config.clone()).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let shard_file = root.join("remote-shard.gguf");
+        let shard_bytes = b"physical shard payload";
+        std::fs::write(&shard_file, shard_bytes).unwrap();
         let layers = LayerRange::new(0, 8).unwrap();
         let seed_manifest = SeedShardManifest {
             model_id: "gemma-4-12b-it-iq4-xs".to_owned(),
@@ -2500,31 +2392,30 @@ mod tests {
                 file_size_bytes: 12_345,
             },
             shard_hash: "seed-hash".to_owned(),
-            payload_kind: "metadata-only".to_owned(),
-        };
-        let payload = serde_json::to_vec_pretty(&seed_manifest).unwrap();
-        let info = ModelShardInfo {
-            model_id: seed_manifest.model_id.clone(),
-            layers,
-            checksum: sha256_bytes(&payload),
-            size_bytes: payload.len() as u64,
-            version: "v1".to_owned(),
-            protocol_version: PROTOCOL_VERSION,
+            payload_kind: PAYLOAD_KIND_GGUF_SHARD.to_owned(),
         };
 
-        install_advertised_seed_record(&cache, &info, &seed_manifest).unwrap();
+        let record = cache
+            .import_physical_shard_file(
+                &shard_file,
+                seed_manifest.model_id.clone(),
+                layers,
+                "v1",
+                seed_manifest.clone(),
+            )
+            .unwrap();
 
         let installed = cache
             .find(
-                &info.model_id,
+                &record.info.model_id,
                 layers,
-                Some(&info.checksum),
-                Some(&info.version),
+                Some(&record.info.checksum),
+                Some(&record.info.version),
             )
             .unwrap()
             .expect("advertised record should be installed");
-        assert_eq!(installed.info, info);
-        assert_eq!(cache.read_payload(&installed.info).unwrap(), payload);
+        assert_eq!(installed.manifest, Some(seed_manifest));
+        assert_eq!(cache.read_payload(&installed.info).unwrap(), shard_bytes);
 
         let _ = std::fs::remove_dir_all(root);
     }

@@ -26,6 +26,8 @@ const cliSidecarBase = resolve(sidecarDir, "llama-cli");
 const bridgeSidecarBase = resolve(sidecarDir, "infernet-llama-bridge");
 const sidecarPath = `${cliSidecarBase}-${targetTriple}${executableSuffix}`;
 const bridgeSidecarPath = `${bridgeSidecarBase}-${targetTriple}${executableSuffix}`;
+const runtimeStampPath = resolve(sidecarDir, `.infernet-llama-runtime-${targetTriple}.stamp`);
+const runtimePatchVersion = "physical-gguf-shards-v1";
 const buildRoot = resolve(repoRoot, "target", "llama.cpp-runtime");
 const sourceDir = join(buildRoot, "llama.cpp");
 const buildDir = join(buildRoot, `build-${targetTriple}`);
@@ -40,14 +42,16 @@ function main() {
   if (fileExists(sidecarPath) && fileExists(bridgeSidecarPath)) {
     const validation = validateRuntime(sidecarPath);
     const bridgeValidation = validateRuntime(bridgeSidecarPath);
-    if (validation.ok && bridgeValidation.ok) {
+    const stampMatches = readStamp() === runtimePatchVersion;
+    if (validation.ok && bridgeValidation.ok && stampMatches) {
       log(`bundled llama.cpp runtime already exists: ${relative(sidecarPath)}`);
       log(`bundled Infernet llama.cpp bridge already exists: ${relative(bridgeSidecarPath)}`);
       return;
     }
-    log(`rebuilding bundled llama.cpp runtime: ${validation.ok ? bridgeValidation.reason : validation.reason}`);
+    log(`rebuilding bundled llama.cpp runtime: ${stampMatches ? (validation.ok ? bridgeValidation.reason : validation.reason) : "runtime patch stamp is stale"}`);
     safeUnlink(sidecarPath);
     safeUnlink(bridgeSidecarPath);
+    safeUnlink(runtimeStampPath);
   }
 
   const configuredCli = process.env.INFERNET_LLAMA_CLI?.trim();
@@ -55,6 +59,7 @@ function main() {
   if (configuredCli && configuredBridge) {
     copyRuntime(configuredCli, sidecarPath, "INFERNET_LLAMA_CLI");
     copyRuntime(configuredBridge, bridgeSidecarPath, "INFERNET_LLAMA_BRIDGE");
+    writeStamp();
     return;
   }
 
@@ -63,12 +68,14 @@ function main() {
   if (cliFromPath && bridgeFromPath) {
     copyRuntime(cliFromPath, sidecarPath, "PATH");
     copyRuntime(bridgeFromPath, bridgeSidecarPath, "PATH");
+    writeStamp();
     return;
   }
 
   const preparedPrebuilt =
     (isWindows && prepareWindowsPrebuilt()) || (isMacos && prepareMacosPrebuilt());
   if (preparedPrebuilt && fileExists(bridgeSidecarPath)) {
+    writeStamp();
     return;
   }
   if (preparedPrebuilt) {
@@ -76,6 +83,7 @@ function main() {
   }
 
   buildFromSource();
+  writeStamp();
 }
 
 function prepareWindowsPrebuilt() {
@@ -351,6 +359,13 @@ function patchModelLoader() {
     "    ml.done_getting_tensors();\n",
     "    ml.done_getting_tensors(params.infernet_partial);\n");
   writeFileSync(path, text);
+
+  const loaderPath = join(sourceDir, "src", "llama-model-loader.cpp");
+  let loader = readText(loaderPath);
+  loader = replaceOnce(loader,
+    "        if (!t_meta) {\n            if (flags & TENSOR_NOT_REQUIRED) {\n                return nullptr;\n            }\n            throw std::runtime_error(format(\"missing tensor '%s'\", tn.str().c_str()));\n        }\n",
+    "        if (!t_meta) {\n            if ((flags & TENSOR_SKIP) || (flags & TENSOR_NOT_REQUIRED)) {\n                return nullptr;\n            }\n            throw std::runtime_error(format(\"missing tensor '%s'\", tn.str().c_str()));\n        }\n");
+  writeFileSync(loaderPath, loader);
 }
 
 function patchDecoderGraphs() {
@@ -598,6 +613,18 @@ function validateRuntime(path) {
   }
 
   return { ok: true };
+}
+
+function readStamp() {
+  try {
+    return readFileSync(runtimeStampPath, "utf8").trim();
+  } catch {
+    return "";
+  }
+}
+
+function writeStamp() {
+  writeFileSync(runtimeStampPath, runtimePatchVersion + "\n");
 }
 
 function invalidMacosDependency(line, runtimeDir) {

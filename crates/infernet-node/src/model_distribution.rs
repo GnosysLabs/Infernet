@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use infernet_model::{
     LayerRange, ModelManifest, SeedShardManifest, SeedSourceMetadata, ShardMetadata,
-    TokenizerCompatibility,
+    TokenizerCompatibility, gguf::write_layer_shard,
 };
 use infernet_protocol::{ModelShardInfo, PROTOCOL_VERSION};
 use serde::{Deserialize, Serialize};
@@ -40,6 +40,8 @@ pub struct CachedShardRecord {
     pub path: PathBuf,
     pub last_access_unix_ms: u64,
     pub pinned: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<SeedShardManifest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +68,9 @@ pub struct SeededModelSummary {
 pub struct ShardCache {
     config: ShardCacheConfig,
 }
+
+pub const PAYLOAD_KIND_METADATA_ONLY: &str = "metadata-only";
+pub const PAYLOAD_KIND_GGUF_SHARD: &str = "gguf-shard";
 
 impl ShardCache {
     pub fn new(config: ShardCacheConfig) -> Result<Self> {
@@ -99,7 +104,31 @@ impl ShardCache {
             protocol_version: PROTOCOL_VERSION,
         };
 
-        self.store_verified(info, bytes)
+        self.store_verified_payload(info, bytes, None)
+    }
+
+    pub fn import_physical_shard_file(
+        &self,
+        source: &Path,
+        model_id: impl Into<String>,
+        layers: LayerRange,
+        version: impl Into<String>,
+        manifest: SeedShardManifest,
+    ) -> Result<CachedShardRecord> {
+        let size_bytes = fs::metadata(source)
+            .with_context(|| format!("failed to inspect shard file {}", source.display()))?
+            .len();
+        let checksum = sha256_file(source)?;
+        let info = ModelShardInfo {
+            model_id: model_id.into(),
+            layers,
+            checksum,
+            size_bytes,
+            version: version.into(),
+            protocol_version: PROTOCOL_VERSION,
+        };
+
+        self.store_verified_file(info, source, Some(manifest), true)
     }
 
     pub fn import_payload(
@@ -119,13 +148,22 @@ impl ShardCache {
             protocol_version: PROTOCOL_VERSION,
         };
 
-        self.store_verified(info, payload)
+        self.store_verified_payload(info, payload, None)
     }
 
     pub fn store_downloaded(
         &self,
         expected: &ModelShardInfo,
         payload: Vec<u8>,
+    ) -> Result<CachedShardRecord> {
+        self.store_downloaded_with_manifest(expected, payload, None)
+    }
+
+    pub fn store_downloaded_with_manifest(
+        &self,
+        expected: &ModelShardInfo,
+        payload: Vec<u8>,
+        manifest: Option<SeedShardManifest>,
     ) -> Result<CachedShardRecord> {
         let actual_checksum = sha256_bytes(&payload);
         if actual_checksum != expected.checksum {
@@ -150,7 +188,42 @@ impl ShardCache {
             );
         }
 
-        self.store_verified(expected.clone(), payload)
+        self.store_verified_payload(expected.clone(), payload, manifest)
+    }
+
+    pub fn store_downloaded_file(
+        &self,
+        expected: &ModelShardInfo,
+        path: &Path,
+        manifest: Option<SeedShardManifest>,
+    ) -> Result<CachedShardRecord> {
+        let actual_checksum = sha256_file(path)?;
+        if actual_checksum != expected.checksum {
+            bail!(
+                "checksum verification failed for {} {}:{}; expected {}, got {}",
+                expected.model_id,
+                expected.layers.start,
+                expected.layers.end,
+                expected.checksum,
+                actual_checksum
+            );
+        }
+
+        let actual_size = fs::metadata(path)
+            .with_context(|| format!("failed to inspect {}", path.display()))?
+            .len();
+        if actual_size != expected.size_bytes {
+            bail!(
+                "size verification failed for {} {}:{}; expected {}, got {}",
+                expected.model_id,
+                expected.layers.start,
+                expected.layers.end,
+                expected.size_bytes,
+                actual_size
+            );
+        }
+
+        self.store_verified_file(expected.clone(), path, manifest, true)
     }
 
     pub fn list(&self) -> Result<Vec<CachedShardRecord>> {
@@ -278,11 +351,16 @@ impl ShardCache {
         Ok(evicted)
     }
 
-    fn store_verified(&self, info: ModelShardInfo, payload: Vec<u8>) -> Result<CachedShardRecord> {
+    fn store_verified_payload(
+        &self,
+        info: ModelShardInfo,
+        payload: Vec<u8>,
+        manifest: Option<SeedShardManifest>,
+    ) -> Result<CachedShardRecord> {
         fs::create_dir_all(self.config.root.join("data"))?;
         fs::create_dir_all(self.config.root.join("meta"))?;
 
-        let data_path = self.data_path(&info);
+        let data_path = self.data_path(&info, manifest.as_ref());
         fs::write(&data_path, payload)
             .with_context(|| format!("failed to write {}", data_path.display()))?;
 
@@ -291,7 +369,61 @@ impl ShardCache {
             info,
             path: data_path,
             last_access_unix_ms: now_unix_ms(),
+            manifest,
         };
+        self.write_record(record)
+    }
+
+    fn store_verified_file(
+        &self,
+        info: ModelShardInfo,
+        source: &Path,
+        manifest: Option<SeedShardManifest>,
+        remove_source_after_copy: bool,
+    ) -> Result<CachedShardRecord> {
+        fs::create_dir_all(self.config.root.join("data"))?;
+        fs::create_dir_all(self.config.root.join("meta"))?;
+
+        let data_path = self.data_path(&info, manifest.as_ref());
+        if data_path.exists() {
+            fs::remove_file(&data_path)
+                .with_context(|| format!("failed to replace {}", data_path.display()))?;
+        }
+        if remove_source_after_copy {
+            match fs::rename(source, &data_path) {
+                Ok(()) => {}
+                Err(_) => {
+                    fs::copy(source, &data_path).with_context(|| {
+                        format!(
+                            "failed to copy shard file {} to {}",
+                            source.display(),
+                            data_path.display()
+                        )
+                    })?;
+                    let _ = fs::remove_file(source);
+                }
+            }
+        } else {
+            fs::copy(source, &data_path).with_context(|| {
+                format!(
+                    "failed to copy shard file {} to {}",
+                    source.display(),
+                    data_path.display()
+                )
+            })?;
+        }
+
+        let record = CachedShardRecord {
+            pinned: self.config.pinned_models.contains(&info.model_id),
+            info,
+            path: data_path,
+            last_access_unix_ms: now_unix_ms(),
+            manifest,
+        };
+        self.write_record(record)
+    }
+
+    fn write_record(&self, record: CachedShardRecord) -> Result<CachedShardRecord> {
         let meta_path = self.meta_path(&record.info);
         let json = serde_json::to_vec_pretty(&record)?;
         fs::write(&meta_path, json)
@@ -311,13 +443,20 @@ impl ShardCache {
         Ok(())
     }
 
-    fn data_path(&self, info: &ModelShardInfo) -> PathBuf {
+    fn data_path(&self, info: &ModelShardInfo, manifest: Option<&SeedShardManifest>) -> PathBuf {
+        let extension =
+            if manifest.is_some_and(|manifest| manifest.payload_kind == PAYLOAD_KIND_GGUF_SHARD) {
+                "gguf"
+            } else {
+                "shard"
+            };
         self.config.root.join("data").join(format!(
-            "{}-{}-{}-{}.shard",
+            "{}-{}-{}-{}.{}",
             sanitize(&info.model_id),
             info.layers.start,
             info.layers.end,
-            &info.checksum[..16.min(info.checksum.len())]
+            &info.checksum[..16.min(info.checksum.len())],
+            extension
         ))
     }
 
@@ -366,6 +505,12 @@ pub fn executable_source_path_for_manifest(
     cached.is_file().then_some(cached)
 }
 
+pub fn is_executable_shard_record(record: &CachedShardRecord) -> bool {
+    record.manifest.as_ref().is_some_and(|manifest| {
+        manifest.payload_kind == PAYLOAD_KIND_GGUF_SHARD && record.path.is_file()
+    })
+}
+
 pub fn sha256_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -411,9 +556,23 @@ pub fn import_seed_model_from_file_with_progress(
         checksum_sha256: source_checksum.clone(),
         file_size_bytes: source_size_bytes,
     };
+    let temp_root = cache
+        .config
+        .root
+        .join("tmp")
+        .join(format!("build-{}", now_unix_ms()));
+    fs::create_dir_all(&temp_root)
+        .with_context(|| format!("failed to create {}", temp_root.display()))?;
     let mut records = Vec::with_capacity(ranges.len());
 
     for layers in ranges {
+        let shard_path = temp_root.join(format!(
+            "{}-{}-{}.gguf",
+            sanitize(&manifest.model_id),
+            layers.start,
+            layers.end
+        ));
+        let shard_summary = write_layer_shard(source, &shard_path, layers, manifest.layer_count)?;
         let shard_manifest = SeedShardManifest {
             model_id: manifest.model_id.clone(),
             display_name: manifest.display_name.clone(),
@@ -435,12 +594,18 @@ pub fn import_seed_model_from_file_with_progress(
             },
             source: source_metadata.clone(),
             shard_hash: seed_shard_hash(&manifest.model_id, layers, &source_checksum),
-            payload_kind: "metadata-only".to_owned(),
+            payload_kind: PAYLOAD_KIND_GGUF_SHARD.to_owned(),
         };
-        let payload = serde_json::to_vec_pretty(&shard_manifest)?;
-        let record = cache.import_payload(payload, manifest.model_id.clone(), layers, &version)?;
+        let record = cache.import_physical_shard_file(
+            &shard_summary.path,
+            manifest.model_id.clone(),
+            layers,
+            version.clone(),
+            shard_manifest,
+        )?;
         records.push(record);
     }
+    let _ = fs::remove_dir_all(&temp_root);
 
     Ok(SeededModelSummary {
         model_id: manifest.model_id.clone(),
@@ -449,7 +614,7 @@ pub fn import_seed_model_from_file_with_progress(
         source_checksum,
         source_size_bytes,
         shard_count: records.len(),
-        metadata_only: true,
+        metadata_only: false,
         records,
     })
 }

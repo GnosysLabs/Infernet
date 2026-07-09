@@ -32,10 +32,10 @@ use libp2p::{
     tcp, yamux,
 };
 pub use model_distribution::{
-    CachedShardRecord, SeededModelSummary, ShardCache, ShardCacheConfig, ShardCacheStats,
-    executable_source_path_for_manifest, import_seed_model_from_file,
-    import_seed_model_from_file_with_progress, sha256_bytes, sha256_file, source_cache_path,
-    source_cache_root,
+    CachedShardRecord, PAYLOAD_KIND_GGUF_SHARD, PAYLOAD_KIND_METADATA_ONLY, SeededModelSummary,
+    ShardCache, ShardCacheConfig, ShardCacheStats, executable_source_path_for_manifest,
+    import_seed_model_from_file, import_seed_model_from_file_with_progress,
+    is_executable_shard_record, sha256_bytes, sha256_file, source_cache_path, source_cache_root,
 };
 use serde::Deserialize;
 use tokio::time::{Instant, interval, sleep};
@@ -159,6 +159,7 @@ struct ModelBlobResponseHeader {
     request_id: uuid::Uuid,
     peer_id: String,
     model_id: String,
+    layers: Option<LayerRange>,
     source_checksum: String,
     offset: u64,
     total_size_bytes: u64,
@@ -215,6 +216,7 @@ impl request_response::Codec for ModelBlobCodec {
             request_id: header.request_id,
             peer_id: header.peer_id,
             model_id: header.model_id,
+            layers: header.layers,
             source_checksum: header.source_checksum,
             offset: header.offset,
             total_size_bytes: header.total_size_bytes,
@@ -261,6 +263,7 @@ impl request_response::Codec for ModelBlobCodec {
             request_id: res.request_id,
             peer_id: res.peer_id,
             model_id: res.model_id,
+            layers: res.layers,
             source_checksum: res.source_checksum,
             offset: res.offset,
             total_size_bytes: res.total_size_bytes,
@@ -330,6 +333,7 @@ enum ActivationNetworkEvent {
     },
 }
 
+#[allow(dead_code)]
 enum ModelNetworkEvent {
     Request {
         request: ModelShardRequest,
@@ -610,27 +614,46 @@ pub async fn fetch_model_shard_over_libp2p(
 
     let deadline = Instant::now() + discovery_timeout;
     let mut publish_interval = interval(config.publish_interval);
-    let mut pending_request: Option<(request_response::OutboundRequestId, ModelShardInfo, String)> =
-        None;
+    let partial_dir = cache.config().root.join("tmp");
+    fs::create_dir_all(&partial_dir)
+        .with_context(|| format!("failed to create {}", partial_dir.display()))?;
+    let partial_path = partial_dir.join(format!(
+        "{}-{}-{}-{}.gguf.partial",
+        sanitize_path_segment(&model_id),
+        layers.start,
+        layers.end,
+        uuid::Uuid::new_v4()
+    ));
+    let _ = fs::remove_file(&partial_path);
+    let mut downloaded_bytes = 0_u64;
+    let mut pending_request: Option<(
+        request_response::OutboundRequestId,
+        ModelShardCandidate,
+        u64,
+    )> = None;
+    let mut failed_peers = Vec::<String>::new();
 
     loop {
         if pending_request.is_none() {
-            if let Some((advertisement, shard)) = select_model_shard_candidate(
+            if let Some(candidate) = select_model_shard_candidate(
                 &registry,
                 &local_peer_id,
                 &model_id,
                 layers,
                 checksum.as_deref(),
                 version.as_deref(),
+                &failed_peers,
             ) {
-                let request = ModelShardRequest::new(
+                let request = ModelBlobRequest::new_shard(
                     model_id.clone(),
                     layers,
-                    Some(shard.checksum.clone()),
-                    Some(shard.version.clone()),
+                    candidate.shard.checksum.clone(),
+                    downloaded_bytes,
+                    MODEL_BLOB_CHUNK_BYTES,
                 );
-                let request_id = send_model_shard_request(&mut swarm, &advertisement, request)?;
-                pending_request = Some((request_id, shard, advertisement.peer_id));
+                let request_id =
+                    send_model_blob_request(&mut swarm, &candidate.advertisement, request)?;
+                pending_request = Some((request_id, candidate, downloaded_bytes));
             }
         }
 
@@ -652,47 +675,75 @@ pub async fn fetch_model_shard_over_libp2p(
                     config.dial_discovered_peers,
                 )? {
                     match network_event {
-                        GridNetworkEvent::Model(ModelNetworkEvent::Response { request_id, response }) => {
-                            if let Some((pending_id, expected, peer_id)) = pending_request.take() {
+                        GridNetworkEvent::ModelBlob(ModelBlobNetworkEvent::Response { request_id, response }) => {
+                            if let Some((pending_id, candidate, expected_offset)) = pending_request.take() {
                                 if request_id != pending_id {
-                                    pending_request = Some((pending_id, expected, peer_id));
+                                    pending_request = Some((pending_id, candidate, expected_offset));
                                     continue;
                                 }
 
                                 if let Some(error) = response.error {
-                                    bail!("model shard request to {peer_id} failed: {error}");
+                                    failed_peers.push(candidate.advertisement.peer_id);
+                                    eprintln!("model shard chunk request failed: {error}");
+                                    continue;
                                 }
-
-                                let response_shard = response
-                                    .shard
-                                    .ok_or_else(|| anyhow!("model shard response from {peer_id} omitted shard metadata"))?;
-                                if response_shard != expected {
-                                    bail!(
-                                        "model shard metadata mismatch from {peer_id}; expected {:?}, got {:?}",
-                                        expected,
-                                        response_shard
+                                if response.model_id != model_id
+                                    || response.source_checksum != candidate.shard.checksum
+                                    || response.layers != Some(layers)
+                                {
+                                    failed_peers.push(candidate.advertisement.peer_id);
+                                    eprintln!("model shard chunk response identity mismatch");
+                                    continue;
+                                }
+                                if response.offset != expected_offset || response.offset != downloaded_bytes {
+                                    failed_peers.push(candidate.advertisement.peer_id);
+                                    eprintln!("model shard chunk response offset mismatch: got {}, expected {}", response.offset, downloaded_bytes);
+                                    continue;
+                                }
+                                if response.total_size_bytes != candidate.shard.size_bytes {
+                                    failed_peers.push(candidate.advertisement.peer_id);
+                                    eprintln!(
+                                        "model shard chunk size mismatch: got {}, expected {}",
+                                        response.total_size_bytes, candidate.shard.size_bytes
                                     );
+                                    continue;
+                                }
+                                if response.payload.is_empty() && downloaded_bytes < candidate.shard.size_bytes {
+                                    failed_peers.push(candidate.advertisement.peer_id);
+                                    eprintln!("model shard chunk response returned empty payload before EOF");
+                                    continue;
                                 }
 
-                                let cache_record = cache.store_downloaded(&expected, response.payload)?;
-                                refresh_advertisement_model_shards(&mut config.advertisement, Some(&cache))?;
-                                if let Some(advertisement) = &config.advertisement {
-                                    publish_advertisement(&mut swarm, &topic, advertisement)?;
-                                }
+                                append_source_chunk(&partial_path, &response.payload)?;
+                                downloaded_bytes = downloaded_bytes.saturating_add(response.payload.len() as u64);
 
-                                return Ok(ModelFetchResult {
-                                    shard: expected,
-                                    source_peer_id: peer_id,
-                                    cache_record,
-                                });
+                                if downloaded_bytes >= candidate.shard.size_bytes {
+                                    let cache_record = cache.store_downloaded_file(
+                                        &candidate.shard,
+                                        &partial_path,
+                                        candidate.seed_manifest.clone(),
+                                    )?;
+                                    refresh_advertisement_model_shards(&mut config.advertisement, Some(&cache))?;
+                                    if let Some(advertisement) = &config.advertisement {
+                                        publish_advertisement(&mut swarm, &topic, advertisement)?;
+                                    }
+
+                                    return Ok(ModelFetchResult {
+                                        shard: candidate.shard,
+                                        source_peer_id: candidate.advertisement.peer_id,
+                                        cache_record,
+                                    });
+                                }
                             }
                         }
-                        GridNetworkEvent::Model(ModelNetworkEvent::OutboundFailure { peer, request_id, error }) => {
-                            if let Some((pending_id, expected, peer_id)) = pending_request.take() {
+                        GridNetworkEvent::ModelBlob(ModelBlobNetworkEvent::OutboundFailure { peer, request_id, error }) => {
+                            if let Some((pending_id, candidate, expected_offset)) = pending_request.take() {
                                 if request_id == pending_id {
-                                    bail!("model shard request to {peer} failed: {error}");
+                                    failed_peers.push(peer.to_string());
+                                    eprintln!("model shard chunk request to {peer} failed: {error}");
+                                    continue;
                                 }
-                                pending_request = Some((pending_id, expected, peer_id));
+                                pending_request = Some((pending_id, candidate, expected_offset));
                             }
                         }
                         GridNetworkEvent::Model(event) => {
@@ -707,11 +758,12 @@ pub async fn fetch_model_shard_over_libp2p(
             }
             _ = sleep_until(deadline) => {
                 bail!(
-                    "timed out discovering model shard {} {}:{} checksum {}",
+                    "timed out downloading executable model shard {} {}:{} checksum {}; downloaded {} bytes",
                     model_id,
                     layers.start,
                     layers.end,
-                    checksum.as_deref().unwrap_or("<any>")
+                    checksum.as_deref().unwrap_or("<any>"),
+                    downloaded_bytes
                 );
             }
         }
@@ -1114,12 +1166,18 @@ fn refresh_advertisement_model_shards(
     match cache {
         Some(cache) => {
             let records = cache.list()?;
-            advertisement.model_shards = records.iter().map(|record| record.info.clone()).collect();
+            advertisement.model_shards = records
+                .iter()
+                .filter(|record| is_executable_shard_record(record))
+                .map(|record| record.info.clone())
+                .collect();
             advertisement.hosted_shards = records
                 .iter()
                 .filter_map(|record| {
-                    let payload = cache.read_payload(&record.info).ok()?;
-                    let manifest = serde_json::from_slice::<SeedShardManifest>(&payload).ok()?;
+                    if !is_executable_shard_record(record) {
+                        return None;
+                    }
+                    let manifest = record.manifest.clone()?;
                     if !seed_record_is_executable(cache.config(), &manifest) {
                         return None;
                     }
@@ -1146,9 +1204,9 @@ fn refresh_advertisement_model_shards(
 }
 
 fn seed_record_is_executable(config: &ShardCacheConfig, manifest: &SeedShardManifest) -> bool {
+    let _ = config;
     manifest.runtime_kind == RuntimeKind::Demo
-        || manifest.payload_kind != "metadata-only"
-        || executable_source_path_for_manifest(config, manifest).is_some()
+        || manifest.payload_kind == model_distribution::PAYLOAD_KIND_GGUF_SHARD
 }
 
 pub fn process_activation_step(
@@ -2097,6 +2155,14 @@ fn model_shard_response_from_cache(
         }
     };
 
+    if is_executable_shard_record(&record) {
+        return ModelShardResponse::failure(
+            request,
+            peer_id.to_owned(),
+            "physical GGUF shards must be fetched with the chunked model blob protocol",
+        );
+    }
+
     match cache.read_payload(&record.info) {
         Ok(payload) => {
             ModelShardResponse::success(request, peer_id.to_owned(), record.info, payload)
@@ -2127,6 +2193,64 @@ fn model_blob_response_from_cache(
             peer_id.to_owned(),
             "model blob request max_bytes must be greater than zero",
         );
+    }
+
+    if let Some(layers) = request.layers {
+        let record = match cache.find(
+            &request.model_id,
+            layers,
+            Some(&request.source_checksum),
+            None,
+        ) {
+            Ok(Some(record)) if is_executable_shard_record(&record) => record,
+            Ok(Some(_)) => {
+                return ModelBlobResponse::failure(
+                    request,
+                    peer_id.to_owned(),
+                    format!(
+                        "cached shard {} {}:{} is not executable",
+                        request.model_id, layers.start, layers.end
+                    ),
+                );
+            }
+            Ok(None) => {
+                return ModelBlobResponse::failure(
+                    request,
+                    peer_id.to_owned(),
+                    format!(
+                        "executable shard not found: {} {}:{} checksum {}",
+                        request.model_id, layers.start, layers.end, request.source_checksum
+                    ),
+                );
+            }
+            Err(error) => {
+                return ModelBlobResponse::failure(request, peer_id.to_owned(), error.to_string());
+            }
+        };
+
+        if request.offset >= record.info.size_bytes {
+            return ModelBlobResponse::success(
+                request,
+                peer_id.to_owned(),
+                record.info.size_bytes,
+                Vec::new(),
+            );
+        }
+        let bytes_to_read = request
+            .max_bytes
+            .min(MODEL_BLOB_CHUNK_BYTES)
+            .min((record.info.size_bytes - request.offset).min(u64::from(u32::MAX)) as u32);
+        return match read_source_chunk(&record.path, request.offset, bytes_to_read as usize) {
+            Ok(payload) => ModelBlobResponse::success(
+                request,
+                peer_id.to_owned(),
+                record.info.size_bytes,
+                payload,
+            ),
+            Err(error) => {
+                ModelBlobResponse::failure(request, peer_id.to_owned(), error.to_string())
+            }
+        };
     }
 
     let (manifest, source_path) = match executable_seed_manifest_for_source(
@@ -2179,16 +2303,14 @@ fn executable_seed_manifest_for_source(
     source_checksum: &str,
 ) -> Result<Option<(SeedShardManifest, PathBuf)>> {
     for record in cache.list()? {
-        let payload = cache.read_payload(&record.info)?;
-        let manifest = match serde_json::from_slice::<SeedShardManifest>(&payload) {
-            Ok(manifest) => manifest,
-            Err(_) => continue,
+        let Some(manifest) = record.manifest.clone() else {
+            continue;
         };
         if manifest.model_id != model_id || manifest.source.checksum_sha256 != source_checksum {
             continue;
         }
-        if let Some(source_path) = executable_source_path_for_manifest(cache.config(), &manifest) {
-            return Ok(Some((manifest, source_path)));
+        if is_executable_shard_record(&record) {
+            return Ok(Some((manifest, record.path)));
         }
     }
 
@@ -2204,10 +2326,8 @@ fn executable_seed_manifest_for_layers(
         if record.info.model_id != model_id || record.info.layers != layers {
             continue;
         }
-        let payload = cache.read_payload(&record.info)?;
-        let manifest = match serde_json::from_slice::<SeedShardManifest>(&payload) {
-            Ok(manifest) => manifest,
-            Err(_) => continue,
+        let Some(manifest) = record.manifest.clone() else {
+            continue;
         };
         if manifest.model_id != model_id || manifest.layers != layers {
             continue;
@@ -2215,8 +2335,8 @@ fn executable_seed_manifest_for_layers(
         if manifest.runtime_kind == RuntimeKind::Demo {
             return Ok(Some((manifest, PathBuf::new())));
         }
-        if let Some(source_path) = executable_source_path_for_manifest(cache.config(), &manifest) {
-            return Ok(Some((manifest, source_path)));
+        if is_executable_shard_record(&record) {
+            return Ok(Some((manifest, record.path)));
         }
     }
 
@@ -2304,32 +2424,6 @@ fn route_hop_is_loopback(hop: &RouteHop) -> bool {
     hop.address.contains("/ip4/127.")
         || hop.address.contains("/ip6/::1")
         || hop.address.contains("/ip6/0:0:0:0:0:0:0:1")
-}
-
-fn send_model_shard_request(
-    swarm: &mut Swarm<GridBehaviour>,
-    advertisement: &NodeAdvertisement,
-    request: ModelShardRequest,
-) -> Result<request_response::OutboundRequestId> {
-    let peer_id = advertisement
-        .peer_id
-        .parse::<PeerId>()
-        .with_context(|| format!("invalid libp2p peer id {}", advertisement.peer_id))?;
-    let addresses = advertisement
-        .addresses
-        .iter()
-        .filter_map(|address| address.parse::<Multiaddr>().ok())
-        .collect::<Vec<_>>();
-    let request_id = if addresses.is_empty() {
-        swarm.behaviour_mut().model.send_request(&peer_id, request)
-    } else {
-        swarm
-            .behaviour_mut()
-            .model
-            .send_request_with_addresses(&peer_id, request, addresses)
-    };
-
-    Ok(request_id)
 }
 
 fn send_model_blob_request(
@@ -2744,6 +2838,13 @@ fn add_advertisement_addresses(
     }
 }
 
+#[derive(Debug, Clone)]
+struct ModelShardCandidate {
+    advertisement: NodeAdvertisement,
+    shard: ModelShardInfo,
+    seed_manifest: Option<SeedShardManifest>,
+}
+
 fn select_model_shard_candidate(
     registry: &ShardRegistry,
     local_peer_id: &str,
@@ -2751,29 +2852,50 @@ fn select_model_shard_candidate(
     layers: LayerRange,
     checksum: Option<&str>,
     version: Option<&str>,
-) -> Option<(NodeAdvertisement, ModelShardInfo)> {
+    failed_peers: &[String],
+) -> Option<ModelShardCandidate> {
     registry
         .advertisements()
         .into_iter()
         .filter(|advertisement| advertisement.peer_id != local_peer_id)
+        .filter(|advertisement| !failed_peers.contains(&advertisement.peer_id))
         .flat_map(|advertisement| {
+            let hosted_shards = advertisement.hosted_shards.clone();
             advertisement
                 .model_shards
                 .clone()
                 .into_iter()
-                .map(move |shard| (advertisement.clone(), shard))
+                .filter_map(move |shard| {
+                    let seed_manifest = hosted_shards
+                        .iter()
+                        .find(|descriptor| {
+                            descriptor.model_id == shard.model_id
+                                && descriptor.layers == shard.layers
+                        })
+                        .and_then(|descriptor| descriptor.seed_manifest.as_deref())
+                        .filter(|manifest| {
+                            manifest.payload_kind == model_distribution::PAYLOAD_KIND_GGUF_SHARD
+                        })
+                        .cloned();
+
+                    seed_manifest.map(|seed_manifest| ModelShardCandidate {
+                        advertisement: advertisement.clone(),
+                        shard,
+                        seed_manifest: Some(seed_manifest),
+                    })
+                })
         })
-        .filter(|(_, shard)| {
-            shard.model_id == model_id
-                && shard.layers == layers
-                && checksum.is_none_or(|checksum| shard.checksum == checksum)
-                && version.is_none_or(|version| shard.version == version)
+        .filter(|candidate| {
+            candidate.shard.model_id == model_id
+                && candidate.shard.layers == layers
+                && checksum.is_none_or(|checksum| candidate.shard.checksum == checksum)
+                && version.is_none_or(|version| candidate.shard.version == version)
         })
-        .min_by_key(|(advertisement, shard)| {
+        .min_by_key(|candidate| {
             (
-                advertisement.latency_hint_ms.unwrap_or(u32::MAX),
-                shard.size_bytes,
-                advertisement.peer_id.clone(),
+                candidate.advertisement.latency_hint_ms.unwrap_or(u32::MAX),
+                candidate.shard.size_bytes,
+                candidate.advertisement.peer_id.clone(),
             )
         })
 }
@@ -2819,6 +2941,19 @@ fn hop_addresses(hop: &RouteHop) -> Result<Vec<Multiaddr>> {
 
 fn sleep_until(deadline: Instant) -> tokio::time::Sleep {
     sleep(deadline.saturating_duration_since(Instant::now()))
+}
+
+fn sanitize_path_segment(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn elapsed_ms(started: Instant) -> u64 {
@@ -2969,14 +3104,14 @@ mod tests {
     }
 
     #[test]
-    fn model_blob_response_serves_chunk_from_seed_source() {
+    fn model_blob_response_serves_chunk_from_physical_shard() {
         let root = std::env::temp_dir().join(format!("infernet-blob-{}", uuid::Uuid::new_v4()));
         let cache_config = ShardCacheConfig::new(root.join("shards"));
         let cache = ShardCache::new(cache_config).unwrap();
         fs::create_dir_all(&root).unwrap();
-        let source = root.join("gemma.gguf");
-        fs::write(&source, b"0123456789abcdef").unwrap();
-        let checksum = sha256_file(&source).unwrap();
+        let shard_file = root.join("gemma-0-8.gguf");
+        fs::write(&shard_file, b"0123456789abcdef").unwrap();
+        let checksum = sha256_file(&shard_file).unwrap();
         let layers = LayerRange::new(0, 8).unwrap();
         let manifest = SeedShardManifest {
             model_id: "gemma".to_owned(),
@@ -2998,26 +3133,22 @@ mod tests {
                 protocol_version: PROTOCOL_VERSION,
             },
             source: infernet_model::SeedSourceMetadata {
-                path: source.display().to_string(),
-                checksum_sha256: checksum.clone(),
+                path: "/seed/gemma.gguf".to_owned(),
+                checksum_sha256: "source-checksum".to_owned(),
                 file_size_bytes: 16,
             },
             shard_hash: "seed-hash".to_owned(),
-            payload_kind: "metadata-only".to_owned(),
+            payload_kind: model_distribution::PAYLOAD_KIND_GGUF_SHARD.to_owned(),
         };
         cache
-            .import_payload(
-                serde_json::to_vec_pretty(&manifest).unwrap(),
-                "gemma",
-                layers,
-                "v1",
-            )
+            .import_physical_shard_file(&shard_file, "gemma", layers, "v1", manifest)
             .unwrap();
 
-        let request = ModelBlobRequest::new("gemma", checksum, 4, 6);
+        let request = ModelBlobRequest::new_shard("gemma", layers, checksum, 4, 6);
         let response = model_blob_response_from_cache(&cache, "peer-a", &request);
 
         assert!(response.error.is_none(), "{:?}", response.error);
+        assert_eq!(response.layers, Some(layers));
         assert_eq!(response.offset, 4);
         assert_eq!(response.total_size_bytes, 16);
         assert_eq!(response.payload, b"456789");
