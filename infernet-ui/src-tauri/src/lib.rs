@@ -15,9 +15,9 @@ use infernet_model::{
     gguf::parse_gguf_info,
 };
 use infernet_node::{
-    DiscoveryConfig, PAYLOAD_KIND_GGUF_SHARD, SeededModelSummary, ShardCache, ShardCacheConfig,
-    discover_for, empty_advertisement, fetch_model_shard_over_libp2p,
-    import_seed_model_from_file_with_progress, infer_over_libp2p, is_executable_shard_record,
+    DiscoveryConfig, PAYLOAD_KIND_GGUF_SHARD, SeedShardBuildProgress, SeededModelSummary,
+    ShardCache, ShardCacheConfig, discover_for, empty_advertisement, fetch_model_shard_over_libp2p,
+    import_seed_model_from_file_with_build_progress, infer_over_libp2p, is_executable_shard_record,
     run_model_distribution_node,
 };
 use infernet_protocol::{
@@ -447,7 +447,11 @@ async fn add_local_gguf_model(
         None,
     );
     let manifest = manifest_from_gguf_source(&source).map_err(|error| error.to_string())?;
-    let summary = import_seed_model_from_file_with_progress(
+    let source_size_bytes = std::fs::metadata(&source)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let mut last_shard_progress_emit = 0_u64;
+    let summary = import_seed_model_from_file_with_build_progress(
         &cache,
         &source,
         &manifest,
@@ -460,6 +464,30 @@ async fn add_local_gguf_model(
                 "Reading and verifying the selected file",
                 downloaded_bytes,
                 Some(total_bytes),
+            );
+        },
+        |progress| {
+            let estimated_bytes = estimated_shard_build_progress_bytes(progress, source_size_bytes);
+            if !should_emit_shard_build_progress(
+                progress,
+                estimated_bytes,
+                &mut last_shard_progress_emit,
+            ) {
+                return;
+            }
+            emit_model_import_progress(
+                &app,
+                &manifest.model_id,
+                "Building shards",
+                format!(
+                    "Writing shard {} of {} for layers {}:{}",
+                    progress.shard_index,
+                    progress.shard_count,
+                    progress.layers.start,
+                    progress.layers.end
+                ),
+                estimated_bytes,
+                (source_size_bytes > 0).then_some(source_size_bytes),
             );
         },
     )
@@ -633,7 +661,11 @@ async fn add_huggingface_model(
     let manifest = manifest_from_gguf_source(&target).map_err(|error| error.to_string())?;
     let cache_config = cache_config_for_app(&app);
     let cache = ShardCache::new(cache_config.clone()).map_err(|error| error.to_string())?;
-    let summary = import_seed_model_from_file_with_progress(
+    let source_size_bytes = std::fs::metadata(&target)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let mut last_shard_progress_emit = 0_u64;
+    let summary = import_seed_model_from_file_with_build_progress(
         &cache,
         &target,
         &manifest,
@@ -646,6 +678,30 @@ async fn add_huggingface_model(
                 "Reading and verifying the downloaded file",
                 verified_bytes,
                 Some(total_bytes),
+            );
+        },
+        |progress| {
+            let estimated_bytes = estimated_shard_build_progress_bytes(progress, source_size_bytes);
+            if !should_emit_shard_build_progress(
+                progress,
+                estimated_bytes,
+                &mut last_shard_progress_emit,
+            ) {
+                return;
+            }
+            emit_model_import_progress(
+                &app,
+                &manifest.model_id,
+                "Building shards",
+                format!(
+                    "Writing shard {} of {} for layers {}:{}",
+                    progress.shard_index,
+                    progress.shard_count,
+                    progress.layers.start,
+                    progress.layers.end
+                ),
+                estimated_bytes,
+                (source_size_bytes > 0).then_some(source_size_bytes),
             );
         },
     )
@@ -890,6 +946,52 @@ fn model_shard_fetch_timeout_ms(size_bytes: u64) -> u64 {
         .saturating_mul(1_000)
         .saturating_mul(2);
     DEFAULT_MODEL_FETCH_TIMEOUT_MS.max(one_megabyte_per_second)
+}
+
+fn estimated_shard_build_progress_bytes(
+    progress: SeedShardBuildProgress,
+    source_size_bytes: u64,
+) -> u64 {
+    if source_size_bytes == 0 || progress.shard_count == 0 {
+        return progress.written_bytes;
+    }
+    if progress.shard_index >= progress.shard_count
+        && progress.written_bytes >= progress.total_bytes
+    {
+        return source_size_bytes;
+    }
+
+    let shard_count = progress.shard_count as u64;
+    let completed_shards = progress.shard_index.saturating_sub(1) as u64;
+    let shard_span = source_size_bytes / shard_count;
+    let in_shard = if progress.total_bytes > 0 {
+        shard_span
+            .saturating_mul(progress.written_bytes.min(progress.total_bytes))
+            .saturating_div(progress.total_bytes)
+    } else {
+        0
+    };
+
+    source_size_bytes.min(
+        shard_span
+            .saturating_mul(completed_shards)
+            .saturating_add(in_shard),
+    )
+}
+
+fn should_emit_shard_build_progress(
+    progress: SeedShardBuildProgress,
+    estimated_bytes: u64,
+    last_emit: &mut u64,
+) -> bool {
+    const MIN_PROGRESS_DELTA_BYTES: u64 = 32 * 1024 * 1024;
+    let should_emit = progress.written_bytes == 0
+        || progress.written_bytes >= progress.total_bytes
+        || estimated_bytes.saturating_sub(*last_emit) >= MIN_PROGRESS_DELTA_BYTES;
+    if should_emit {
+        *last_emit = estimated_bytes;
+    }
+    should_emit
 }
 
 fn snapshot_from_registry(

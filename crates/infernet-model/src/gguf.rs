@@ -159,6 +159,16 @@ pub fn write_layer_shard(
     layers: crate::LayerRange,
     layer_count: u32,
 ) -> Result<GgufLayerShardSummary> {
+    write_layer_shard_with_progress(source, destination, layers, layer_count, |_, _| {})
+}
+
+pub fn write_layer_shard_with_progress(
+    source: &Path,
+    destination: &Path,
+    layers: crate::LayerRange,
+    layer_count: u32,
+    mut on_progress: impl FnMut(u64, u64),
+) -> Result<GgufLayerShardSummary> {
     layers.validate_for_model(layer_count)?;
 
     let parsed = parse_gguf_layout(source)?;
@@ -219,6 +229,9 @@ pub fn write_layer_shard(
             .checked_add(span)
             .ok_or_else(|| anyhow!("GGUF shard data offset overflow"))?;
     }
+    let total_copy_bytes = next_data_offset;
+    let mut copied_bytes = 0_u64;
+    on_progress(copied_bytes, total_copy_bytes);
 
     output.write_all(b"GGUF")?;
     write_u32(&mut output, parsed.version)?;
@@ -270,8 +283,11 @@ pub fn write_layer_shard(
             .get(&tensor.offset)
             .copied()
             .ok_or_else(|| anyhow!("missing span for tensor {}", tensor.name))?;
-        copy_range(&mut source_file, &mut output, old_position, span)
-            .with_context(|| format!("failed to copy tensor {}", tensor.name))?;
+        copy_range_with_progress(&mut source_file, &mut output, old_position, span, |bytes| {
+            copied_bytes = copied_bytes.saturating_add(bytes);
+            on_progress(copied_bytes.min(total_copy_bytes), total_copy_bytes);
+        })
+        .with_context(|| format!("failed to copy tensor {}", tensor.name))?;
     }
 
     output.flush()?;
@@ -394,7 +410,13 @@ fn align_up(value: u64, alignment: u64) -> Result<u64> {
     }
 }
 
-fn copy_range(input: &mut File, output: &mut File, offset: u64, len: u64) -> Result<()> {
+fn copy_range_with_progress(
+    input: &mut File,
+    output: &mut File,
+    offset: u64,
+    len: u64,
+    mut on_progress: impl FnMut(u64),
+) -> Result<()> {
     input.seek(SeekFrom::Start(offset))?;
     let mut remaining = len;
     let mut buffer = [0; 1024 * 1024];
@@ -406,6 +428,7 @@ fn copy_range(input: &mut File, output: &mut File, offset: u64, len: u64) -> Res
         }
         output.write_all(&buffer[..read])?;
         remaining -= read as u64;
+        on_progress(read as u64);
     }
     Ok(())
 }

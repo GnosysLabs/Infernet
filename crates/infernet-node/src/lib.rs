@@ -32,9 +32,10 @@ use libp2p::{
     tcp, yamux,
 };
 pub use model_distribution::{
-    CachedShardRecord, PAYLOAD_KIND_GGUF_SHARD, PAYLOAD_KIND_METADATA_ONLY, SeededModelSummary,
-    ShardCache, ShardCacheConfig, ShardCacheStats, executable_source_path_for_manifest,
-    import_seed_model_from_file, import_seed_model_from_file_with_progress,
+    CachedShardRecord, PAYLOAD_KIND_GGUF_SHARD, PAYLOAD_KIND_METADATA_ONLY, SeedShardBuildProgress,
+    SeededModelSummary, ShardCache, ShardCacheConfig, ShardCacheStats,
+    executable_source_path_for_manifest, import_seed_model_from_file,
+    import_seed_model_from_file_with_build_progress, import_seed_model_from_file_with_progress,
     is_executable_shard_record, sha256_bytes, sha256_file, source_cache_path, source_cache_root,
 };
 use serde::Deserialize;

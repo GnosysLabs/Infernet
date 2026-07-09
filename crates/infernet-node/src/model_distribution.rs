@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use infernet_model::{
     LayerRange, ModelManifest, SeedShardManifest, SeedSourceMetadata, ShardMetadata,
-    TokenizerCompatibility, gguf::write_layer_shard,
+    TokenizerCompatibility, gguf::write_layer_shard_with_progress,
 };
 use infernet_protocol::{ModelShardInfo, PROTOCOL_VERSION};
 use serde::{Deserialize, Serialize};
@@ -62,6 +62,15 @@ pub struct SeededModelSummary {
     pub shard_count: usize,
     pub metadata_only: bool,
     pub records: Vec<CachedShardRecord>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SeedShardBuildProgress {
+    pub shard_index: usize,
+    pub shard_count: usize,
+    pub layers: LayerRange,
+    pub written_bytes: u64,
+    pub total_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -523,7 +532,14 @@ pub fn import_seed_model_from_file(
     manifest: &ModelManifest,
     version: impl Into<String>,
 ) -> Result<SeededModelSummary> {
-    import_seed_model_from_file_with_progress(cache, source, manifest, version, |_, _| {})
+    import_seed_model_from_file_with_build_progress(
+        cache,
+        source,
+        manifest,
+        version,
+        |_, _| {},
+        |_| {},
+    )
 }
 
 pub fn import_seed_model_from_file_with_progress(
@@ -532,6 +548,24 @@ pub fn import_seed_model_from_file_with_progress(
     manifest: &ModelManifest,
     version: impl Into<String>,
     mut on_hash_progress: impl FnMut(u64, u64),
+) -> Result<SeededModelSummary> {
+    import_seed_model_from_file_with_build_progress(
+        cache,
+        source,
+        manifest,
+        version,
+        &mut on_hash_progress,
+        |_| {},
+    )
+}
+
+pub fn import_seed_model_from_file_with_build_progress(
+    cache: &ShardCache,
+    source: &Path,
+    manifest: &ModelManifest,
+    version: impl Into<String>,
+    mut on_hash_progress: impl FnMut(u64, u64),
+    mut on_shard_progress: impl FnMut(SeedShardBuildProgress),
 ) -> Result<SeededModelSummary> {
     if source.extension().and_then(|value| value.to_str()) != Some("gguf") {
         bail!(
@@ -564,15 +598,31 @@ pub fn import_seed_model_from_file_with_progress(
     fs::create_dir_all(&temp_root)
         .with_context(|| format!("failed to create {}", temp_root.display()))?;
     let mut records = Vec::with_capacity(ranges.len());
+    let shard_count = ranges.len();
 
-    for layers in ranges {
+    for (index, layers) in ranges.into_iter().enumerate() {
+        let shard_index = index + 1;
         let shard_path = temp_root.join(format!(
             "{}-{}-{}.gguf",
             sanitize(&manifest.model_id),
             layers.start,
             layers.end
         ));
-        let shard_summary = write_layer_shard(source, &shard_path, layers, manifest.layer_count)?;
+        let shard_summary = write_layer_shard_with_progress(
+            source,
+            &shard_path,
+            layers,
+            manifest.layer_count,
+            |written_bytes, total_bytes| {
+                on_shard_progress(SeedShardBuildProgress {
+                    shard_index,
+                    shard_count,
+                    layers,
+                    written_bytes,
+                    total_bytes,
+                });
+            },
+        )?;
         let shard_manifest = SeedShardManifest {
             model_id: manifest.model_id.clone(),
             display_name: manifest.display_name.clone(),
