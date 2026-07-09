@@ -1,12 +1,12 @@
 use std::time::Duration;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env,
     fs::File,
     io::Write,
     net::{IpAddr, UdpSocket},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
 use futures::StreamExt;
@@ -43,6 +43,7 @@ struct UiState {
     topic: String,
     huggingface_token: Mutex<Option<String>>,
     model_distribution_started: Mutex<bool>,
+    active_model_acquisitions: Arc<Mutex<BTreeSet<String>>>,
     manual_peers: Mutex<Vec<NodeAdvertisement>>,
     last_registry: Mutex<Option<ShardRegistry>>,
 }
@@ -54,6 +55,7 @@ impl Default for UiState {
             topic: DEFAULT_TOPIC.to_owned(),
             huggingface_token: Mutex::new(None),
             model_distribution_started: Mutex::new(false),
+            active_model_acquisitions: Arc::new(Mutex::new(BTreeSet::new())),
             manual_peers: Mutex::new(Vec::new()),
             last_registry: Mutex::new(None),
         }
@@ -750,8 +752,7 @@ async fn collect_snapshot(
             return Err(error.to_string());
         }
     };
-    acquire_advertised_model_records(app, state, &cache_config, &manifest, &registry, false)
-        .await?;
+    spawn_background_model_record_acquisition(app, state, &cache_config, &manifest, &registry)?;
 
     Ok(snapshot_from_registry(
         local_peer_id,
@@ -898,6 +899,149 @@ async fn acquire_advertised_model_records(
     Ok(())
 }
 
+fn spawn_background_model_record_acquisition(
+    app: &AppHandle,
+    state: &State<'_, UiState>,
+    cache_config: &ShardCacheConfig,
+    manifest: &ModelManifest,
+    registry: &ShardRegistry,
+) -> Result<(), String> {
+    if manifest.runtime_kind == RuntimeKind::Demo {
+        return Ok(());
+    }
+
+    let cache = ShardCache::new(cache_config.clone()).map_err(|error| error.to_string())?;
+    let plan = advertised_model_record_plan(registry, &manifest.model_id);
+    if plan.is_empty() {
+        return Ok(());
+    }
+
+    let missing_ranges = missing_ranges_from_layer_ranges(
+        manifest.layer_count,
+        plan.iter().map(|record| record.info.layers),
+    );
+    if !missing_ranges.is_empty() {
+        return Ok(());
+    }
+
+    let local_peer_id = identity_from_state(state)?.0;
+    let plan = model_records_to_download_for_local_contribution(
+        &cache,
+        &manifest.model_id,
+        &local_peer_id,
+        plan,
+    )
+    .map_err(|error| error.to_string())?;
+    if plan.is_empty() {
+        return Ok(());
+    }
+
+    let acquisition_key = model_acquisition_key(&manifest.model_id, &plan);
+    {
+        let mut active = state
+            .active_model_acquisitions
+            .lock()
+            .map_err(|_| "failed to lock model acquisition state".to_owned())?;
+        if !active.insert(acquisition_key.clone()) {
+            return Ok(());
+        }
+    }
+
+    let mut static_peers = configured_static_peers(state)?;
+    merge_static_peer_advertisements(&mut static_peers, registry.advertisements());
+    let (mut config, _) = discovery_config_from_state(state)?;
+    config.static_peers = static_peers;
+
+    let app = app.clone();
+    let cache_config = cache_config.clone();
+    let manifest = manifest.clone();
+    let active_model_acquisitions = Arc::clone(&state.active_model_acquisitions);
+
+    tauri::async_runtime::spawn(async move {
+        let result = async {
+            for record in plan {
+                let cache = ShardCache::new(cache_config.clone())?;
+                if cache
+                    .find(
+                        &record.info.model_id,
+                        record.info.layers,
+                        Some(&record.info.checksum),
+                        Some(&record.info.version),
+                    )?
+                    .is_some()
+                {
+                    continue;
+                }
+
+                emit_model_import_progress(
+                    &app,
+                    &manifest.model_id,
+                    "Downloading shard",
+                    format!(
+                        "layers {}:{}",
+                        record.info.layers.start, record.info.layers.end
+                    ),
+                    0,
+                    Some(record.info.size_bytes),
+                );
+                fetch_model_shard_over_libp2p(
+                    config.clone(),
+                    cache_config.clone(),
+                    manifest.model_id.clone(),
+                    record.info.layers,
+                    Some(record.info.checksum.clone()),
+                    Some(record.info.version.clone()),
+                    Duration::from_millis(model_shard_fetch_timeout_ms(record.info.size_bytes)),
+                )
+                .await?;
+                emit_model_import_progress(
+                    &app,
+                    &manifest.model_id,
+                    "Shard ready",
+                    format!(
+                        "layers {}:{}",
+                        record.info.layers.start, record.info.layers.end
+                    ),
+                    record.info.size_bytes,
+                    Some(record.info.size_bytes),
+                );
+            }
+
+            emit_model_import_progress(
+                &app,
+                &manifest.model_id,
+                "Ready",
+                "Local shards are verified and seeding",
+                1,
+                Some(1),
+            );
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        if let Err(error) = result {
+            eprintln!(
+                "background model shard acquisition for {} failed: {error}",
+                manifest.model_id
+            );
+            emit_model_import_progress(
+                &app,
+                &manifest.model_id,
+                "Download failed",
+                error.to_string(),
+                0,
+                None,
+            );
+        }
+
+        if let Ok(mut active) = active_model_acquisitions.lock() {
+            active.remove(&acquisition_key);
+        }
+    });
+
+    Ok(())
+}
+
 fn model_records_to_download_for_local_contribution(
     cache: &ShardCache,
     model_id: &str,
@@ -909,28 +1053,65 @@ fn model_records_to_download_for_local_contribution(
         .list()?
         .into_iter()
         .filter(|record| record.info.model_id == model_id && is_executable_shard_record(record))
-        .map(|record| record.info.layers)
+        .map(|record| {
+            (
+                record.info.layers,
+                record.info.checksum,
+                record.info.version,
+            )
+        })
         .collect::<Vec<_>>();
-
-    if !local_executable.is_empty() {
-        return Ok(Vec::new());
-    }
+    let missing_records = plan
+        .iter()
+        .filter(|record| {
+            !local_executable.iter().any(|(layers, checksum, version)| {
+                *layers == record.info.layers
+                    && checksum == &record.info.checksum
+                    && version == &record.info.version
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
 
     let parity = stable_peer_parity(local_peer_id);
     let mut selected = plan
         .iter()
         .enumerate()
         .filter(|(index, _)| index % 2 == parity)
+        .filter(|(_, record)| {
+            missing_records.iter().any(|missing| {
+                missing.info.layers == record.info.layers
+                    && missing.info.checksum == record.info.checksum
+                    && missing.info.version == record.info.version
+            })
+        })
         .map(|(_, record)| record.clone())
         .collect::<Vec<_>>();
 
     if selected.is_empty() {
-        if let Some(first) = plan.into_iter().next() {
+        if let Some(first) = missing_records.into_iter().next() {
             selected.push(first);
         }
     }
 
     Ok(selected)
+}
+
+fn model_acquisition_key(model_id: &str, plan: &[AdvertisedModelRecord]) -> String {
+    let mut ranges = plan
+        .iter()
+        .map(|record| {
+            format!(
+                "{}:{}:{}:{}",
+                record.info.layers.start,
+                record.info.layers.end,
+                record.info.checksum,
+                record.info.version
+            )
+        })
+        .collect::<Vec<_>>();
+    ranges.sort();
+    format!("{model_id}:{}", ranges.join(","))
 }
 
 fn stable_peer_parity(peer_id: &str) -> usize {
@@ -2578,6 +2759,79 @@ mod tests {
             .expect("advertised record should be installed");
         assert_eq!(installed.manifest, Some(seed_manifest));
         assert_eq!(cache.read_payload(&installed.info).unwrap(), shard_bytes);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_contribution_planner_downloads_missing_records_after_partial_install() {
+        let root = std::env::temp_dir().join(format!("infernet-ui-partial-{}", unix_ms()));
+        let cache_config = ShardCacheConfig::new(root.join("shards"));
+        let cache = ShardCache::new(cache_config).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let shard_file = root.join("local-shard.gguf");
+        std::fs::write(&shard_file, b"local physical gguf shard placeholder").unwrap();
+        let installed_layers = LayerRange::new(0, 8).unwrap();
+        let missing_layers = LayerRange::new(8, 16).unwrap();
+        let seed_manifest = SeedShardManifest {
+            model_id: "gemma".to_owned(),
+            display_name: "Gemma".to_owned(),
+            architecture: "gemma".to_owned(),
+            layer_count: 16,
+            hidden_size: 1024,
+            activation_dtype: "f16".to_owned(),
+            runtime_kind: RuntimeKind::LlamaCpp,
+            layers: installed_layers,
+            tokenizer: infernet_model::TokenizerCompatibility {
+                family: "gemma".to_owned(),
+                checksum: None,
+            },
+            metadata: infernet_model::ShardMetadata {
+                architecture: "gemma".to_owned(),
+                quantization: Some("IQ4_XS".to_owned()),
+                source_checksum: Some("source".to_owned()),
+                protocol_version: PROTOCOL_VERSION,
+            },
+            source: infernet_model::SeedSourceMetadata {
+                path: "/tmp/gemma.gguf".to_owned(),
+                checksum_sha256: "source".to_owned(),
+                file_size_bytes: 16,
+            },
+            shard_hash: "hash".to_owned(),
+            payload_kind: PAYLOAD_KIND_GGUF_SHARD.to_owned(),
+        };
+        let installed = cache
+            .import_physical_shard_file(
+                &shard_file,
+                "gemma".to_owned(),
+                installed_layers,
+                "v1",
+                seed_manifest,
+            )
+            .unwrap();
+        let missing = ModelShardInfo {
+            model_id: "gemma".to_owned(),
+            layers: missing_layers,
+            checksum: "missing-checksum".to_owned(),
+            size_bytes: 8,
+            version: "v1".to_owned(),
+            protocol_version: PROTOCOL_VERSION,
+        };
+        let selected = model_records_to_download_for_local_contribution(
+            &cache,
+            "gemma",
+            "local-peer",
+            vec![
+                AdvertisedModelRecord {
+                    info: installed.info,
+                },
+                AdvertisedModelRecord { info: missing },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].info.layers, missing_layers);
 
         let _ = std::fs::remove_dir_all(root);
     }
