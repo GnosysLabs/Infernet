@@ -36,7 +36,6 @@ const runtimeLockPath = resolve(sidecarDir, `.infernet-llama-runtime-${targetTri
 const runtimePatchVersion = "infernet-pinned-persistent-server-runtime-v8";
 const buildRoot = resolve(repoRoot, "target", "llama.cpp-runtime");
 const sourceDir = join(buildRoot, "llama.cpp");
-const buildDir = join(buildRoot, `build-${targetTriple}`);
 const downloadDir = join(buildRoot, "downloads");
 const prebuiltDir = join(buildRoot, `prebuilt-${targetTriple}`);
 const llamaRef = process.env.LLAMA_CPP_REF || "049326a00025d00b08cc188ed716b681e984a3f8";
@@ -44,12 +43,17 @@ const rpcServerTarget = "ggml-rpc-server";
 const serverTarget = "llama-server";
 const buildJobs = readBuildJobs();
 const cudaEnabled = shouldEnableCuda();
-const cudaArchitectures = "86;89";
+const cudaArchitectures = process.env.INFERNET_CUDA_ARCHITECTURES?.trim() || "native";
+const windowsCudaGenerator = isWindows && cudaEnabled
+  ? process.env.CMAKE_GENERATOR?.trim() || "Visual Studio 17 2022"
+  : null;
+const cudaToolkitRoot = process.env.CUDA_PATH?.trim() || null;
 const bridgeSourceHash = createHash("sha256")
   .update(readFileSync(resolve(repoRoot, "llama-runtime", "infernet-bridge.cpp")))
   .digest("hex")
   .slice(0, 16);
 const runtimeBackend = cudaEnabled ? `cuda-${cudaArchitectures}` : isMacos ? "metal" : "cpu";
+const buildDir = join(buildRoot, `build-${targetTriple}-${runtimeBackend.replaceAll(";", "-")}`);
 const runtimeStamp = `${runtimePatchVersion}:${llamaRef}:${runtimeBackend}:${bridgeSourceHash}`;
 
 if (process.argv.includes("--dry-run")) {
@@ -259,6 +263,10 @@ function buildFromSource() {
   prepareInfernetBridgeSource();
 
   const cmakeArgs = [
+    ...(windowsCudaGenerator ? ["-G", windowsCudaGenerator] : []),
+    ...(windowsCudaGenerator?.startsWith("Visual Studio ") && cudaToolkitRoot
+      ? ["-T", `cuda=${cudaToolkitRoot}`, `-DCUDAToolkit_ROOT=${cudaToolkitRoot}`]
+      : []),
     "-S", sourceDir,
     "-B", buildDir,
     "-DCMAKE_BUILD_TYPE=Release",
@@ -674,6 +682,10 @@ function cmakeTargets() {
     encoding: "utf8",
   });
   if (result.status !== 0) {
+    if (isWindows) {
+      return findFilesRecursive(buildDir, (path) => path.toLowerCase().endsWith(".vcxproj"))
+        .map((path) => basename(path, ".vcxproj"));
+    }
     return [];
   }
   return result.stdout
@@ -1095,7 +1107,7 @@ function safeUnlink(path) {
 }
 
 function readText(path) {
-  return readFileSync(path, "utf8");
+  return readFileSync(path, "utf8").replace(/\r\n?/g, "\n");
 }
 
 function replaceOnce(text, search, replacement) {
