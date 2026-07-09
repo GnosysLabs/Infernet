@@ -17,8 +17,9 @@ use infernet_model::{
 };
 use infernet_node::{
     DiscoveryConfig, SeededModelSummary, ShardCache, ShardCacheConfig, discover_for,
-    empty_advertisement, fetch_model_shard_over_libp2p, import_seed_model_from_file_with_progress,
-    infer_over_libp2p, run_model_distribution_node, sha256_bytes,
+    empty_advertisement, executable_source_path_for_manifest, fetch_model_shard_over_libp2p,
+    fetch_model_source_over_libp2p, import_seed_model_from_file_with_progress, infer_over_libp2p,
+    run_model_distribution_node, sha256_bytes,
 };
 use infernet_protocol::{
     ModelShardInfo, NodeAdvertisement, PROTOCOL_VERSION, RouteHop, TraceEvent,
@@ -33,6 +34,7 @@ const DEFAULT_TOPIC: &str = "infernet/grid-demo/1";
 const DEFAULT_DISCOVERY_TIMEOUT_MS: u64 = 4_000;
 const DEFAULT_INFERENCE_TIMEOUT_MS: u64 = 6_000;
 const DEFAULT_MODEL_FETCH_TIMEOUT_MS: u64 = 6_000;
+const DEFAULT_MODEL_SOURCE_FETCH_TIMEOUT_MS: u64 = 60 * 60 * 1_000;
 const MIN_LOCAL_GGUF_LIMIT_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 const UI_LISTEN_PORT: u16 = 9777;
 const DEFAULT_BOOTSTRAP_PEERS: &[&str] = &[
@@ -880,7 +882,119 @@ async fn acquire_advertised_model_records(
         );
     }
 
+    if allow_direct_fetch {
+        acquire_advertised_model_source(app, state, cache_config, manifest, registry).await?;
+    }
+
     Ok(())
+}
+
+async fn acquire_advertised_model_source(
+    app: &AppHandle,
+    state: &State<'_, UiState>,
+    cache_config: &ShardCacheConfig,
+    manifest: &ModelManifest,
+    registry: &ShardRegistry,
+) -> Result<(), String> {
+    if local_source_path_for_model(cache_config, &manifest.model_id).is_some() {
+        return Ok(());
+    }
+
+    let seed_manifest = local_seed_manifest_for_model(cache_config, &manifest.model_id)
+        .or_else(|| advertised_seed_manifest_for_model(registry, &manifest.model_id));
+    let Some(seed_manifest) = seed_manifest else {
+        return Err(format!(
+            "{} is visible on the network, but no peer advertised a verifiable GGUF source yet.",
+            manifest.display_name
+        ));
+    };
+
+    let source_checksum = seed_manifest.source.checksum_sha256.clone();
+    let source_size_bytes = seed_manifest.source.file_size_bytes;
+    let mut static_peers = configured_static_peers(state)?;
+    merge_static_peer_advertisements(&mut static_peers, registry.advertisements());
+    let (mut config, _) = discovery_config_from_state(state)?;
+    config.static_peers = static_peers;
+    emit_model_import_progress(
+        app,
+        &manifest.model_id,
+        "Downloading model",
+        format!("Fetching {} from peers", manifest.display_name),
+        0,
+        Some(source_size_bytes),
+    );
+
+    let progress_app = app.clone();
+    let progress_model_id = manifest.model_id.clone();
+    let progress_name = manifest.display_name.clone();
+    fetch_model_source_over_libp2p(
+        config,
+        cache_config.clone(),
+        manifest.model_id.clone(),
+        source_checksum,
+        source_size_bytes,
+        Duration::from_millis(model_source_fetch_timeout_ms(source_size_bytes)),
+        move |downloaded_bytes, total_bytes| {
+            emit_model_import_progress(
+                &progress_app,
+                &progress_model_id,
+                "Downloading model",
+                format!("Fetching {progress_name} from peers"),
+                downloaded_bytes,
+                Some(total_bytes),
+            );
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+
+    emit_model_import_progress(
+        app,
+        &manifest.model_id,
+        "Ready",
+        "Model downloaded, verified, and available for sharing",
+        source_size_bytes,
+        Some(source_size_bytes),
+    );
+
+    Ok(())
+}
+
+fn local_seed_manifest_for_model(
+    cache_config: &ShardCacheConfig,
+    model_id: &str,
+) -> Option<SeedShardManifest> {
+    let cache = ShardCache::new(cache_config.clone()).ok()?;
+    let records = cache.list().ok()?;
+    records.into_iter().find_map(|record| {
+        let payload = cache.read_payload(&record.info).ok()?;
+        let manifest = serde_json::from_slice::<SeedShardManifest>(&payload).ok()?;
+        (manifest.model_id == model_id).then_some(manifest)
+    })
+}
+
+fn advertised_seed_manifest_for_model(
+    registry: &ShardRegistry,
+    model_id: &str,
+) -> Option<SeedShardManifest> {
+    registry
+        .advertisements()
+        .into_iter()
+        .flat_map(|advertisement| advertisement.hosted_shards.into_iter())
+        .find_map(|descriptor| {
+            if descriptor.model_id != model_id {
+                return None;
+            }
+            descriptor.seed_manifest.map(|manifest| *manifest)
+        })
+}
+
+fn model_source_fetch_timeout_ms(size_bytes: u64) -> u64 {
+    let one_megabyte_per_second = size_bytes
+        .saturating_div(1024 * 1024)
+        .saturating_mul(1_000)
+        .saturating_mul(2);
+    DEFAULT_MODEL_SOURCE_FETCH_TIMEOUT_MS.max(one_megabyte_per_second)
 }
 
 fn snapshot_from_registry(
@@ -1184,7 +1298,7 @@ fn model_status(
     }
 
     let Some(source_path) = local_source_path_for_model(cache_config, &manifest.model_id) else {
-        return "Available for sharing. This machine has shard records, but not executable GGUF tensors yet.".to_owned();
+        return "Model records installed. Infernet will download the verified GGUF source from peers before chat.".to_owned();
     };
     if std::fs::metadata(source_path)
         .map(|metadata| metadata.len() > local_gguf_size_limit_bytes())
@@ -1542,7 +1656,7 @@ fn local_cache_advertisement(
     for record in records {
         let payload = cache.read_payload(&record.info).ok()?;
         let manifest = serde_json::from_slice::<SeedShardManifest>(&payload).ok()?;
-        if seed_record_is_executable(&manifest) {
+        if seed_record_is_executable(cache_config, &manifest) {
             let seed_manifest = Box::new(manifest.clone());
             hosted_shards.push(ShardDescriptor {
                 model_id: manifest.model_id.clone(),
@@ -1573,10 +1687,10 @@ fn local_cache_advertisement(
     })
 }
 
-fn seed_record_is_executable(manifest: &SeedShardManifest) -> bool {
+fn seed_record_is_executable(config: &ShardCacheConfig, manifest: &SeedShardManifest) -> bool {
     manifest.runtime_kind == RuntimeKind::Demo
         || manifest.payload_kind != "metadata-only"
-        || Path::new(&manifest.source.path).is_file()
+        || executable_source_path_for_manifest(config, manifest).is_some()
 }
 
 async fn generate_with_llama_cli(
@@ -1587,7 +1701,7 @@ async fn generate_with_llama_cli(
 ) -> Result<String, String> {
     let model_path = local_source_path_for_model(cache_config, &manifest.model_id).ok_or_else(|| {
         format!(
-            "{} is available, but this machine does not have executable GGUF tensors yet. Infernet can share metadata records today; real split-GGUF token execution still needs the tensor shard runtime.",
+            "{} is available, but the verified GGUF source is not in this machine's cache yet. Keep a seeding peer online or add the model locally, then try again.",
             manifest.display_name
         )
     })?;
@@ -1691,8 +1805,7 @@ fn local_source_path_for_model(cache_config: &ShardCacheConfig, model_id: &str) 
         let payload = cache.read_payload(&record.info).ok()?;
         let manifest = serde_json::from_slice::<SeedShardManifest>(&payload).ok()?;
         if manifest.model_id == model_id {
-            let path = PathBuf::from(manifest.source.path);
-            if path.is_file() {
+            if let Some(path) = executable_source_path_for_manifest(cache_config, &manifest) {
                 return Some(path);
             }
         }

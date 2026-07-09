@@ -46,20 +46,27 @@ model layers, but it does not carry activation tensors.
 Advertisements now carry two independent shard lists:
 
 - `hosted_shards` for inference-capable layer execution;
-- `model_shards` for locally cached model files available over
-  `/infernet/model/1`.
+- `model_shards` for locally cached model records available over
+  `/infernet/model/1`; executable GGUF source bytes move over
+  `/infernet/model-blob/1`.
 
 ## Model Distribution
 
-Model shard files are distributed peer-to-peer over:
+Model shard metadata is distributed peer-to-peer over:
 
 ```text
 /infernet/model/1
 ```
 
-This protocol is separate from activation forwarding. A node can seed model
-files without serving inference, and a downloader becomes a seeder as soon as it
-stores and verifies a shard.
+Executable GGUF source files are downloaded in verified chunks over:
+
+```text
+/infernet/model-blob/1
+```
+
+Both protocols are separate from activation forwarding. A node can seed model
+records and GGUF source bytes without serving inference, and a downloader becomes
+a seeder as soon as it stores and verifies the source checksum.
 
 Import an initial shard:
 
@@ -291,12 +298,13 @@ Current limitations:
 
 - WAN discovery uses the public bootstrap node; private NAT-to-NAT activation
   and model transfer still need circuit relay or hole punching.
-- Model distribution uses `/infernet/model/1`, but currently transfers one JSON
-  encoded payload from one source. Binary streaming, resume, and multi-source
-  downloads are future work.
+- Model distribution uses `/infernet/model/1` for metadata records and
+  `/infernet/model-blob/1` for chunked GGUF source transfer. Resume and
+  multi-source downloads are future work.
 - The activation payload is JSON-encoded `f32` demo data, not a real model
   tensor codec.
-- Real GGUF execution is not linked yet; LlamaCpp routes fail explicitly instead
-  of falling back to the toy runtime.
+- GGUF source download and local llama.cpp token execution are wired through the
+  desktop app. True split-GGUF layer execution still needs the llama.cpp
+  layer-range activation bridge.
 - Peers are trusted for this phase; there is no correctness proof or privacy
   protection from the worker executing a layer.

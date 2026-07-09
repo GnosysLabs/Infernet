@@ -352,9 +352,10 @@ The UI should visualize:
 3. Add a shard-builder command that emits sidecar metadata for a GGUF layer
    range.
 4. Update routing to support `RuntimeKind::LlamaCpp`.
-5. Make runtime execution explicitly select demo vs llama.cpp and return a clear
-   "real GGUF runtime not linked yet" error for llama.cpp routes until the bridge
-   lands.
+5. Make runtime execution explicitly select demo vs llama.cpp. Until the
+   layer-range bridge lands, the desktop app may download a complete verified
+   GGUF source over `/infernet/model-blob/1` and run local llama.cpp token
+   generation as a correctness fallback.
 6. Remove UI execution modes and present models as the primary navigation.
 7. Add the llama.cpp bridge behind a feature flag or separate crate.
 8. Add binary activation frames and session/KV metadata.

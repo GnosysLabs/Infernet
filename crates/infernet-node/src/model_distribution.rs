@@ -332,6 +332,40 @@ impl ShardCache {
     }
 }
 
+pub fn source_cache_root(config: &ShardCacheConfig) -> PathBuf {
+    config
+        .root
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| config.root.clone())
+        .join("sources")
+}
+
+pub fn source_cache_path(
+    config: &ShardCacheConfig,
+    model_id: &str,
+    source_checksum: &str,
+) -> PathBuf {
+    source_cache_root(config).join(format!(
+        "{}-{}.gguf",
+        sanitize(model_id),
+        &source_checksum[..16.min(source_checksum.len())]
+    ))
+}
+
+pub fn executable_source_path_for_manifest(
+    config: &ShardCacheConfig,
+    manifest: &SeedShardManifest,
+) -> Option<PathBuf> {
+    let original = PathBuf::from(&manifest.source.path);
+    if original.is_file() {
+        return Some(original);
+    }
+
+    let cached = source_cache_path(config, &manifest.model_id, &manifest.source.checksum_sha256);
+    cached.is_file().then_some(cached)
+}
+
 pub fn sha256_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -551,6 +585,53 @@ mod tests {
             .store_downloaded(&expected, b"test".to_vec())
             .unwrap_err();
         assert!(err.to_string().contains("checksum verification failed"));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn executable_source_path_finds_downloaded_source_cache() {
+        let temp = std::env::temp_dir().join(format!(
+            "infernet-source-cache-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = ShardCacheConfig::new(temp.join("shards"));
+        let source_checksum = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let cached_source = source_cache_path(&config, "gemma", source_checksum);
+        fs::create_dir_all(cached_source.parent().unwrap()).unwrap();
+        fs::write(&cached_source, b"gguf bytes").unwrap();
+        let manifest = SeedShardManifest {
+            model_id: "gemma".to_owned(),
+            display_name: "Gemma".to_owned(),
+            architecture: "gemma".to_owned(),
+            layer_count: 8,
+            hidden_size: 16,
+            activation_dtype: "f16".to_owned(),
+            runtime_kind: infernet_model::RuntimeKind::LlamaCpp,
+            layers: LayerRange::new(0, 8).unwrap(),
+            tokenizer: TokenizerCompatibility {
+                family: "gemma".to_owned(),
+                checksum: None,
+            },
+            metadata: ShardMetadata {
+                architecture: "gemma".to_owned(),
+                quantization: Some("IQ4_XS".to_owned()),
+                source_checksum: Some(source_checksum.to_owned()),
+                protocol_version: PROTOCOL_VERSION,
+            },
+            source: SeedSourceMetadata {
+                path: temp.join("missing-source.gguf").display().to_string(),
+                checksum_sha256: source_checksum.to_owned(),
+                file_size_bytes: 9,
+            },
+            shard_hash: "hash".to_owned(),
+            payload_kind: "metadata-only".to_owned(),
+        };
+
+        assert_eq!(
+            executable_source_path_for_manifest(&config, &manifest),
+            Some(cached_source)
+        );
 
         let _ = fs::remove_dir_all(temp);
     }

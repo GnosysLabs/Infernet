@@ -7,7 +7,8 @@ Date: 2026-07-08
 Infernet now has three separate protocol families:
 
 - Peer discovery: mDNS plus shard advertisements over gossipsub.
-- Model distribution: `/infernet/model/1`.
+- Model distribution metadata: `/infernet/model/1`.
+- Model source transfer: `/infernet/model-blob/1`.
 - Distributed inference: `/infernet/activation/1`.
 
 Model transfer is independent from activation forwarding. Inference must not
@@ -37,10 +38,17 @@ underlying model file, or do both.
 1. A node imports an initial shard into its local cache.
 2. The node runs a distribution seeder and advertises `model_shards`.
 3. A downloader discovers peers that advertise the requested shard.
-4. The downloader sends a `/infernet/model/1` request directly to a source peer.
-5. The source peer reads the shard from its cache and returns metadata plus bytes.
-6. The downloader verifies checksum and size before storing.
-7. Once stored, the downloader advertises and serves the shard too.
+4. The downloader sends `/infernet/model/1` requests directly to source peers for
+   any missing shard metadata records.
+5. If the executable GGUF source is missing, the downloader sends
+   `/infernet/model-blob/1` chunk requests keyed by `model_id`, source checksum,
+   byte offset, and max byte count.
+6. The source peer reads the requested byte range from either its imported GGUF
+   path or its downloaded source cache.
+7. The downloader verifies the complete GGUF SHA-256 and size before storing it
+   under the local source cache.
+8. Once stored, the downloader advertises and serves the shard records and GGUF
+   source bytes too.
 
 The `model mirror` command demonstrates step 7 by downloading once and then
 staying online as a seeder.
@@ -68,6 +76,10 @@ Every received payload is verified before it is accepted:
 - SHA-256 checksum must match advertised metadata.
 - byte size must match advertised metadata.
 - local reads re-check SHA-256 before serving.
+
+For `/infernet/model-blob/1`, each chunk is only a transport fragment. The node
+does not mark the source executable until the full downloaded GGUF file matches
+the advertised source SHA-256.
 
 The current trust root is the advertised checksum. Future model manifests should
 pin expected shard checksums so a malicious first advertiser cannot define a fake

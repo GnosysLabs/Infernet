@@ -221,13 +221,12 @@ export default function App() {
       setStatus("Connected");
     } catch (error) {
       const message = String(error);
-      const runtimePending = isRuntimePendingMessage(message);
       setLastError(message);
       setMessages((current) => [
         ...current,
         { id: `assistant-error-${Date.now()}`, role: "assistant", text: message },
       ]);
-      setStatus(runtimePending ? "Runtime pending" : "Needs attention");
+      setStatus("Needs attention");
     } finally {
       setIsRunning(false);
     }
@@ -516,25 +515,22 @@ function RunStatusCard({
   showNetwork: boolean;
   setShowNetwork: (show: boolean) => void;
 }) {
-  const runtimePending = lastError ? isRuntimePendingMessage(lastError) : false;
   const label = lastError
-    ? runtimePending ? "Runtime pending" : "Needs attention"
+    ? "Needs attention"
     : isRunning
       ? "Thinking..."
       : "Response ready";
-  const detail = runtimePending
-    ? `${totalHops} shard groups ready`
-    : peerCount > 1
+  const detail = peerCount > 1
     ? `Connected to ${peerCount} peers`
     : "Running on Community Compute";
   const phase = lastError
-    ? runtimePending ? "Token generation runtime not connected yet." : lastError
+    ? lastError
     : isRunning
       ? phaseLabel(completedHops, totalHops)
       : "Done";
 
   return (
-    <div className={runtimePending ? "run-card notice" : lastError ? "run-card error" : "run-card"}>
+    <div className={lastError ? "run-card error" : "run-card"}>
       <div className="run-card-main">
         <span className="run-spinner" />
         <div>
@@ -1184,15 +1180,6 @@ function hopKey(peerId: string, layerStart: number, layerEnd: number): string {
 
 function runtimeLabel(runtimeKind: string): string {
   return runtimeKind === "llama_cpp" ? "GGUF" : "Ready";
-}
-
-function isRuntimePendingMessage(message: string): boolean {
-  const lower = message.toLowerCase();
-  return lower.includes("gguf execution runtime is not connected yet")
-    || lower.includes("split-gguf token execution")
-    || lower.includes("does not have executable gguf tensors")
-    || lower.includes("token generation is not connected yet")
-    || lower.includes("bundled llama.cpp runtime is missing");
 }
 
 function friendlyImportError(error: string): string {

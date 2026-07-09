@@ -5,6 +5,7 @@ use uuid::Uuid;
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const ACTIVATION_PROTOCOL: &str = "/infernet/activation/1";
 pub const MODEL_PROTOCOL: &str = "/infernet/model/1";
+pub const MODEL_BLOB_PROTOCOL: &str = "/infernet/model-blob/1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelShardInfo {
@@ -14,6 +15,86 @@ pub struct ModelShardInfo {
     pub size_bytes: u64,
     pub version: String,
     pub protocol_version: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelBlobRequest {
+    pub protocol_version: u32,
+    pub request_id: Uuid,
+    pub model_id: String,
+    pub source_checksum: String,
+    pub offset: u64,
+    pub max_bytes: u32,
+}
+
+impl ModelBlobRequest {
+    pub fn new(
+        model_id: impl Into<String>,
+        source_checksum: impl Into<String>,
+        offset: u64,
+        max_bytes: u32,
+    ) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: Uuid::new_v4(),
+            model_id: model_id.into(),
+            source_checksum: source_checksum.into(),
+            offset,
+            max_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelBlobResponse {
+    pub protocol_version: u32,
+    pub request_id: Uuid,
+    pub peer_id: String,
+    pub model_id: String,
+    pub source_checksum: String,
+    pub offset: u64,
+    pub total_size_bytes: u64,
+    pub payload: Vec<u8>,
+    pub error: Option<String>,
+}
+
+impl ModelBlobResponse {
+    pub fn success(
+        request: &ModelBlobRequest,
+        peer_id: impl Into<String>,
+        total_size_bytes: u64,
+        payload: Vec<u8>,
+    ) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: request.request_id,
+            peer_id: peer_id.into(),
+            model_id: request.model_id.clone(),
+            source_checksum: request.source_checksum.clone(),
+            offset: request.offset,
+            total_size_bytes,
+            payload,
+            error: None,
+        }
+    }
+
+    pub fn failure(
+        request: &ModelBlobRequest,
+        peer_id: impl Into<String>,
+        error: impl Into<String>,
+    ) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: request.request_id,
+            peer_id: peer_id.into(),
+            model_id: request.model_id.clone(),
+            source_checksum: request.source_checksum.clone(),
+            offset: request.offset,
+            total_size_bytes: 0,
+            payload: Vec::new(),
+            error: Some(error.into()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
