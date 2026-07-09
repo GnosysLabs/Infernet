@@ -1,4 +1,9 @@
-use std::{fs, path::PathBuf, time::Duration};
+use std::{
+    env, fs,
+    net::{IpAddr, Ipv4Addr, TcpListener, UdpSocket},
+    path::PathBuf,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
@@ -7,12 +12,18 @@ use infernet_model::{
     RuntimeKind, ShardDescriptor, ShardMetadata, TokenizerCompatibility, gguf,
 };
 use infernet_node::{
-    DiscoveryConfig, ShardCache, ShardCacheConfig, WorkerConfig, discover_for, empty_advertisement,
-    enrich_local_advertisement, fetch_model_shard_over_libp2p, import_seed_model_from_file,
+    DiscoveryConfig, INFERNET_LLAMA_RPC_RUNTIME_ABI, LLAMA_RPC_DEFAULT_PORT,
+    LLAMA_RPC_PROTOCOL_VERSION, LlamaRpcServer, LlamaRpcServerConfig, ShardCache, ShardCacheConfig,
+    WorkerConfig, clear_local_llama_rpc_endpoint, detect_node_capabilities, discover_for,
+    empty_advertisement, enrich_local_advertisement, fetch_model_shard_over_libp2p,
+    find_llama_rpc_server_binary, import_seed_model_from_file,
+    import_seed_model_from_file_consuming, import_seed_model_from_file_consuming_verified,
     infer_over_libp2p, load_or_generate_keypair, local_capability_advertisement,
-    run_model_distribution_node, run_worker_node,
+    run_model_distribution_node, run_worker_node, set_local_inference_active,
+    set_local_llama_rpc_endpoint, set_local_rpc_active, spawn_llama_rpc_server,
+    stop_persistent_llama_server,
 };
-use infernet_protocol::{ModelShardInfo, NodeAdvertisement, RouteHop};
+use infernet_protocol::{LlamaRpcEndpoint, ModelShardInfo, NodeAdvertisement, RouteHop};
 use infernet_router::ShardRegistry;
 use sha2::{Digest, Sha256};
 
@@ -151,6 +162,9 @@ struct ModelAddLocalArgs {
     gguf: PathBuf,
     #[arg(long, default_value = "1.0.0-compat.1")]
     version: String,
+    /// Move the verified source into Infernet's package instead of retaining a duplicate.
+    #[arg(long, default_value_t = false)]
+    consume_source: bool,
 }
 
 #[derive(Debug, Args)]
@@ -189,6 +203,27 @@ struct ModelServeArgs {
     topic: String,
     #[arg(long, default_value = "/ip4/0.0.0.0/tcp/0")]
     p2p_listen: String,
+    /// Disable the private llama.cpp RPC compute sidecar.
+    #[arg(long, default_value_t = false)]
+    no_rpc: bool,
+    /// Private RFC1918 or Tailscale IPv4 address to bind and advertise.
+    #[arg(long)]
+    rpc_host: Option<Ipv4Addr>,
+    /// RPC port. The default is 50052, with an automatic private-port fallback.
+    #[arg(long)]
+    rpc_port: Option<u16>,
+    /// CPU helper threads used by the RPC sidecar (defaults to half, capped at 8).
+    #[arg(long)]
+    rpc_threads: Option<usize>,
+    /// Optional llama.cpp backend device, such as CUDA0 or Metal.
+    #[arg(long)]
+    rpc_device: Option<String>,
+    /// Explicit ggml-rpc-server binary (or use INFERNET_LLAMA_RPC_SERVER).
+    #[arg(long)]
+    rpc_server_binary: Option<PathBuf>,
+    /// RPC tensor cache and log directory.
+    #[arg(long)]
+    rpc_cache_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -308,7 +343,7 @@ fn add_local_model(args: ModelAddLocalArgs) -> Result<()> {
             release.version
         ));
     }
-    if !test_model_allowed {
+    let verified_source_checksum = if !test_model_allowed {
         let source_size_bytes = fs::metadata(&args.gguf)
             .with_context(|| format!("failed to inspect {}", args.gguf.display()))?
             .len();
@@ -327,9 +362,27 @@ fn add_local_model(args: ModelAddLocalArgs) -> Result<()> {
                 source_checksum
             ));
         }
-    }
+        Some(source_checksum)
+    } else {
+        None
+    };
     let cache = ShardCache::new(cache_config(&args.cache))?;
-    let summary = import_seed_model_from_file(&cache, &args.gguf, &manifest, args.version)?;
+    let summary = if args.consume_source {
+        match verified_source_checksum {
+            Some(checksum) => import_seed_model_from_file_consuming_verified(
+                &cache,
+                &args.gguf,
+                &manifest,
+                args.version,
+                checksum,
+            )?,
+            None => {
+                import_seed_model_from_file_consuming(&cache, &args.gguf, &manifest, args.version)?
+            }
+        }
+    } else {
+        import_seed_model_from_file(&cache, &args.gguf, &manifest, args.version)?
+    };
 
     println!("model={}", summary.model_id);
     println!("display_name={}", summary.display_name);
@@ -646,6 +699,13 @@ fn list_model_shards(args: ModelCacheArgs) -> Result<()> {
 }
 
 async fn serve_model_distribution(args: ModelServeArgs) -> Result<()> {
+    // Install the signal listener before spawning the child. Otherwise a Ctrl-C
+    // arriving during sidecar readiness could terminate this process before
+    // Rust gets a chance to drop and reap the child.
+    let mut shutdown_receiver = tokio::spawn(wait_for_shutdown_signal());
+    tokio::task::yield_now().await;
+
+    let mut rpc_server = start_worker_rpc_server(&args)?;
     let mut discovery = DiscoveryConfig::new(args.topic);
     discovery.p2p_listen = args.p2p_listen;
     let peer_id = discovery.peer_id().to_string();
@@ -656,8 +716,286 @@ async fn serve_model_distribution(args: ModelServeArgs) -> Result<()> {
     println!("peer_id={peer_id}");
     println!("model_protocol=/infernet/model/1");
     println!("cache={}", args.cache.cache_dir.display());
+    if let Some(server) = rpc_server.as_ref() {
+        println!("llama_rpc={}", server.server.endpoint());
+        println!("llama_rpc_security=private-network-only");
+    } else {
+        println!("llama_rpc=disabled");
+    }
 
-    run_model_distribution_node(discovery, cache_config(&args.cache)).await
+    let mut service = Box::pin(run_model_distribution_node(
+        discovery,
+        cache_config(&args.cache),
+    ));
+    let mut rpc_health_check = tokio::time::interval(Duration::from_secs(1));
+    let result = loop {
+        tokio::select! {
+            result = &mut service => break result,
+            signal = &mut shutdown_receiver => {
+                signal
+                    .context("shutdown signal listener stopped")?
+                    .context("failed to install Ctrl-C handler")?;
+                break Ok(());
+            }
+            _ = rpc_health_check.tick(), if rpc_server.is_some() => {
+                let is_running = rpc_server
+                    .as_mut()
+                    .is_some_and(|server| server.server.is_running());
+                let active = rpc_server
+                    .as_ref()
+                    .is_some_and(|server| server.server.has_active_client());
+                set_local_rpc_active(active);
+                if !is_running {
+                    clear_local_llama_rpc_endpoint();
+                    break Err(anyhow!(
+                        "llama.cpp RPC sidecar stopped unexpectedly; compute advertisement withdrawn"
+                    ));
+                }
+            }
+        }
+    };
+    stop_persistent_llama_server();
+    set_local_inference_active(false);
+    set_local_rpc_active(false);
+    drop(rpc_server);
+    result
+}
+
+async fn wait_for_shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
+}
+
+struct AdvertisedWorkerRpcServer {
+    server: LlamaRpcServer,
+}
+
+impl Drop for AdvertisedWorkerRpcServer {
+    fn drop(&mut self) {
+        clear_local_llama_rpc_endpoint();
+    }
+}
+
+fn start_worker_rpc_server(args: &ModelServeArgs) -> Result<Option<AdvertisedWorkerRpcServer>> {
+    if args.no_rpc || env_flag("INFERNET_DISABLE_LLAMA_RPC") {
+        clear_local_llama_rpc_endpoint();
+        return Ok(None);
+    }
+
+    clear_local_llama_rpc_endpoint();
+    let binary = match args.rpc_server_binary.clone() {
+        Some(binary) if binary.is_file() => binary,
+        Some(binary) => {
+            return Err(anyhow!(
+                "llama.cpp RPC server binary is missing: {}",
+                binary.display()
+            ));
+        }
+        None => find_llama_rpc_server_binary().ok_or_else(|| {
+            anyhow!(
+                "ggml-rpc-server was not found; set --rpc-server-binary or INFERNET_LLAMA_RPC_SERVER"
+            )
+        })?,
+    };
+    let host = configured_worker_rpc_host(args.rpc_host)?;
+    let requested_port = args.rpc_port.or(configured_env_port()?);
+    let port = available_worker_rpc_port(host, requested_port)?;
+    let threads = configured_worker_rpc_threads(args.rpc_threads)?;
+    let device = args
+        .rpc_device
+        .clone()
+        .or_else(|| env::var("INFERNET_LLAMA_RPC_DEVICE").ok())
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let cache_dir = args
+        .rpc_cache_dir
+        .clone()
+        .or_else(|| env::var_os("INFERNET_LLAMA_RPC_CACHE_DIR").map(PathBuf::from))
+        .unwrap_or_else(|| args.cache.cache_dir.join("rpc-runtime"));
+    let backend = rpc_backend_for_device(
+        &detect_node_capabilities().compute_backend,
+        device.as_deref(),
+    )?;
+    let endpoint = LlamaRpcEndpoint {
+        host: host.to_string(),
+        port,
+        rpc_protocol_version: LLAMA_RPC_PROTOCOL_VERSION.to_owned(),
+        runtime_abi: INFERNET_LLAMA_RPC_RUNTIME_ABI.to_owned(),
+        backend: backend.clone(),
+        ready: true,
+    };
+    let server = spawn_llama_rpc_server(LlamaRpcServerConfig {
+        binary,
+        bind_host: host.to_string(),
+        advertised_host: host.to_string(),
+        port,
+        cache_dir,
+        cache_tensors: false,
+        threads,
+        device,
+        expected_backend: backend,
+        startup_timeout: Duration::from_secs(30),
+    })?;
+    if let Err(error) = set_local_llama_rpc_endpoint(Some(endpoint)) {
+        drop(server);
+        clear_local_llama_rpc_endpoint();
+        return Err(anyhow!(error));
+    }
+
+    Ok(Some(AdvertisedWorkerRpcServer { server }))
+}
+
+fn configured_worker_rpc_host(explicit: Option<Ipv4Addr>) -> Result<Ipv4Addr> {
+    let host = if let Some(host) = explicit {
+        host
+    } else if let Ok(value) = env::var("INFERNET_LLAMA_RPC_HOST") {
+        value
+            .trim()
+            .parse::<Ipv4Addr>()
+            .context("INFERNET_LLAMA_RPC_HOST must be a private IPv4 address")?
+    } else {
+        preferred_private_ipv4().ok_or_else(|| {
+            anyhow!(
+                "no private LAN/Tailscale IPv4 address was detected; pass --rpc-host explicitly"
+            )
+        })?
+    };
+
+    if is_private_or_tailscale_ipv4(host) {
+        Ok(host)
+    } else {
+        Err(anyhow!(
+            "refusing to expose unauthenticated llama.cpp RPC on non-private address {host}"
+        ))
+    }
+}
+
+fn is_private_or_tailscale_ipv4(host: Ipv4Addr) -> bool {
+    let [first, second, _, _] = host.octets();
+    first == 10
+        || (first == 172 && (16..=31).contains(&second))
+        || (first == 192 && second == 168)
+        || (first == 100 && (64..=127).contains(&second))
+}
+
+fn preferred_private_ipv4() -> Option<Ipv4Addr> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    match socket.local_addr().ok()?.ip() {
+        IpAddr::V4(host) if is_private_or_tailscale_ipv4(host) => Some(host),
+        _ => None,
+    }
+}
+
+fn configured_env_port() -> Result<Option<u16>> {
+    let Ok(value) = env::var("INFERNET_LLAMA_RPC_PORT") else {
+        return Ok(None);
+    };
+    let port = value
+        .trim()
+        .parse::<u16>()
+        .context("INFERNET_LLAMA_RPC_PORT must be between 1 and 65535")?;
+    if port == 0 {
+        return Err(anyhow!(
+            "INFERNET_LLAMA_RPC_PORT must be between 1 and 65535"
+        ));
+    }
+    Ok(Some(port))
+}
+
+fn available_worker_rpc_port(host: Ipv4Addr, requested: Option<u16>) -> Result<u16> {
+    let preferred = requested.unwrap_or(LLAMA_RPC_DEFAULT_PORT);
+    match TcpListener::bind((host, preferred)) {
+        Ok(listener) => {
+            drop(listener);
+            Ok(preferred)
+        }
+        Err(error) if requested.is_some() => Err(anyhow!(
+            "configured llama.cpp RPC address {host}:{preferred} is unavailable: {error}"
+        )),
+        Err(_) => {
+            let listener = TcpListener::bind((host, 0)).with_context(|| {
+                format!("could not allocate a private llama.cpp RPC port on {host}")
+            })?;
+            let port = listener
+                .local_addr()
+                .context("could not inspect allocated llama.cpp RPC port")?
+                .port();
+            drop(listener);
+            Ok(port)
+        }
+    }
+}
+
+fn configured_worker_rpc_threads(explicit: Option<usize>) -> Result<usize> {
+    if let Some(threads) = explicit {
+        if threads == 0 {
+            return Err(anyhow!("--rpc-threads must be a positive integer"));
+        }
+        return Ok(threads);
+    }
+    if let Ok(value) = env::var("INFERNET_LLAMA_RPC_THREADS") {
+        return value
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|threads| *threads > 0)
+            .ok_or_else(|| anyhow!("INFERNET_LLAMA_RPC_THREADS must be a positive integer"));
+    }
+
+    Ok(std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(2)
+        .div_ceil(2)
+        .clamp(1, 8))
+}
+
+fn rpc_backend_for_device(detected: &str, device: Option<&str>) -> Result<String> {
+    let backend = match device {
+        Some(device) => {
+            let device = device.to_ascii_lowercase();
+            if device.contains("cuda") {
+                "cuda"
+            } else if device.contains("metal") {
+                "metal"
+            } else if device.contains("cpu") {
+                "cpu"
+            } else {
+                return Err(anyhow!(
+                    "cannot advertise unknown llama.cpp RPC device {device}"
+                ));
+            }
+        }
+        None => detected,
+    }
+    .to_owned();
+    if matches!(backend.as_str(), "cuda" | "metal") {
+        Ok(backend)
+    } else {
+        Err(anyhow!(
+            "distributed inference requires a CUDA or Metal backend, got {backend}"
+        ))
+    }
+}
+
+fn env_flag(name: &str) -> bool {
+    env::var(name).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 async fn fetch_model_shard(args: ModelFetchArgs, mirror_after_download: bool) -> Result<()> {
@@ -867,6 +1205,24 @@ fn hex_lower(bytes: &[u8]) -> String {
 
 fn print_peers(registry: &ShardRegistry) {
     for advertisement in registry.advertisements() {
+        if let Some(capabilities) = advertisement.capabilities.as_ref() {
+            println!(
+                "machine peer={} machine_id={} backend={} device={} free_accelerator_bytes={} active_sessions={}/{} rpc={}",
+                advertisement.peer_id,
+                capabilities.machine_id.as_deref().unwrap_or("unknown"),
+                capabilities.compute_backend,
+                capabilities.device_name,
+                capabilities.available_accelerator_memory_bytes,
+                capabilities.active_sessions,
+                capabilities.max_sessions,
+                capabilities
+                    .llama_rpc
+                    .as_ref()
+                    .filter(|endpoint| endpoint.ready)
+                    .map(LlamaRpcEndpoint::llama_cpp_endpoint)
+                    .unwrap_or_else(|| "not-ready".to_owned()),
+            );
+        }
         for shard in advertisement.hosted_shards {
             println!(
                 "hosted_shard peer={} model={} layers={}:{} runtime={} address={}",
@@ -914,6 +1270,39 @@ fn print_route(route: &[RouteHop]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rpc_binding_accepts_only_private_and_tailscale_ipv4() {
+        for host in [
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(172, 16, 0, 1),
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(100, 64, 0, 1),
+            Ipv4Addr::new(100, 127, 255, 254),
+        ] {
+            assert!(is_private_or_tailscale_ipv4(host), "{host}");
+        }
+
+        for host in [
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::new(8, 8, 8, 8),
+            Ipv4Addr::new(100, 128, 0, 1),
+            Ipv4Addr::new(217, 77, 11, 197),
+        ] {
+            assert!(!is_private_or_tailscale_ipv4(host), "{host}");
+        }
+    }
+
+    #[test]
+    fn explicit_rpc_device_controls_advertised_backend() {
+        assert!(rpc_backend_for_device("metal", Some("CPU")).is_err());
+        assert_eq!(
+            rpc_backend_for_device("cpu", Some("CUDA0,CPU")).unwrap(),
+            "cuda"
+        );
+        assert!(rpc_backend_for_device("cpu", Some("Vulkan0")).is_err());
+    }
 
     #[test]
     fn static_peer_descriptor_does_not_claim_local_capabilities() {

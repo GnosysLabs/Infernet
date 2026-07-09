@@ -122,12 +122,37 @@ impl ModelBlobResponse {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlamaRpcEndpoint {
+    /// Host accepted by llama.cpp's `--rpc host:port` convention.
+    pub host: String,
+    pub port: u16,
+    /// ggml RPC wire protocol implemented by the endpoint.
+    pub rpc_protocol_version: String,
+    /// Infernet runtime/package ABI accepted by this worker.
+    pub runtime_abi: String,
+    /// Backend actually exposed by the running RPC server (cuda/metal/cpu).
+    pub backend: String,
+    /// True only after the configured RPC backend has become reachable.
+    pub ready: bool,
+}
+
+impl LlamaRpcEndpoint {
+    pub fn llama_cpp_endpoint(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeCapabilities {
     pub os: String,
     pub arch: String,
     pub compute_backend: String,
     pub device_name: String,
+    /// Stable, privacy-preserving hash of the physical host identity. Used to
+    /// avoid counting two app identities/interfaces as two computers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
     pub logical_cpu_cores: u32,
     pub total_ram_bytes: u64,
     pub available_ram_bytes: u64,
@@ -141,6 +166,8 @@ pub struct NodeCapabilities {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub measured_decode_tokens_per_second: Option<f32>,
     pub queue_depth: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llama_rpc: Option<LlamaRpcEndpoint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -179,6 +206,8 @@ pub struct TraceEvent {
 pub struct PromptMetadata {
     pub prompt: String,
     pub demo_mode: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rpc_endpoints: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -377,6 +406,7 @@ mod tests {
             Some(PromptMetadata {
                 prompt: "hello infernet".to_owned(),
                 demo_mode: true,
+                rpc_endpoints: vec!["192.0.2.10:50052".to_owned()],
             }),
         );
         request.trace.push(TraceEvent {
@@ -456,6 +486,7 @@ mod tests {
             arch: "x86_64".to_owned(),
             compute_backend: "cuda".to_owned(),
             device_name: "NVIDIA GeForce RTX 3090".to_owned(),
+            machine_id: Some("machine-a".to_owned()),
             logical_cpu_cores: 16,
             total_ram_bytes: 64 * 1024 * 1024 * 1024,
             available_ram_bytes: 48 * 1024 * 1024 * 1024,
@@ -467,6 +498,14 @@ mod tests {
             measured_prefill_tokens_per_second: Some(92.5),
             measured_decode_tokens_per_second: Some(31.25),
             queue_depth: 0,
+            llama_rpc: Some(LlamaRpcEndpoint {
+                host: "192.0.2.10".to_owned(),
+                port: 50052,
+                rpc_protocol_version: "4.0.1".to_owned(),
+                runtime_abi: "infernet-llama-rpc-v1".to_owned(),
+                backend: "cuda".to_owned(),
+                ready: true,
+            }),
         };
         let advertisement = NodeAdvertisement {
             protocol_version: PROTOCOL_VERSION,
@@ -483,10 +522,49 @@ mod tests {
         let bytes = serde_json::to_vec(&advertisement).unwrap();
         let decoded: NodeAdvertisement = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(decoded, advertisement);
+        assert_eq!(
+            decoded
+                .capabilities
+                .as_ref()
+                .and_then(|capabilities| capabilities.llama_rpc.as_ref())
+                .map(LlamaRpcEndpoint::llama_cpp_endpoint)
+                .as_deref(),
+            Some("192.0.2.10:50052")
+        );
 
         let mut without_capabilities = advertisement;
         without_capabilities.capabilities = None;
         let value = serde_json::to_value(without_capabilities).unwrap();
         assert!(value.get("capabilities").is_none());
+    }
+
+    #[test]
+    fn older_capabilities_and_prompt_metadata_default_rpc_fields() {
+        let capabilities_json = r#"{
+            "os":"linux",
+            "arch":"x86_64",
+            "compute_backend":"cuda",
+            "device_name":"RTX 4060",
+            "logical_cpu_cores":8,
+            "total_ram_bytes":32000,
+            "available_ram_bytes":16000,
+            "total_accelerator_memory_bytes":8000,
+            "available_accelerator_memory_bytes":6000,
+            "unified_memory":false,
+            "max_sessions":1,
+            "active_sessions":0,
+            "queue_depth":0
+        }"#;
+        let capabilities: NodeCapabilities = serde_json::from_str(capabilities_json).unwrap();
+        assert!(capabilities.llama_rpc.is_none());
+        let capabilities_value = serde_json::to_value(capabilities).unwrap();
+        assert!(capabilities_value.get("llama_rpc").is_none());
+
+        let prompt_json = r#"{"prompt":"hello","demo_mode":false}"#;
+        let prompt: PromptMetadata = serde_json::from_str(prompt_json).unwrap();
+        assert!(prompt.rpc_endpoints.is_empty());
+
+        let value = serde_json::to_value(prompt).unwrap();
+        assert!(value.get("rpc_endpoints").is_none());
     }
 }

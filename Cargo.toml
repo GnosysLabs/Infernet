@@ -34,3 +34,9 @@ tauri-build = "2"
 thiserror = "2.0.12"
 tokio = { version = "1.46.1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "time"] }
 uuid = { version = "1.17.0", features = ["serde", "v4"] }
+
+# Model installation hashes multi-gigabyte artifacts. Keep the SHA-256
+# implementation optimized in development builds so a debug app does not turn
+# a one-time integrity check into a multi-minute CPU-bound operation.
+[profile.dev.package.sha2]
+opt-level = 3

@@ -13,6 +13,7 @@ import {
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, "..");
@@ -24,20 +25,38 @@ const executableSuffix = isWindows ? ".exe" : "";
 const sidecarDir = resolve(repoRoot, "infernet-ui", "src-tauri", "binaries");
 const cliSidecarBase = resolve(sidecarDir, "llama-cli");
 const bridgeSidecarBase = resolve(sidecarDir, "infernet-llama-bridge");
+const rpcServerSidecarBase = resolve(sidecarDir, "ggml-rpc-server");
+const serverSidecarBase = resolve(sidecarDir, "llama-server");
 const sidecarPath = `${cliSidecarBase}-${targetTriple}${executableSuffix}`;
 const bridgeSidecarPath = `${bridgeSidecarBase}-${targetTriple}${executableSuffix}`;
+const rpcServerSidecarPath = `${rpcServerSidecarBase}-${targetTriple}${executableSuffix}`;
+const serverSidecarPath = `${serverSidecarBase}-${targetTriple}${executableSuffix}`;
 const runtimeStampPath = resolve(sidecarDir, `.infernet-llama-runtime-${targetTriple}.stamp`);
 const runtimeLockPath = resolve(sidecarDir, `.infernet-llama-runtime-${targetTriple}.lock`);
-const runtimePatchVersion = "infernet-capacity-gpu-v5";
+const runtimePatchVersion = "infernet-pinned-persistent-server-runtime-v8";
 const buildRoot = resolve(repoRoot, "target", "llama.cpp-runtime");
 const sourceDir = join(buildRoot, "llama.cpp");
 const buildDir = join(buildRoot, `build-${targetTriple}`);
 const downloadDir = join(buildRoot, "downloads");
 const prebuiltDir = join(buildRoot, `prebuilt-${targetTriple}`);
 const llamaRef = process.env.LLAMA_CPP_REF || "049326a00025d00b08cc188ed716b681e984a3f8";
-const runtimeStamp = `${runtimePatchVersion}:${llamaRef}`;
+const rpcServerTarget = "ggml-rpc-server";
+const serverTarget = "llama-server";
+const buildJobs = readBuildJobs();
+const cudaEnabled = shouldEnableCuda();
+const cudaArchitectures = "86;89";
+const bridgeSourceHash = createHash("sha256")
+  .update(readFileSync(resolve(repoRoot, "llama-runtime", "infernet-bridge.cpp")))
+  .digest("hex")
+  .slice(0, 16);
+const runtimeBackend = cudaEnabled ? `cuda-${cudaArchitectures}` : isMacos ? "metal" : "cpu";
+const runtimeStamp = `${runtimePatchVersion}:${llamaRef}:${runtimeBackend}:${bridgeSourceHash}`;
 
-withRuntimeLock(main);
+if (process.argv.includes("--dry-run")) {
+  printBuildPlan();
+} else {
+  withRuntimeLock(main);
+}
 
 function withRuntimeLock(task) {
   acquireRuntimeLock();
@@ -81,49 +100,52 @@ function acquireRuntimeLock() {
 
 function main() {
   mkdirSync(sidecarDir, { recursive: true });
-  if (fileExists(sidecarPath) && fileExists(bridgeSidecarPath)) {
+  if (
+    fileExists(sidecarPath)
+    && fileExists(bridgeSidecarPath)
+    && fileExists(rpcServerSidecarPath)
+    && fileExists(serverSidecarPath)
+  ) {
     const validation = validateRuntime(sidecarPath);
     const bridgeValidation = validateRuntime(bridgeSidecarPath);
+    const rpcServerValidation = validateRuntime(rpcServerSidecarPath);
+    const serverValidation = validateRuntime(serverSidecarPath);
     const stampMatches = readStamp() === runtimeStamp;
-    if (validation.ok && bridgeValidation.ok && stampMatches) {
+    if (validation.ok && bridgeValidation.ok && rpcServerValidation.ok && serverValidation.ok && stampMatches) {
       log(`bundled llama.cpp runtime already exists: ${relative(sidecarPath)}`);
       log(`bundled Infernet llama.cpp bridge already exists: ${relative(bridgeSidecarPath)}`);
+      log(`bundled llama.cpp RPC server already exists: ${relative(rpcServerSidecarPath)}`);
+      log(`bundled llama.cpp HTTP server already exists: ${relative(serverSidecarPath)}`);
       return;
     }
-    log(`rebuilding bundled llama.cpp runtime: ${stampMatches ? (validation.ok ? bridgeValidation.reason : validation.reason) : "runtime patch stamp is stale"}`);
+    const invalidRuntime = [validation, bridgeValidation, rpcServerValidation, serverValidation]
+      .find((candidate) => !candidate.ok);
+    log(`rebuilding bundled llama.cpp runtime: ${stampMatches ? invalidRuntime.reason : "runtime patch stamp is stale"}`);
     // Keep the last known-good sidecars in place until replacements have been
     // built and validated. This avoids breaking a running dev app if a rebuild
     // is interrupted.
   }
 
-  const configuredCli = process.env.INFERNET_LLAMA_CLI?.trim();
-  const configuredBridge = process.env.INFERNET_LLAMA_BRIDGE?.trim();
-  if (configuredCli && configuredBridge) {
+  const allowExternalRuntime = environmentFlag("INFERNET_ALLOW_EXTERNAL_LLAMA_RUNTIME");
+  const configuredCli = allowExternalRuntime && process.env.INFERNET_LLAMA_CLI?.trim();
+  const configuredBridge = allowExternalRuntime && process.env.INFERNET_LLAMA_BRIDGE?.trim();
+  const configuredRpcServer = allowExternalRuntime && process.env.INFERNET_LLAMA_RPC_SERVER?.trim();
+  const configuredServer = allowExternalRuntime && process.env.INFERNET_LLAMA_SERVER?.trim();
+  if (configuredCli && configuredBridge && configuredRpcServer && configuredServer) {
     copyRuntime(configuredCli, sidecarPath, "INFERNET_LLAMA_CLI");
     copyRuntime(configuredBridge, bridgeSidecarPath, "INFERNET_LLAMA_BRIDGE");
+    copyRuntime(configuredRpcServer, rpcServerSidecarPath, "INFERNET_LLAMA_RPC_SERVER");
+    copyRuntime(configuredServer, serverSidecarPath, "INFERNET_LLAMA_SERVER");
     writeStamp();
     return;
   }
-
-  const cliFromPath = findOnPath(isWindows ? ["llama-cli.exe", "llama.exe", "main.exe"] : ["llama-cli", "llama", "main"]);
-  const bridgeFromPath = findOnPath(isWindows ? ["infernet-llama-bridge.exe"] : ["infernet-llama-bridge"]);
-  if (cliFromPath && bridgeFromPath) {
-    copyRuntime(cliFromPath, sidecarPath, "PATH");
-    copyRuntime(bridgeFromPath, bridgeSidecarPath, "PATH");
-    writeStamp();
-    return;
+  if (allowExternalRuntime && [configuredCli, configuredBridge, configuredRpcServer, configuredServer].some(Boolean)) {
+    fail("external llama.cpp runtime override requires all four INFERNET_LLAMA_* binary paths");
   }
 
-  const preparedPrebuilt =
-    (isWindows && prepareWindowsPrebuilt()) || (isMacos && prepareMacosPrebuilt());
-  if (preparedPrebuilt && fileExists(bridgeSidecarPath)) {
-    writeStamp();
-    return;
-  }
-  if (preparedPrebuilt) {
-    ensureSourceBuildRequirements();
-  }
-
+  // RPC client/server wire compatibility must be exact. Never combine a
+  // current upstream prebuilt with Infernet's pinned bridge and then stamp the
+  // result as pinned; build the complete runtime from the exact commit.
   buildFromSource();
   writeStamp();
 }
@@ -159,12 +181,16 @@ function prepareWindowsPrebuilt() {
     ]);
 
     const cli = findFileRecursive(prebuiltDir, "llama-cli.exe");
-    if (!cli) {
-      log(`official llama.cpp prebuilt ${asset.name} did not contain llama-cli.exe`);
+    const rpcServer = findFileRecursive(prebuiltDir, "ggml-rpc-server.exe");
+    const server = findFileRecursive(prebuiltDir, "llama-server.exe");
+    if (!cli || !rpcServer || !server) {
+      log(`official llama.cpp prebuilt ${asset.name} did not contain llama-cli.exe, llama-server.exe, and ggml-rpc-server.exe`);
       return false;
     }
 
     copyRuntime(cli, sidecarPath, `official llama.cpp ${asset.name}`);
+    copyRuntime(rpcServer, rpcServerSidecarPath, `official llama.cpp ${asset.name}`);
+    copyRuntime(server, serverSidecarPath, `official llama.cpp ${asset.name}`);
     copyRuntimeDlls(dirname(cli));
     return true;
   } catch (error) {
@@ -198,15 +224,21 @@ function prepareMacosPrebuilt() {
     run("tar", ["-xzf", tarPath, "-C", prebuiltDir]);
 
     const cli = findFileRecursive(prebuiltDir, "llama-cli");
-    if (!cli) {
-      log(`official llama.cpp prebuilt ${asset.name} did not contain llama-cli`);
+    const rpcServer = findFileRecursive(prebuiltDir, "ggml-rpc-server");
+    const server = findFileRecursive(prebuiltDir, "llama-server");
+    if (!cli || !rpcServer || !server) {
+      log(`official llama.cpp prebuilt ${asset.name} did not contain llama-cli, llama-server, and ggml-rpc-server`);
       return false;
     }
 
     const label = `official llama.cpp ${asset.name}`;
     copyRuntime(cli, sidecarPath, label, { validate: false });
+    copyRuntime(rpcServer, rpcServerSidecarPath, label, { validate: false });
+    copyRuntime(server, serverSidecarPath, label, { validate: false });
     copyRuntimeDylibs(dirname(cli));
     validatePreparedRuntime(sidecarPath, label);
+    validatePreparedRuntime(rpcServerSidecarPath, label);
+    validatePreparedRuntime(serverSidecarPath, label);
     return true;
   } catch (error) {
     log(`failed to prepare official macOS llama.cpp runtime: ${error.message}`);
@@ -232,6 +264,10 @@ function buildFromSource() {
     "-DCMAKE_BUILD_TYPE=Release",
     "-DBUILD_SHARED_LIBS=OFF",
     "-DGGML_BACKEND_DL=OFF",
+    "-DGGML_RPC=ON",
+    "-DGGML_NATIVE=OFF",
+    `-DGGML_CUDA=${cudaEnabled ? "ON" : "OFF"}`,
+    `-DGGML_METAL=${isMacos ? "ON" : "OFF"}`,
     "-DLLAMA_CURL=OFF",
     "-DLLAMA_OPENSSL=OFF",
     "-DLLAMA_BUILD_COMMON=ON",
@@ -241,11 +277,8 @@ function buildFromSource() {
     "-DLLAMA_USE_PREBUILT_UI=OFF",
     "-DLLAMA_BUILD_TESTS=OFF",
   ];
-  if (process.platform === "darwin") {
-    cmakeArgs.push("-DGGML_METAL=ON");
-  }
-  if (process.env.INFERNET_CUDA === "1") {
-    cmakeArgs.push("-DGGML_CUDA=ON");
+  if (cudaEnabled) {
+    cmakeArgs.push(`-DCMAKE_CUDA_ARCHITECTURES=${cudaArchitectures}`);
   }
 
   run("cmake", cmakeArgs);
@@ -254,8 +287,18 @@ function buildFromSource() {
   if (!cliTarget) {
     fail(`no supported llama.cpp CLI target found in ${buildDir}`);
   }
-  run("cmake", ["--build", buildDir, "--config", "Release", "--target", cliTarget]);
-  run("cmake", ["--build", buildDir, "--config", "Release", "--target", "infernet-llama-bridge"]);
+  if (!targets.includes(rpcServerTarget)) {
+    fail(`required llama.cpp RPC target ${rpcServerTarget} was not generated in ${buildDir}`);
+  }
+  if (!targets.includes(serverTarget)) {
+    fail(`required llama.cpp server target ${serverTarget} was not generated in ${buildDir}`);
+  }
+  run("cmake", [
+    "--build", buildDir,
+    "--config", "Release",
+    "--parallel", String(buildJobs),
+    "--target", cliTarget, "infernet-llama-bridge", rpcServerTarget, serverTarget,
+  ]);
 
   const built = [
     join(buildDir, "bin", `llama-cli${executableSuffix}`),
@@ -280,8 +323,57 @@ function buildFromSource() {
     fail(`llama.cpp built, but infernet-llama-bridge was not found under ${buildDir}`);
   }
 
+  const rpcServerBuilt = [
+    join(buildDir, "bin", `${rpcServerTarget}${executableSuffix}`),
+    join(buildDir, "bin", "Release", `${rpcServerTarget}${executableSuffix}`),
+    join(buildDir, "tools", "rpc", `${rpcServerTarget}${executableSuffix}`),
+    join(buildDir, "tools", "rpc", "Release", `${rpcServerTarget}${executableSuffix}`),
+  ].find(fileExists);
+
+  if (!rpcServerBuilt) {
+    fail(`llama.cpp built, but ${rpcServerTarget} was not found under ${buildDir}`);
+  }
+
+  const serverBuilt = [
+    join(buildDir, "bin", `${serverTarget}${executableSuffix}`),
+    join(buildDir, "bin", "Release", `${serverTarget}${executableSuffix}`),
+    join(buildDir, "tools", "server", `${serverTarget}${executableSuffix}`),
+    join(buildDir, "tools", "server", "Release", `${serverTarget}${executableSuffix}`),
+  ].find(fileExists);
+
+  if (!serverBuilt) {
+    fail(`llama.cpp built, but ${serverTarget} was not found under ${buildDir}`);
+  }
+
   copyRuntime(built, sidecarPath, "llama.cpp source build");
   copyRuntime(bridgeBuilt, bridgeSidecarPath, "Infernet llama.cpp bridge source build");
+  copyRuntime(rpcServerBuilt, rpcServerSidecarPath, "llama.cpp RPC server source build");
+  copyRuntime(serverBuilt, serverSidecarPath, "llama.cpp HTTP server source build");
+  if (isWindows && cudaEnabled) {
+    copyCudaRuntimeDlls();
+  }
+}
+
+function copyCudaRuntimeDlls() {
+  const directories = [];
+  if (process.env.CUDA_PATH) {
+    directories.push(join(process.env.CUDA_PATH, "bin"));
+  }
+  directories.push(...(process.env.PATH || "").split(";").filter(Boolean));
+  const copied = new Set();
+  for (const directory of directories) {
+    if (!existsSync(directory)) continue;
+    for (const name of readdirSync(directory)) {
+      if (!/^(?:cublas|cublasLt|cudart|nvrtc|nvJitLink).+\.dll$/i.test(name) || copied.has(name.toLowerCase())) {
+        continue;
+      }
+      copyFileSync(join(directory, name), join(sidecarDir, name));
+      copied.add(name.toLowerCase());
+    }
+  }
+  if (![...copied].some((name) => name.startsWith("cublas")) || ![...copied].some((name) => name.startsWith("cudart"))) {
+    fail("CUDA runtime DLLs were not found; ensure CUDA_PATH/bin is available while packaging the NVIDIA worker");
+  }
 }
 
 function prepareInfernetBridgeSource() {
@@ -699,6 +791,59 @@ function invalidMacosDependency(line, runtimeDir) {
   }
 
   return true;
+}
+
+function readBuildJobs() {
+  const configured =
+    process.env.INFERNET_LLAMA_BUILD_JOBS?.trim()
+    || process.env.CMAKE_BUILD_PARALLEL_LEVEL?.trim()
+    || "2";
+  const jobs = Number.parseInt(configured, 10);
+  if (!/^\d+$/.test(configured) || !Number.isInteger(jobs) || jobs < 1) {
+    fail("INFERNET_LLAMA_BUILD_JOBS must be a positive integer");
+  }
+  // Native llama.cpp compilation is intentionally capped. Unbounded parallel
+  // builds previously made development machines unresponsive.
+  return Math.min(jobs, 2);
+}
+
+function environmentFlag(name) {
+  return ["1", "true", "yes", "on"].includes((process.env[name] || "").trim().toLowerCase());
+}
+
+function shouldEnableCuda() {
+  const configured = process.env.INFERNET_CUDA?.trim().toLowerCase();
+  if (["0", "false", "no", "off"].includes(configured)) {
+    return false;
+  }
+  if (["1", "true", "yes", "on"].includes(configured)) {
+    return true;
+  }
+  return !isMacos && commandAvailable(isWindows ? "nvidia-smi.exe" : "nvidia-smi");
+}
+
+function printBuildPlan() {
+  console.log(JSON.stringify({
+    llamaRef,
+    targetTriple,
+    buildJobs,
+    cmakeOptions: [
+      "-DGGML_RPC=ON",
+      "-DBUILD_SHARED_LIBS=OFF",
+      "-DGGML_BACKEND_DL=OFF",
+      "-DGGML_NATIVE=OFF",
+      `-DGGML_CUDA=${cudaEnabled ? "ON" : "OFF"}`,
+      `-DGGML_METAL=${isMacos ? "ON" : "OFF"}`,
+      ...(cudaEnabled ? [`-DCMAKE_CUDA_ARCHITECTURES=${cudaArchitectures}`] : []),
+    ],
+    targets: ["llama-cli", "infernet-llama-bridge", rpcServerTarget, serverTarget],
+    sidecars: [
+      relative(sidecarPath),
+      relative(bridgeSidecarPath),
+      relative(rpcServerSidecarPath),
+      relative(serverSidecarPath),
+    ],
+  }, null, 2));
 }
 
 function rustTargetTriple() {

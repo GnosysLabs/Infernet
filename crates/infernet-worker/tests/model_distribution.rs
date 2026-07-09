@@ -66,6 +66,7 @@ fn shard_downloaders_become_seeders() {
         .args([
             "model",
             "serve",
+            "--no-rpc",
             "--cache-dir",
             seed_cache.to_str().unwrap(),
             "--topic",

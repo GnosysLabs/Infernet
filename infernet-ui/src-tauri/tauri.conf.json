@@ -28,10 +28,9 @@
     "targets": "all",
     "externalBin": [
       "binaries/llama-cli",
-      "binaries/infernet-llama-bridge"
-    ],
-    "resources": [
-      "binaries"
+      "binaries/infernet-llama-bridge",
+      "binaries/ggml-rpc-server",
+      "binaries/llama-server"
     ]
   }
 }

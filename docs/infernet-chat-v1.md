@@ -31,15 +31,13 @@ optional measured throughput. NVIDIA capacity comes from `nvidia-smi`; Apple
 Silicon reports Metal with its currently available unified memory. Device names
 are descriptive only—the planner uses the reported numbers.
 
-The launch scheduler assigns immutable, content-addressed components in
-contiguous layer ranges. It reserves model weights, KV cache, runtime scratch
-space, and a safety margin before accepting an assignment. Saturated machines
-are skipped; measured throughput and live load influence balancing. The 4060
-can therefore receive only components that safely fit its actual free VRAM,
-while the 3090 and higher-memory Macs can receive larger ranges. The scheduler
-tries to include every useful reported machine (up to eight) when the fixed
-components fit safely, then falls back to the largest feasible set. Within that
-set it minimizes network boundaries.
+The launch scheduler selects one verified package coordinator and a leased set
+of CUDA/Metal RPC workers. Pinned llama.cpp assigns contiguous layers and their
+KV buffers in proportion to backend memory. Infernet reserves KV cache, runtime
+scratch space, and a safety margin before accepting the topology. Saturated
+machines and duplicate app identities on one physical host are skipped. The
+topology remains stable across prompts so weights and distributed KV stay
+resident instead of being retransferred whenever free-memory telemetry changes.
 
 ## Package contract
 
@@ -100,9 +98,12 @@ The official package does not ship until all of these pass:
 6. Repeated runs survive peer restart, missing-component, timeout, and checksum
    failure tests without freezing a host.
 
-Until partial Gemma 4 MoE execution passes those gates, the compatibility
-package remains a complete `0:N` package for correctness testing and is not
-presented as the distributed launch release.
+For launch, the compatibility package remains a complete `0:N` package on one
+coordinator, while llama.cpp RPC distributes its tensors and KV allocations
+across the selected machines at load time. This delivers real multi-machine
+execution without duplicating global tensors into 30+ GB of generated shard
+files. A future native-component release can remove the remaining requirement
+that one coordinator stores the complete source package.
 
 ## Seeding the pinned compatibility release
 
@@ -112,6 +113,7 @@ exact official file, seed it on the 3090 host with:
 ```sh
 cargo run -p infernet-worker -- model add-local \
   --gguf /path/to/gemma-4-26B_q4_0-it.gguf \
+  --consume-source \
   --cache-dir /path/to/infernet-official-seed
 
 cargo run -p infernet-worker -- model serve \
@@ -120,5 +122,7 @@ cargo run -p infernet-worker -- model serve \
 ```
 
 The release command checks the exact size and SHA-256 before placing anything
-in the seed cache. Other nodes obtain only the pinned payload from Infernet's
-network and verify it while downloading.
+in the seed cache. `--consume-source` moves that verified payload into the
+Infernet package, leaving one 14.4 GB copy instead of retaining a second source
+copy. Other nodes receive only the tensors assigned to their RPC backend in
+memory; tensor disk caching is disabled for launch.

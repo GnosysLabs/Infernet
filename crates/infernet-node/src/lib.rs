@@ -1,10 +1,13 @@
 pub mod capabilities;
+pub mod llama_server_runtime;
 pub mod model_distribution;
+pub mod rpc_runtime;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::mem;
+use std::net::Ipv4Addr;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -15,8 +18,14 @@ use std::{fs, io};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
-use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, StreamExt, channel::oneshot};
-use infernet_model::{LayerRange, ModelManifest, RuntimeKind, SeedShardManifest, ShardDescriptor};
+use futures::{
+    AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, StreamExt,
+    channel::{mpsc, oneshot},
+};
+use infernet_model::{
+    LayerRange, ModelManifest, OfficialModelRelease, RuntimeKind, SeedShardManifest,
+    ShardDescriptor,
+};
 use infernet_protocol::{
     ACTIVATION_PROTOCOL, ActivationRequest, ActivationResponse, MODEL_BLOB_PROTOCOL,
     MODEL_PROTOCOL, ModelBlobRequest, ModelBlobResponse, ModelShardInfo, ModelShardRequest,
@@ -40,6 +49,7 @@ pub use model_distribution::{
     PAYLOAD_KIND_GGUF_SHARD, PAYLOAD_KIND_INFERNET_SHARD, PAYLOAD_KIND_METADATA_ONLY,
     SeedShardBuildProgress, SeededModelSummary, ShardCache, ShardCacheConfig, ShardCacheStats,
     executable_source_path_for_manifest, import_seed_model_from_file,
+    import_seed_model_from_file_consuming, import_seed_model_from_file_consuming_verified,
     import_seed_model_from_file_with_build_progress, import_seed_model_from_file_with_progress,
     is_executable_shard_record, seed_manifest_for_network, sha256_bytes, sha256_file,
     source_cache_path, source_cache_root,
@@ -47,7 +57,19 @@ pub use model_distribution::{
 use serde::Deserialize;
 use tokio::time::{Instant, interval, sleep};
 
-pub use capabilities::detect_node_capabilities;
+pub use capabilities::{
+    PINNED_GGML_RPC_PROTOCOL_VERSION, clear_local_llama_rpc_endpoint,
+    configured_llama_rpc_endpoint, detect_node_capabilities, set_local_inference_active,
+    set_local_llama_rpc_endpoint, set_local_rpc_active, validate_llama_rpc_endpoint,
+};
+pub use llama_server_runtime::{
+    LlamaServerCompletion, LlamaServerConfig, complete_with_persistent_llama_server,
+    find_llama_server_binary, stop_persistent_llama_server,
+};
+pub use rpc_runtime::{
+    INFERNET_LLAMA_RPC_RUNTIME_ABI, LLAMA_RPC_DEFAULT_PORT, LLAMA_RPC_PROTOCOL_VERSION,
+    LlamaRpcServer, LlamaRpcServerConfig, find_llama_rpc_server_binary, spawn_llama_rpc_server,
+};
 
 pub type ModelDistributionReadiness = oneshot::Sender<std::result::Result<String, String>>;
 
@@ -72,6 +94,12 @@ pub struct DiscoveryConfig {
     pub advertise_listen_addresses: bool,
     pub dial_discovered_peers: bool,
     pub relay_advertisements: bool,
+    /// Explicitly trusted llama.cpp RPC backends selected by the caller for
+    /// this request. These are validated again before they cross the network.
+    pub rpc_endpoints: Vec<String>,
+    /// Exact route selected alongside `rpc_endpoints`. This prevents a second
+    /// discovery pass from switching coordinators after the RPC plan is built.
+    pub planned_route: Option<Vec<RouteHop>>,
 }
 
 impl DiscoveryConfig {
@@ -86,11 +114,26 @@ impl DiscoveryConfig {
             advertise_listen_addresses: true,
             dial_discovered_peers: true,
             relay_advertisements: false,
+            rpc_endpoints: Vec::new(),
+            planned_route: None,
         }
     }
 
     pub fn peer_id(&self) -> PeerId {
         self.keypair.public().to_peer_id()
+    }
+
+    pub fn set_trusted_rpc_endpoints(
+        &mut self,
+        endpoints: impl IntoIterator<Item = String>,
+    ) -> Result<()> {
+        self.rpc_endpoints =
+            normalize_trusted_rpc_endpoints(&endpoints.into_iter().collect::<Vec<_>>())?;
+        Ok(())
+    }
+
+    pub fn set_planned_route(&mut self, route: Vec<RouteHop>) {
+        self.planned_route = Some(route);
     }
 }
 
@@ -155,6 +198,10 @@ const MODEL_FETCH_PEER_RETRY_COOLDOWN: Duration = Duration::from_secs(5);
 const LLAMA_BRIDGE_EXECUTION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const LLAMA_BRIDGE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const LLAMA_BRIDGE_MAX_LIBRARY_THREADS: usize = 4;
+// llama.cpp supports at most 16 devices total, including the coordinator's
+// local backend. Launch nodes expose one accelerator each; keep ample headroom
+// for local and future multi-device hosts.
+const MAX_TRUSTED_RPC_ENDPOINTS: usize = 8;
 
 struct RemoveFileOnDrop(PathBuf);
 
@@ -404,6 +451,21 @@ enum PendingOutbound {
     },
 }
 
+enum LocalActivationOutcome {
+    Response(ActivationResponse),
+    Forward(ActivationRequest),
+}
+
+struct CompletedLocalActivation {
+    job_id: uuid::Uuid,
+    outcome: LocalActivationOutcome,
+}
+
+struct PendingLocalActivation {
+    channel: request_response::ResponseChannel<ActivationResponse>,
+    peer_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ActivationStep {
     Forward(ActivationRequest),
@@ -542,9 +604,21 @@ async fn run_model_distribution_node_inner(
     let mut publish_interval = interval(discovery.publish_interval);
     let mut static_peer_dial_interval = interval(Duration::from_secs(10));
     let mut pending_forwards = HashMap::new();
+    let (local_completion_sender, mut local_completion_receiver) = mpsc::unbounded();
+    let mut pending_local_activations = HashMap::new();
 
     loop {
         tokio::select! {
+            completed = local_completion_receiver.next() => {
+                let completed = completed.ok_or_else(|| anyhow!("local inference completion channel closed"))?;
+                handle_completed_local_activation(
+                    &mut swarm,
+                    &discovery.static_peers,
+                    completed,
+                    &mut pending_local_activations,
+                    &mut pending_forwards,
+                )?;
+            }
             _ = static_peer_dial_interval.tick(), if !discovery.static_peers.is_empty() => {
                 add_static_peer_addresses(&mut swarm, &discovery.static_peers);
             }
@@ -620,6 +694,8 @@ async fn run_model_distribution_node_inner(
                                 &discovery.static_peers,
                                 event,
                                 &mut pending_forwards,
+                                &local_completion_sender,
+                                &mut pending_local_activations,
                             )?;
                         }
                     }
@@ -1214,6 +1290,11 @@ pub async fn infer_over_libp2p(
     hidden_size: usize,
     discovery_timeout: Duration,
 ) -> Result<InferenceResult> {
+    let rpc_endpoints = normalize_trusted_rpc_endpoints(&config.rpc_endpoints)?;
+    if !rpc_endpoints.is_empty() {
+        validate_rpc_model_manifest(&manifest)?;
+    }
+
     let topic = gossipsub::IdentTopic::new(config.topic.clone());
     let mut registry = ShardRegistry::new();
     registry.extend(config.static_peers.clone());
@@ -1222,15 +1303,20 @@ pub async fn infer_over_libp2p(
     add_static_peer_addresses(&mut swarm, &config.static_peers);
     listen_on(&mut swarm, &config.p2p_listen)?;
 
-    let route = discover_route_on_swarm(
-        &mut swarm,
-        &mut registry,
-        &mut config,
-        &topic,
-        &manifest,
-        discovery_timeout,
-    )
-    .await?;
+    let route = if let Some(route) = config.planned_route.clone() {
+        validate_planned_route(&route, &manifest, &config.static_peers)?;
+        route
+    } else {
+        discover_route_on_swarm(
+            &mut swarm,
+            &mut registry,
+            &mut config,
+            &topic,
+            &manifest,
+            discovery_timeout,
+        )
+        .await?
+    };
 
     let demo_mode = manifest.runtime_kind == RuntimeKind::Demo;
     let activation = if demo_mode {
@@ -1243,7 +1329,11 @@ pub async fn infer_over_libp2p(
         route.clone(),
         hidden_size,
         activation,
-        Some(PromptMetadata { prompt, demo_mode }),
+        Some(PromptMetadata {
+            prompt,
+            demo_mode,
+            rpc_endpoints,
+        }),
     );
     let first_hop = request
         .current_hop()
@@ -1259,7 +1349,7 @@ pub async fn infer_over_libp2p(
         outbound_id,
         match manifest.runtime_kind {
             RuntimeKind::Demo => Duration::from_secs(15),
-            RuntimeKind::LlamaCpp => Duration::from_secs(15 * 60),
+            RuntimeKind::LlamaCpp => Duration::from_secs(18 * 60),
         },
     )
     .await?;
@@ -1269,6 +1359,103 @@ pub async fn infer_over_libp2p(
     }
 
     Ok(InferenceResult { route, response })
+}
+
+fn normalize_trusted_rpc_endpoints(endpoints: &[String]) -> Result<Vec<String>> {
+    let mut normalized = Vec::new();
+    let mut seen = HashSet::new();
+
+    for endpoint in endpoints {
+        let endpoint = endpoint.trim();
+        let (host, port) = endpoint.split_once(':').ok_or_else(|| {
+            anyhow!("llama RPC endpoint must use the private IPv4 host:port form")
+        })?;
+        if host.is_empty() || port.is_empty() || port.contains(':') {
+            bail!("llama RPC endpoint must use the private IPv4 host:port form");
+        }
+        let host = host.parse::<Ipv4Addr>().with_context(|| {
+            format!("llama RPC endpoint {endpoint:?} must use a private IPv4 address")
+        })?;
+        if !is_trusted_rpc_ipv4(host) {
+            bail!(
+                "llama RPC endpoint {endpoint:?} is not on a private LAN, link-local, or Tailscale address"
+            );
+        }
+        if !port.bytes().all(|byte| byte.is_ascii_digit()) {
+            bail!("llama RPC endpoint {endpoint:?} has an invalid port");
+        }
+        let port = port
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port > 0)
+            .ok_or_else(|| anyhow!("llama RPC endpoint {endpoint:?} has an invalid port"))?;
+        let endpoint = format!("{host}:{port}");
+        if seen.insert(endpoint.clone()) {
+            normalized.push(endpoint);
+            if normalized.len() > MAX_TRUSTED_RPC_ENDPOINTS {
+                bail!(
+                    "llama RPC request exceeds the {MAX_TRUSTED_RPC_ENDPOINTS}-backend safety limit"
+                );
+            }
+        }
+    }
+
+    Ok(normalized)
+}
+
+fn validate_planned_route(
+    route: &[RouteHop],
+    manifest: &ModelManifest,
+    advertisements: &[NodeAdvertisement],
+) -> Result<()> {
+    if route.is_empty() {
+        bail!("planned inference route must not be empty");
+    }
+    let mut expected_start = 0_u32;
+    for hop in route {
+        if hop.layers.start != expected_start || hop.layers.end > manifest.layer_count {
+            bail!("planned inference route is not contiguous for the selected model");
+        }
+        let advertised = advertisements.iter().any(|advertisement| {
+            advertisement.peer_id == hop.peer_id
+                && advertisement
+                    .hosted_shards
+                    .iter()
+                    .any(|shard| shard.model_id == manifest.model_id && shard.layers == hop.layers)
+        });
+        if !advertised {
+            bail!(
+                "planned coordinator {} no longer advertises the selected verified model",
+                hop.peer_id
+            );
+        }
+        expected_start = hop.layers.end;
+    }
+    if expected_start != manifest.layer_count {
+        bail!("planned inference route does not cover the full selected model");
+    }
+    Ok(())
+}
+
+fn is_trusted_rpc_ipv4(address: Ipv4Addr) -> bool {
+    let [first, second, _, _] = address.octets();
+    let carrier_grade_nat = first == 100 && (64..=127).contains(&second);
+    address.is_private() || address.is_link_local() || carrier_grade_nat
+}
+
+fn validate_rpc_model_manifest(manifest: &ModelManifest) -> Result<()> {
+    let official_model = ModelManifest::infernet_chat_v1();
+    let release = OfficialModelRelease::infernet_chat_v1_compatibility();
+    release
+        .validate_for_model(&official_model)
+        .context("pinned Infernet Chat release metadata is invalid")?;
+    if manifest != &official_model || manifest.model_id != release.model_id {
+        bail!(
+            "distributed llama RPC execution is restricted to the pinned {} release",
+            release.release_id
+        );
+    }
+    Ok(())
 }
 
 pub fn demo_advertisement(
@@ -1597,6 +1784,36 @@ fn execute_llama_cpp_shard(
             manifest.runtime_kind.as_str()
         );
     }
+    let rpc_endpoints =
+        validated_rpc_endpoints_for_execution(config, layers, request, &manifest, &model_path)?;
+    if !rpc_endpoints.is_empty() {
+        let binary = find_llama_server_binary().ok_or_else(|| {
+            anyhow!(
+                "llama-server binary is missing; run npm run prepare-runtime or set INFERNET_LLAMA_SERVER"
+            )
+        })?;
+        let release = OfficialModelRelease::infernet_chat_v1_compatibility();
+        let completion = complete_with_persistent_llama_server(
+            LlamaServerConfig {
+                binary,
+                model_path,
+                rpc_endpoints,
+                context_size: release.launch_context_cap_tokens,
+                threads: llama_bridge_thread_cap(),
+                cache_ram_mib: 0,
+                startup_timeout: Duration::from_secs(8 * 60),
+                request_timeout: Duration::from_secs(7 * 60),
+                log_dir: cache_config.root.join("runtime"),
+            },
+            &prompt.prompt,
+            64,
+        )?;
+        return Ok(LlamaShardOutput {
+            activation: Vec::new(),
+            output_text: Some(completion.text),
+            timing_ms: completion.timing_ms,
+        });
+    }
 
     let bridge = find_llama_bridge_binary().ok_or_else(|| {
         anyhow!(
@@ -1653,6 +1870,7 @@ fn execute_llama_cpp_shard(
         // which no split executor exists yet (including Qwen 3.5).
         command.arg("--full-model");
     }
+    append_llama_rpc_arguments(&mut command, &rpc_endpoints);
     if !request.activation.is_empty() {
         command.arg("--input").arg(&input_path);
     }
@@ -1741,6 +1959,121 @@ fn execute_llama_cpp_shard(
             .map(|value| value.max(0.0).round() as u64)
             .unwrap_or(0),
     })
+}
+
+fn validated_rpc_endpoints_for_execution(
+    config: &WorkerConfig,
+    layers: LayerRange,
+    request: &ActivationRequest,
+    manifest: &SeedShardManifest,
+    model_path: &Path,
+) -> Result<Vec<String>> {
+    let endpoints = normalize_trusted_rpc_endpoints(
+        &request
+            .prompt
+            .as_ref()
+            .map(|prompt| prompt.rpc_endpoints.as_slice())
+            .unwrap_or_default(),
+    )?;
+    if endpoints.is_empty() {
+        return Ok(endpoints);
+    }
+
+    let package_path = model_path
+        .parent()
+        .ok_or_else(|| anyhow!("full model RPC payload has no package directory"))?
+        .join(INFERNET_SHARD_MANIFEST_FILE);
+    let package_bytes = fs::read(&package_path).with_context(|| {
+        format!(
+            "distributed RPC requires a complete Infernet package manifest at {}",
+            package_path.display()
+        )
+    })?;
+    let package = serde_json::from_slice::<InfernetShardPackageManifest>(&package_bytes)
+        .with_context(|| format!("failed to parse {}", package_path.display()))?;
+    let model_size_bytes = fs::metadata(model_path)
+        .with_context(|| format!("failed to inspect {}", model_path.display()))?
+        .len();
+    validate_official_rpc_package(
+        config,
+        layers,
+        request,
+        manifest,
+        &package,
+        model_size_bytes,
+    )?;
+
+    Ok(endpoints)
+}
+
+fn validate_official_rpc_package(
+    config: &WorkerConfig,
+    layers: LayerRange,
+    request: &ActivationRequest,
+    manifest: &SeedShardManifest,
+    package: &InfernetShardPackageManifest,
+    model_size_bytes: u64,
+) -> Result<()> {
+    let official_model = ModelManifest::infernet_chat_v1();
+    let release = OfficialModelRelease::infernet_chat_v1_compatibility();
+    release
+        .validate_for_model(&official_model)
+        .context("pinned Infernet Chat release metadata is invalid")?;
+    let component = release
+        .components
+        .iter()
+        .find(|component| component.layers == Some(layers))
+        .ok_or_else(|| anyhow!("RPC layer range is not part of the pinned official release"))?;
+
+    let single_full_model_hop = request.route.len() == 1
+        && request.current_hop_index == 0
+        && request.next_hop().is_none()
+        && request.activation.is_empty();
+    let exact_model = config.runtime_kind == RuntimeKind::LlamaCpp
+        && config.model_id == official_model.model_id
+        && config.hidden_size == official_model.hidden_size
+        && layers.start == 0
+        && layers.end == official_model.layer_count
+        && manifest.model_id == official_model.model_id
+        && manifest.display_name == official_model.display_name
+        && manifest.architecture == official_model.architecture
+        && manifest.layer_count == official_model.layer_count
+        && manifest.hidden_size == official_model.hidden_size
+        && manifest.activation_dtype == official_model.activation_dtype
+        && manifest.runtime_kind == official_model.runtime_kind
+        && manifest.layers == layers
+        && manifest.metadata.architecture == official_model.architecture
+        && manifest.metadata.quantization.as_deref() == official_model.quantization.as_deref()
+        && manifest.metadata.protocol_version == PROTOCOL_VERSION
+        && manifest.metadata.source_checksum.as_deref()
+            == Some(release.upstream.source_sha256.as_str())
+        && manifest.source.checksum_sha256 == release.upstream.source_sha256
+        && manifest.source.file_size_bytes == release.expected_total_bytes
+        && manifest.payload_kind == PAYLOAD_KIND_FULL_MODEL;
+    let exact_package = package.format_version == INFERNET_SHARD_FORMAT_VERSION
+        && package.runtime_abi == INFERNET_FULL_MODEL_RUNTIME_ABI
+        && package.component == "full_model"
+        && package.seed_manifest == *manifest
+        && package.payload.kind == "gguf_tensor_payload"
+        && package.payload.file == INFERNET_SHARD_TENSOR_FILE
+        && package.payload.checksum_sha256 == component.sha256
+        && package.payload.size_bytes == component.size_bytes
+        && model_size_bytes == component.size_bytes;
+
+    if !single_full_model_hop || !exact_model || !exact_package {
+        bail!(
+            "distributed llama RPC requires the exact pinned {} full-model package on a single coordinator hop",
+            release.release_id
+        );
+    }
+
+    Ok(())
+}
+
+fn append_llama_rpc_arguments(command: &mut Command, endpoints: &[String]) {
+    if !endpoints.is_empty() {
+        command.arg("--rpc").arg(endpoints.join(","));
+    }
 }
 
 fn constrain_llama_bridge_library_threads(command: &mut Command) {
@@ -2253,6 +2586,8 @@ fn handle_cached_activation_event(
     activation_relays: &[NodeAdvertisement],
     network_event: ActivationNetworkEvent,
     pending_forwards: &mut HashMap<request_response::OutboundRequestId, PendingOutbound>,
+    completion_sender: &mpsc::UnboundedSender<CompletedLocalActivation>,
+    pending_local_activations: &mut HashMap<uuid::Uuid, PendingLocalActivation>,
 ) -> Result<()> {
     match network_event {
         ActivationNetworkEvent::Request { request, channel } => {
@@ -2264,6 +2599,8 @@ fn handle_cached_activation_event(
                 request,
                 channel,
                 pending_forwards,
+                completion_sender,
+                pending_local_activations,
             )?;
         }
         ActivationNetworkEvent::Response {
@@ -2310,47 +2647,86 @@ fn handle_cached_activation_request(
     cache: &ShardCache,
     peer_id: &str,
     activation_relays: &[NodeAdvertisement],
-    mut request: ActivationRequest,
+    request: ActivationRequest,
     channel: request_response::ResponseChannel<ActivationResponse>,
     pending_forwards: &mut HashMap<request_response::OutboundRequestId, PendingOutbound>,
+    completion_sender: &mpsc::UnboundedSender<CompletedLocalActivation>,
+    pending_local_activations: &mut HashMap<uuid::Uuid, PendingLocalActivation>,
 ) -> Result<()> {
-    loop {
-        let trace_id = request.trace_id;
-        if request
-            .current_hop()
-            .is_some_and(|hop| hop.peer_id != peer_id)
-        {
-            return forward_activation_request(
+    let trace_id = request.trace_id;
+    if request
+        .current_hop()
+        .is_some_and(|hop| hop.peer_id != peer_id)
+    {
+        return forward_activation_request(
+            swarm,
+            peer_id,
+            activation_relays,
+            request,
+            channel,
+            pending_forwards,
+        );
+    }
+
+    if !pending_local_activations.is_empty() {
+        send_response(
+            swarm,
+            channel,
+            ActivationResponse::failure(
+                trace_id,
+                peer_id.to_owned(),
+                "the model coordinator is already processing a request".to_owned(),
+                request.trace,
+            ),
+        );
+        return Ok(());
+    }
+
+    let worker = match worker_config_for_activation(cache, peer_id, &request) {
+        Ok(worker) => worker,
+        Err(error) => {
+            send_response(
                 swarm,
-                peer_id,
-                activation_relays,
-                request,
                 channel,
-                pending_forwards,
+                ActivationResponse::failure(
+                    trace_id,
+                    peer_id.to_owned(),
+                    error.to_string(),
+                    request.trace,
+                ),
             );
+            return Ok(());
         }
+    };
 
-        let worker = match worker_config_for_activation(cache, peer_id, &request) {
-            Ok(worker) => worker,
-            Err(error) => {
-                send_response(
-                    swarm,
-                    channel,
-                    ActivationResponse::failure(
-                        trace_id,
-                        peer_id.to_owned(),
-                        error.to_string(),
-                        request.trace,
-                    ),
-                );
-                return Ok(());
-            }
-        };
+    let job_id = uuid::Uuid::new_v4();
+    pending_local_activations.insert(
+        job_id,
+        PendingLocalActivation {
+            channel,
+            peer_id: peer_id.to_owned(),
+        },
+    );
+    let completion_sender = completion_sender.clone();
+    let peer_id = peer_id.to_owned();
+    set_local_inference_active(true);
+    tokio::task::spawn_blocking(move || {
+        let outcome = process_local_activation_steps(&worker, &peer_id, request);
+        let _ = completion_sender.unbounded_send(CompletedLocalActivation { job_id, outcome });
+    });
 
-        match process_activation_step(&worker, request) {
-            Ok(ActivationStep::Final(response)) => {
-                send_response(swarm, channel, response);
-                return Ok(());
+    Ok(())
+}
+
+fn process_local_activation_steps(
+    worker: &WorkerConfig,
+    peer_id: &str,
+    mut request: ActivationRequest,
+) -> LocalActivationOutcome {
+    loop {
+        match process_activation_step(worker, request) {
+            Ok(ActivationStep::Final(response)) | Err(response) => {
+                return LocalActivationOutcome::Response(response);
             }
             Ok(ActivationStep::Forward(next_request)) => {
                 if next_request
@@ -2358,22 +2734,38 @@ fn handle_cached_activation_request(
                     .is_some_and(|hop| hop.peer_id == peer_id)
                 {
                     request = next_request;
-                    continue;
+                } else {
+                    return LocalActivationOutcome::Forward(next_request);
                 }
-                return forward_activation_request(
-                    swarm,
-                    peer_id,
-                    activation_relays,
-                    next_request,
-                    channel,
-                    pending_forwards,
-                );
-            }
-            Err(response) => {
-                send_response(swarm, channel, response);
-                return Ok(());
             }
         }
+    }
+}
+
+fn handle_completed_local_activation(
+    swarm: &mut Swarm<GridBehaviour>,
+    activation_relays: &[NodeAdvertisement],
+    completed: CompletedLocalActivation,
+    pending_local_activations: &mut HashMap<uuid::Uuid, PendingLocalActivation>,
+    pending_forwards: &mut HashMap<request_response::OutboundRequestId, PendingOutbound>,
+) -> Result<()> {
+    let Some(pending) = pending_local_activations.remove(&completed.job_id) else {
+        return Ok(());
+    };
+    set_local_inference_active(false);
+    match completed.outcome {
+        LocalActivationOutcome::Response(response) => {
+            send_response(swarm, pending.channel, response);
+            Ok(())
+        }
+        LocalActivationOutcome::Forward(request) => forward_activation_request(
+            swarm,
+            &pending.peer_id,
+            activation_relays,
+            request,
+            pending.channel,
+            pending_forwards,
+        ),
     }
 }
 
@@ -3099,7 +3491,7 @@ fn build_grid_swarm(
                 // previous five-second transport deadline guaranteed failure while
                 // the worker kept computing after the client had already given up.
                 request_response::Config::default()
-                    .with_request_timeout(Duration::from_secs(16 * 60)),
+                    .with_request_timeout(Duration::from_secs(20 * 60)),
             );
             let model = request_response::json::Behaviour::new(
                 [(
@@ -3418,6 +3810,210 @@ mod tests {
             peer_id.to_owned(),
             format!("/ip4/203.0.113.10/tcp/9777/p2p/{peer_id}"),
         )
+    }
+
+    fn official_rpc_fixture() -> (
+        WorkerConfig,
+        LayerRange,
+        ActivationRequest,
+        SeedShardManifest,
+        InfernetShardPackageManifest,
+    ) {
+        let model = ModelManifest::infernet_chat_v1();
+        let release = OfficialModelRelease::infernet_chat_v1_compatibility();
+        let layers = LayerRange::new(0, model.layer_count).unwrap();
+        let component = release
+            .components
+            .iter()
+            .find(|component| component.layers == Some(layers))
+            .unwrap();
+        let manifest = SeedShardManifest {
+            model_id: model.model_id.clone(),
+            display_name: model.display_name.clone(),
+            architecture: model.architecture.clone(),
+            layer_count: model.layer_count,
+            hidden_size: model.hidden_size,
+            activation_dtype: model.activation_dtype.clone(),
+            runtime_kind: model.runtime_kind.clone(),
+            layers,
+            tokenizer: infernet_model::TokenizerCompatibility {
+                family: "gemma".to_owned(),
+                checksum: None,
+            },
+            metadata: infernet_model::ShardMetadata {
+                architecture: model.architecture.clone(),
+                quantization: model.quantization.clone(),
+                source_checksum: Some(release.upstream.source_sha256.clone()),
+                protocol_version: PROTOCOL_VERSION,
+            },
+            source: infernet_model::SeedSourceMetadata {
+                path: "/official/infernet-chat-v1.gguf".to_owned(),
+                checksum_sha256: release.upstream.source_sha256.clone(),
+                file_size_bytes: release.expected_total_bytes,
+            },
+            shard_hash: "official-full-model-shard".to_owned(),
+            payload_kind: PAYLOAD_KIND_FULL_MODEL.to_owned(),
+        };
+        let package = InfernetShardPackageManifest {
+            format_version: INFERNET_SHARD_FORMAT_VERSION.to_owned(),
+            runtime_abi: INFERNET_FULL_MODEL_RUNTIME_ABI.to_owned(),
+            component: "full_model".to_owned(),
+            seed_manifest: manifest.clone(),
+            payload: InfernetShardPayloadManifest {
+                kind: "gguf_tensor_payload".to_owned(),
+                file: INFERNET_SHARD_TENSOR_FILE.to_owned(),
+                checksum_sha256: component.sha256.clone(),
+                size_bytes: component.size_bytes,
+            },
+        };
+        let request = ActivationRequest::new(
+            model.model_id.clone(),
+            vec![hop("coordinator", layers.start, layers.end)],
+            model.hidden_size,
+            Vec::new(),
+            Some(PromptMetadata {
+                prompt: "hello".to_owned(),
+                demo_mode: false,
+                rpc_endpoints: vec!["192.168.1.20:50052".to_owned()],
+            }),
+        );
+        let worker = WorkerConfig {
+            peer_id: "coordinator".to_owned(),
+            model_id: model.model_id,
+            runtime_kind: model.runtime_kind,
+            owned_layers: layers,
+            hidden_size: model.hidden_size,
+            shard_cache: None,
+        };
+
+        (worker, layers, request, manifest, package)
+    }
+
+    #[test]
+    fn discovery_config_has_no_rpc_backends_by_default() {
+        assert!(
+            DiscoveryConfig::new("infernet/test")
+                .rpc_endpoints
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn trusted_rpc_endpoints_are_canonicalized_and_deduplicated() {
+        let endpoints = normalize_trusted_rpc_endpoints(&[
+            " 192.168.1.20:50052 ".to_owned(),
+            "192.168.1.20:50052".to_owned(),
+            "100.64.2.3:6000".to_owned(),
+            "169.254.10.8:50052".to_owned(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            endpoints,
+            [
+                "192.168.1.20:50052",
+                "100.64.2.3:6000",
+                "169.254.10.8:50052",
+            ]
+        );
+    }
+
+    #[test]
+    fn rpc_endpoints_reject_public_dns_and_malformed_targets() {
+        for endpoint in [
+            "8.8.8.8:50052",
+            "worker.example.com:50052",
+            "127.0.0.1:50052",
+            "[::1]:50052",
+            "192.168.1.20:0",
+            "192.168.1.20:not-a-port",
+        ] {
+            assert!(
+                normalize_trusted_rpc_endpoints(&[endpoint.to_owned()]).is_err(),
+                "accepted unsafe RPC endpoint {endpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn rpc_execution_accepts_exact_official_single_hop_package() {
+        let (worker, layers, request, manifest, package) = official_rpc_fixture();
+        let release = OfficialModelRelease::infernet_chat_v1_compatibility();
+
+        validate_official_rpc_package(
+            &worker,
+            layers,
+            &request,
+            &manifest,
+            &package,
+            release.expected_total_bytes,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rpc_execution_rejects_partial_multihop_and_incompatible_packages() {
+        let (worker, layers, request, manifest, package) = official_rpc_fixture();
+        let release = OfficialModelRelease::infernet_chat_v1_compatibility();
+
+        let partial_layers = LayerRange::new(0, layers.end - 1).unwrap();
+        assert!(
+            validate_official_rpc_package(
+                &worker,
+                partial_layers,
+                &request,
+                &manifest,
+                &package,
+                release.expected_total_bytes,
+            )
+            .is_err()
+        );
+
+        let mut multihop = request.clone();
+        multihop.route.push(hop("unexpected-peer", 0, 1));
+        assert!(
+            validate_official_rpc_package(
+                &worker,
+                layers,
+                &multihop,
+                &manifest,
+                &package,
+                release.expected_total_bytes,
+            )
+            .is_err()
+        );
+
+        let mut incompatible = package.clone();
+        incompatible.runtime_abi = "wrong-runtime-abi".to_owned();
+        assert!(
+            validate_official_rpc_package(
+                &worker,
+                layers,
+                &request,
+                &manifest,
+                &incompatible,
+                release.expected_total_bytes,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn llama_bridge_receives_one_rpc_comma_list() {
+        let mut command = Command::new("infernet-llama-bridge");
+        append_llama_rpc_arguments(
+            &mut command,
+            &[
+                "192.168.1.20:50052".to_owned(),
+                "100.64.2.3:50052".to_owned(),
+            ],
+        );
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(args, ["--rpc", "192.168.1.20:50052,100.64.2.3:50052"]);
     }
 
     #[cfg(unix)]

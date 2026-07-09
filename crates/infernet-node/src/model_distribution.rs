@@ -584,13 +584,14 @@ impl ShardCache {
                     .with_context(|| format!("failed to read {}", meta_path.display()));
             }
         };
+        let mut source_was_renamed = false;
         let result: Result<CachedShardRecord> = (|| {
             fs::create_dir_all(self.config.root.join("data"))?;
             fs::create_dir_all(self.config.root.join("meta"))?;
             prepare_data_path(&data_path)?;
             if remove_source_after_copy {
                 match fs::rename(source, &data_path) {
-                    Ok(()) => {}
+                    Ok(()) => source_was_renamed = true,
                     Err(_) => {
                         fs::copy(source, &data_path).with_context(|| {
                             format!(
@@ -599,7 +600,6 @@ impl ShardCache {
                                 data_path.display()
                             )
                         })?;
-                        let _ = fs::remove_file(source);
                     }
                 }
             } else {
@@ -631,6 +631,9 @@ impl ShardCache {
         })();
 
         if result.is_err() {
+            if source_was_renamed && data_path.is_file() {
+                let _ = fs::rename(&data_path, source);
+            }
             let _ = remove_cached_payload_path(&data_path);
             if let Some(backup) = &backup_root {
                 let _ = fs::rename(backup, &data_root);
@@ -643,8 +646,13 @@ impl ShardCache {
                     let _ = fs::remove_file(&meta_path);
                 }
             }
-        } else if let Some(backup) = &backup_root {
-            let _ = remove_any_path(backup);
+        } else {
+            if remove_source_after_copy && !source_was_renamed {
+                let _ = fs::remove_file(source);
+            }
+            if let Some(backup) = &backup_root {
+                let _ = remove_any_path(backup);
+            }
         }
 
         result
@@ -1068,6 +1076,7 @@ pub fn import_seed_model_from_file(
         source,
         manifest,
         version,
+        false,
         |_, _| {},
         |_| {},
     )
@@ -1085,7 +1094,60 @@ pub fn import_seed_model_from_file_with_progress(
         source,
         manifest,
         version,
+        false,
         &mut on_hash_progress,
+        |_| {},
+    )
+}
+
+/// Verifies and adopts a complete model source into the Infernet cache.
+///
+/// On success the source path is consumed, so the coordinator keeps exactly
+/// one model payload instead of a second 14+ GB import copy. The cache store
+/// restores the source if committing package metadata fails.
+pub fn import_seed_model_from_file_consuming(
+    cache: &ShardCache,
+    source: &Path,
+    manifest: &ModelManifest,
+    version: impl Into<String>,
+) -> Result<SeededModelSummary> {
+    import_seed_model_from_file_with_build_progress(
+        cache,
+        source,
+        manifest,
+        version,
+        true,
+        |_, _| {},
+        |_| {},
+    )
+}
+
+/// Adopts a complete model source after the caller has already verified its
+/// SHA-256 checksum. This avoids hashing an official multi-gigabyte artifact a
+/// second time between verification and the atomic cache commit.
+pub fn import_seed_model_from_file_consuming_verified(
+    cache: &ShardCache,
+    source: &Path,
+    manifest: &ModelManifest,
+    version: impl Into<String>,
+    verified_source_checksum: impl Into<String>,
+) -> Result<SeededModelSummary> {
+    let verified_source_checksum = verified_source_checksum.into().to_ascii_lowercase();
+    if verified_source_checksum.len() != 64
+        || !verified_source_checksum
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        bail!("verified source checksum must be a 64-character SHA-256 digest");
+    }
+    import_seed_model_from_file_with_build_progress_and_checksum(
+        cache,
+        source,
+        manifest,
+        version,
+        true,
+        Some(verified_source_checksum),
+        |_, _| {},
         |_| {},
     )
 }
@@ -1095,6 +1157,29 @@ pub fn import_seed_model_from_file_with_build_progress(
     source: &Path,
     manifest: &ModelManifest,
     version: impl Into<String>,
+    consume_source: bool,
+    mut on_hash_progress: impl FnMut(u64, u64),
+    mut on_shard_progress: impl FnMut(SeedShardBuildProgress),
+) -> Result<SeededModelSummary> {
+    import_seed_model_from_file_with_build_progress_and_checksum(
+        cache,
+        source,
+        manifest,
+        version,
+        consume_source,
+        None,
+        &mut on_hash_progress,
+        &mut on_shard_progress,
+    )
+}
+
+fn import_seed_model_from_file_with_build_progress_and_checksum(
+    cache: &ShardCache,
+    source: &Path,
+    manifest: &ModelManifest,
+    version: impl Into<String>,
+    consume_source: bool,
+    verified_source_checksum: Option<String>,
     mut on_hash_progress: impl FnMut(u64, u64),
     mut on_shard_progress: impl FnMut(SeedShardBuildProgress),
 ) -> Result<SeededModelSummary> {
@@ -1133,17 +1218,29 @@ pub fn import_seed_model_from_file_with_build_progress(
             .with_context(|| format!("failed to create {}", temp_root.display()))?;
         let staged = temp_root.join("model.gguf");
         let result = (|| -> Result<(CachedShardRecord, String)> {
-            clone_or_copy_file(source, &staged, |written_bytes, total_bytes| {
+            let payload_path = if consume_source {
                 on_shard_progress(SeedShardBuildProgress {
                     shard_index: 1,
                     shard_count: 1,
                     layers: full_range,
-                    written_bytes,
-                    total_bytes,
+                    written_bytes: source_size_bytes,
+                    total_bytes: source_size_bytes,
                 });
-            })?;
-            let staged_size = fs::metadata(&staged)
-                .with_context(|| format!("failed to inspect {}", staged.display()))?
+                source
+            } else {
+                clone_or_copy_file(source, &staged, |written_bytes, total_bytes| {
+                    on_shard_progress(SeedShardBuildProgress {
+                        shard_index: 1,
+                        shard_count: 1,
+                        layers: full_range,
+                        written_bytes,
+                        total_bytes,
+                    });
+                })?;
+                staged.as_path()
+            };
+            let staged_size = fs::metadata(payload_path)
+                .with_context(|| format!("failed to inspect {}", payload_path.display()))?
                 .len();
             if staged_size != source_size_bytes {
                 bail!(
@@ -1152,16 +1249,20 @@ pub fn import_seed_model_from_file_with_build_progress(
                     staged_size
                 );
             }
-            validate_gguf_matches_manifest(&staged, manifest)?;
-            let source_checksum =
-                sha256_file_with_progress(&staged, staged_size, &mut on_hash_progress)?;
+            validate_gguf_matches_manifest(payload_path, manifest)?;
+            let source_checksum = match verified_source_checksum.as_ref() {
+                Some(checksum) => checksum.clone(),
+                None => {
+                    sha256_file_with_progress(payload_path, staged_size, &mut on_hash_progress)?
+                }
+            };
             let source_metadata = SeedSourceMetadata {
                 path: source.display().to_string(),
                 checksum_sha256: source_checksum.clone(),
                 file_size_bytes: staged_size,
             };
             let record = cache.commit_verified_staged_shard_file(
-                &staged,
+                payload_path,
                 manifest.model_id.clone(),
                 full_range,
                 version.clone(),
@@ -1188,8 +1289,10 @@ pub fn import_seed_model_from_file_with_build_progress(
             records: vec![record],
         });
     }
-    let source_checksum =
-        sha256_file_with_progress(source, source_size_bytes, &mut on_hash_progress)?;
+    let source_checksum = match verified_source_checksum.as_ref() {
+        Some(checksum) => checksum.clone(),
+        None => sha256_file_with_progress(source, source_size_bytes, &mut on_hash_progress)?,
+    };
     let source_metadata = SeedSourceMetadata {
         path: source.display().to_string(),
         checksum_sha256: source_checksum.clone(),
@@ -1694,6 +1797,34 @@ mod tests {
         let cached_before = fs::read(&summary.records[0].path).unwrap();
         fs::write(&source, vec![0_u8; cached_before.len()]).unwrap();
         assert_eq!(fs::read(&summary.records[0].path).unwrap(), cached_before);
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn consuming_full_model_import_leaves_exactly_one_payload() {
+        let temp = std::env::temp_dir().join(format!(
+            "infernet-consuming-model-import-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        let source = temp.join("qwen35-test.gguf");
+        write_test_gguf(&source, "qwen35", 32, 1024).unwrap();
+        let source_size = fs::metadata(&source).unwrap().len();
+        let cache = ShardCache::new(ShardCacheConfig::new(temp.join("cache"))).unwrap();
+        let manifest = test_model_manifest("qwen35", 32, 1024);
+
+        let summary =
+            import_seed_model_from_file_consuming(&cache, &source, &manifest, "v1").unwrap();
+
+        assert!(
+            !source.exists(),
+            "consumed source must not remain duplicated"
+        );
+        assert_eq!(summary.records.len(), 1);
+        assert_eq!(summary.records[0].info.size_bytes, source_size);
+        assert!(summary.records[0].path.is_file());
+        assert_eq!(cache.stats().unwrap().storage_used_bytes, source_size);
 
         let _ = fs::remove_dir_all(temp);
     }

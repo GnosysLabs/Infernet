@@ -47,6 +47,17 @@ export interface MachineView {
   measuredPrefillTokensPerSecond?: number | null;
   measuredDecodeTokensPerSecond?: number | null;
   hostedComponentCount: number;
+  rpcReady: boolean;
+}
+
+export interface ExecutionParticipantView {
+  peerId: string;
+  shortPeerId: string;
+  role: "coordinator" | "worker";
+  computeBackend: string;
+  deviceName: string;
+  availableMemoryBytes: number;
+  estimatedSharePercent: number;
 }
 
 export interface RouteHopView {
@@ -123,6 +134,7 @@ export interface ModelImportProgress {
 
 export type ProgressEvent =
   | { type: "routeDiscovered"; route: RouteHopView[] }
+  | { type: "executionPlan"; participants: ExecutionParticipantView[] }
   | {
       type: "hopStarted";
       traceId: string;

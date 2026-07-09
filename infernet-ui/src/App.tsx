@@ -27,6 +27,7 @@ import {
   runDistributedInference,
 } from "./api";
 import type {
+  ExecutionParticipantView,
   GridSnapshot,
   HopProgress,
   LocalIdentity,
@@ -63,6 +64,8 @@ export default function App() {
   const [lastRunDurationMs, setLastRunDurationMs] = useState<number | null>(null);
   const [hops, setHops] = useState<HopProgress[]>([]);
   const [route, setRoute] = useState<RouteHopView[]>([]);
+  const [executionPlan, setExecutionPlan] = useState<ExecutionParticipantView[]>([]);
+  const [executionConfirmed, setExecutionConfirmed] = useState(false);
   const [lastError, setLastError] = useState<string | null>(null);
   const [transferActivities, setTransferActivities] = useState<TransferActivity[]>([]);
   const [installingModelId, setInstallingModelId] = useState<string | null>(null);
@@ -97,6 +100,14 @@ export default function App() {
       return;
     }
 
+    if (event.type === "executionPlan") {
+      setExecutionPlan(event.participants);
+      setExecutionConfirmed(false);
+      setStatus("Starting distributed model");
+      setLastError(null);
+      return;
+    }
+
     if (event.type === "hopStarted") {
       setHops((current) => upsertHop(current, event, "running"));
       setStatus("Running model");
@@ -110,12 +121,15 @@ export default function App() {
     }
 
     if (event.type === "finalOutput") {
+      setExecutionConfirmed(true);
       setStatus("Ready");
       setIsRunning(false);
       return;
     }
 
     if (event.type === "error") {
+      setExecutionConfirmed(false);
+      setExecutionPlan([]);
       setLastError(event.message);
       setStatus("Needs attention");
       setIsRunning(false);
@@ -229,6 +243,8 @@ export default function App() {
     setPage("chat");
     setRoute([]);
     setHops([]);
+    setExecutionPlan([]);
+    setExecutionConfirmed(false);
     setLastError(null);
     setStatus("Connecting");
   }
@@ -257,6 +273,7 @@ export default function App() {
     if (!userPrompt || isRunning) {
       return;
     }
+
     if (!selectedModelView) {
       setLastError("Install Infernet Chat before sending a message.");
       setStatus("No models");
@@ -278,6 +295,8 @@ export default function App() {
     setLastError(null);
     setStatus("Finding available compute");
     setHops([]);
+    setExecutionPlan([]);
+    setExecutionConfirmed(false);
 
     try {
       const output = (await runDistributedInference(userPrompt, selectedModel)).output;
@@ -289,6 +308,8 @@ export default function App() {
       setStatus("Ready");
     } catch (error) {
       const message = String(error);
+      setExecutionPlan([]);
+      setExecutionConfirmed(false);
       setLastError(message);
       setStatus("Needs attention");
     } finally {
@@ -363,6 +384,8 @@ export default function App() {
           snapshot={snapshot}
           model={selectedModelView}
           route={activeRoute}
+          executionPlan={executionPlan}
+          executionConfirmed={executionConfirmed}
           hops={hops}
           transferActivities={transferActivities}
           status={status}
@@ -608,6 +631,8 @@ function ActivitySidebar({
   snapshot,
   model,
   route,
+  executionPlan,
+  executionConfirmed,
   hops,
   transferActivities,
   status,
@@ -622,6 +647,8 @@ function ActivitySidebar({
   snapshot: GridSnapshot;
   model?: ModelView;
   route: RouteHopView[];
+  executionPlan: ExecutionParticipantView[];
+  executionConfirmed: boolean;
   hops: HopProgress[];
   transferActivities: TransferActivity[];
   status: string;
@@ -639,7 +666,11 @@ function ActivitySidebar({
   const computeMs = hops.reduce((total, hop) => total + (hop.timingMs ?? 0), 0);
   const activeTransfers = transferActivities.filter((activity) => activity.status === "active");
   const recentTransfer = transferActivities.find((activity) => activity.status !== "active");
-  const location = peerIds.length === 0
+  const location = executionPlan.length > 0
+    ? executionConfirmed
+      ? `${executionPlan.length} computers completed the last response`
+      : `Planned across ${executionPlan.length} computers`
+    : peerIds.length === 0
     ? isRunning ? "Choosing a computer" : "Not used yet"
     : ranLocally
       ? "This Mac"
@@ -679,6 +710,10 @@ function ActivitySidebar({
             <ActivityDataRow
               label="Other computers online"
               value={String(snapshot.networkPeerCount)}
+            />
+            <ActivityDataRow
+              label="Distributed workers ready"
+              value={String(snapshot.machines.filter((machine) => machine.rpcReady).length)}
             />
           </dl>
         </section>
@@ -720,7 +755,15 @@ function ActivitySidebar({
                     <span>{machineLoadLabel(machine.activeSessions, machine.maxSessions, machine.queueDepth)}</span>
                   </div>
                   <span className="machine-role">
-                    {machineRoleLabel(machine.peerId, machine.hostedComponentCount, route, isRunning)}
+                    {machineRoleLabel(
+                      machine.peerId,
+                      machine.hostedComponentCount,
+                      machine.rpcReady,
+                      route,
+                      executionPlan,
+                      executionConfirmed,
+                      isRunning,
+                    )}
                   </span>
                   {developerMode ? <code>{machine.peerId}</code> : null}
                 </div>
@@ -770,6 +813,7 @@ function ActivitySidebar({
             <summary>Technical details</summary>
             <div className="technical-detail-list">
               <code>Local peer: {identity?.peerId ?? snapshot.localPeerId ?? "starting"}</code>
+              {lastError ? <code>Last error: {lastError}</code> : null}
               {route.length === 0 ? <span>No execution route selected.</span> : route.map((hop) => {
                 const progress = hops.find((item) => item.key === hopKey(hop.peerId, hop.layerStart, hop.layerEnd));
                 return (
@@ -1334,9 +1378,23 @@ function machineLoadLabel(activeSessions: number, maxSessions: number, queueDept
 function machineRoleLabel(
   peerId: string,
   hostedComponentCount: number,
+  rpcReady: boolean,
   route: RouteHopView[],
+  executionPlan: ExecutionParticipantView[],
+  executionConfirmed: boolean,
   isRunning: boolean,
 ): string {
+  const participant = executionPlan.find((item) => item.peerId === peerId);
+  if (participant?.role === "coordinator") {
+    return executionConfirmed
+      ? `Coordinated last response · ≈${participant.estimatedSharePercent}% share`
+      : `Planned coordinator · ≈${participant.estimatedSharePercent}% share`;
+  }
+  if (participant) {
+    return executionConfirmed
+      ? `Used in last response · ≈${participant.estimatedSharePercent}% share`
+      : `Planned worker · ≈${participant.estimatedSharePercent}% share`;
+  }
   const assignment = route.find((hop) => hop.peerId === peerId);
   if (assignment && isRunning) {
     return `Working on layers ${assignment.layerStart + 1}–${assignment.layerEnd}`;
@@ -1347,11 +1405,23 @@ function machineRoleLabel(
   if (hostedComponentCount > 0) {
     return `Stores ${hostedComponentCount} verified model part${hostedComponentCount === 1 ? "" : "s"}`;
   }
-  return "Ready to receive a model part";
+  return rpcReady ? "Ready for distributed inference" : "Compute service unavailable";
 }
 
 function friendlyActivityError(error: string): string {
   const normalized = error.toLowerCase();
+  if (normalized.includes("at least one other gpu") || normalized.includes("distributed inference needs")) {
+    return "Infernet Chat needs one model coordinator and at least one other CUDA or Apple-silicon computer online.";
+  }
+  if (normalized.includes("compute service") || normalized.includes("rpc worker")) {
+    return "A computer is online, but its distributed compute service is not ready. Restart Infernet on that computer.";
+  }
+  if (normalized.includes("safe model memory") || normalized.includes("enough free memory")) {
+    return "The connected computers do not currently have enough free GPU or unified memory for Infernet Chat.";
+  }
+  if (normalized.includes("incompatible") || normalized.includes("pinned protocol")) {
+    return "One computer is running an incompatible Infernet build. Update or rebuild Infernet on every machine.";
+  }
   if (normalized.includes("timed out") || normalized.includes("timeout")) {
     return "The model took too long to respond. Try again in a moment.";
   }

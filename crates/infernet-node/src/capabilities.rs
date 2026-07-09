@@ -1,15 +1,24 @@
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
 use std::fs;
 
-use infernet_protocol::NodeCapabilities;
+use infernet_protocol::{LlamaRpcEndpoint, NodeCapabilities};
+use sha2::{Digest, Sha256};
 
 const KIBIBYTE: u64 = 1024;
 const MEBIBYTE: u64 = 1024 * KIBIBYTE;
 const AVAILABLE_MEMORY_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+pub const PINNED_GGML_RPC_PROTOCOL_VERSION: &str = "4.0.1";
+
+const LLAMA_RPC_HOST_ENV: &str = "INFERNET_LLAMA_RPC_HOST";
+const LLAMA_RPC_PORT_ENV: &str = "INFERNET_LLAMA_RPC_PORT";
+const LLAMA_RPC_RUNTIME_ABI_ENV: &str = "INFERNET_LLAMA_RPC_RUNTIME_ABI";
+const LLAMA_RPC_BACKEND_ENV: &str = "INFERNET_LLAMA_RPC_BACKEND";
+const LLAMA_RPC_READY_ENV: &str = "INFERNET_LLAMA_RPC_READY";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MemoryStats {
@@ -42,6 +51,27 @@ struct AvailableMemoryCache {
     last_refresh: Instant,
 }
 
+#[derive(Debug, Default)]
+struct LocalLlamaRpcState {
+    override_configured: bool,
+    endpoint: Option<LlamaRpcEndpoint>,
+}
+
+impl LocalLlamaRpcState {
+    fn set(&mut self, endpoint: Option<LlamaRpcEndpoint>) {
+        self.override_configured = true;
+        self.endpoint = endpoint;
+    }
+
+    fn resolve(&self, configured: Option<LlamaRpcEndpoint>) -> Option<LlamaRpcEndpoint> {
+        if self.override_configured {
+            self.endpoint.clone()
+        } else {
+            configured
+        }
+    }
+}
+
 impl AvailableMemoryCache {
     fn refresh_if_due(
         &mut self,
@@ -67,6 +97,9 @@ impl AvailableMemoryCache {
 
 static DETECTED_HARDWARE: OnceLock<NodeCapabilities> = OnceLock::new();
 static AVAILABLE_MEMORY: OnceLock<Mutex<AvailableMemoryCache>> = OnceLock::new();
+static LOCAL_LLAMA_RPC: OnceLock<Mutex<LocalLlamaRpcState>> = OnceLock::new();
+static LOCAL_INFERENCE_ACTIVE: AtomicBool = AtomicBool::new(false);
+static LOCAL_RPC_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Detects the hardware resources this node can offer without assuming any
 /// optional system command is installed. Unknown values are reported as zero.
@@ -83,10 +116,68 @@ pub fn detect_node_capabilities() -> NodeCapabilities {
         .unwrap_or(capabilities.max_sessions)
         .max(1);
     capabilities.active_sessions = configured_u32("INFERNET_ACTIVE_SESSIONS")
-        .unwrap_or(0)
+        .unwrap_or_else(|| {
+            u32::from(
+                LOCAL_INFERENCE_ACTIVE.load(Ordering::Relaxed)
+                    || LOCAL_RPC_ACTIVE.load(Ordering::Relaxed),
+            )
+        })
         .min(capabilities.max_sessions);
     capabilities.queue_depth = configured_u32("INFERNET_QUEUE_DEPTH").unwrap_or(0);
+    capabilities.llama_rpc = local_llama_rpc_endpoint();
     capabilities
+}
+
+pub fn set_local_inference_active(active: bool) {
+    LOCAL_INFERENCE_ACTIVE.store(active, Ordering::Relaxed);
+}
+
+pub fn set_local_rpc_active(active: bool) {
+    LOCAL_RPC_ACTIVE.store(active, Ordering::Relaxed);
+}
+
+/// Sets the process-local RPC endpoint state advertised by this node. Passing
+/// `None` explicitly clears readiness and suppresses any startup environment
+/// fallback. A supervisor should set a ready endpoint only after its sidecar
+/// has completed a readiness check.
+pub fn set_local_llama_rpc_endpoint(endpoint: Option<LlamaRpcEndpoint>) -> Result<(), String> {
+    if let Some(endpoint) = &endpoint {
+        validate_llama_rpc_endpoint(endpoint)?;
+    }
+
+    let state = LOCAL_LLAMA_RPC.get_or_init(|| Mutex::new(LocalLlamaRpcState::default()));
+    state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .set(endpoint);
+    Ok(())
+}
+
+pub fn clear_local_llama_rpc_endpoint() {
+    // Clearing cannot fail validation.
+    let _ = set_local_llama_rpc_endpoint(None);
+}
+
+fn local_llama_rpc_endpoint() -> Option<LlamaRpcEndpoint> {
+    let configured = configured_llama_rpc_endpoint();
+    let state = LOCAL_LLAMA_RPC.get_or_init(|| Mutex::new(LocalLlamaRpcState::default()));
+    state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .resolve(configured)
+}
+
+/// Returns an advertised llama.cpp RPC endpoint only when its network address,
+/// runtime ABI, and exposed backend were explicitly configured. Hardware
+/// detection alone never creates an execution endpoint or marks one ready.
+pub fn configured_llama_rpc_endpoint() -> Option<LlamaRpcEndpoint> {
+    llama_rpc_endpoint_from_config(
+        std::env::var(LLAMA_RPC_HOST_ENV).ok().as_deref(),
+        std::env::var(LLAMA_RPC_PORT_ENV).ok().as_deref(),
+        std::env::var(LLAMA_RPC_RUNTIME_ABI_ENV).ok().as_deref(),
+        std::env::var(LLAMA_RPC_BACKEND_ENV).ok().as_deref(),
+        std::env::var(LLAMA_RPC_READY_ENV).ok().as_deref(),
+    )
 }
 
 fn detect_available_memory(capabilities: &NodeCapabilities) -> AvailableMemory {
@@ -138,6 +229,7 @@ fn detect_static_hardware() -> NodeCapabilities {
         arch,
         compute_backend: "cpu".to_owned(),
         device_name: cpu_name,
+        machine_id: detect_machine_id(),
         logical_cpu_cores,
         total_ram_bytes: memory.total_bytes,
         available_ram_bytes: memory.available_bytes,
@@ -149,6 +241,7 @@ fn detect_static_hardware() -> NodeCapabilities {
         measured_prefill_tokens_per_second: None,
         measured_decode_tokens_per_second: None,
         queue_depth: 0,
+        llama_rpc: None,
     };
 
     if let Some(device) = detect_nvidia_device() {
@@ -168,8 +261,134 @@ fn detect_static_hardware() -> NodeCapabilities {
     capabilities
 }
 
+fn detect_machine_id() -> Option<String> {
+    let raw = std::env::var("INFERNET_MACHINE_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(platform_machine_id)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"infernet-machine-v1\0");
+    hasher.update(raw.trim().as_bytes());
+    Some(
+        hasher
+            .finalize()
+            .iter()
+            .take(16)
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
+}
+
+fn platform_machine_id() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        return fs::read_to_string("/etc/machine-id").ok();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = command_stdout("ioreg", &["-rd1", "-c", "IOPlatformExpertDevice"])?;
+        return output.lines().find_map(|line| {
+            let (_, value) = line.split_once("IOPlatformUUID")?;
+            value
+                .split('"')
+                .filter(|part| !part.trim().is_empty() && *part != " = ")
+                .next_back()
+                .map(str::to_owned)
+        });
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let output = command_stdout(
+            "reg",
+            &[
+                "query",
+                r"HKLM\SOFTWARE\Microsoft\Cryptography",
+                "/v",
+                "MachineGuid",
+            ],
+        )?;
+        return output
+            .lines()
+            .find(|line| line.contains("MachineGuid"))
+            .and_then(|line| line.split_whitespace().next_back())
+            .map(str::to_owned);
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
 fn configured_u32(name: &str) -> Option<u32> {
     std::env::var(name).ok()?.trim().parse().ok()
+}
+
+fn llama_rpc_endpoint_from_config(
+    host: Option<&str>,
+    port: Option<&str>,
+    runtime_abi: Option<&str>,
+    backend: Option<&str>,
+    ready: Option<&str>,
+) -> Option<LlamaRpcEndpoint> {
+    let host = host?.trim();
+    // The pinned llama.cpp parser expects exactly the host:port form and splits
+    // at the first colon, so an IPv6 literal is not currently interoperable.
+    if host.is_empty() || host.contains(':') || host.chars().any(char::is_whitespace) {
+        return None;
+    }
+
+    let port = port?.trim().parse::<u16>().ok().filter(|port| *port > 0)?;
+    let runtime_abi = nonempty_config_value(runtime_abi?)?;
+    let backend = nonempty_config_value(backend?)?.to_ascii_lowercase();
+    if !matches!(backend.as_str(), "cuda" | "metal" | "cpu") {
+        return None;
+    }
+
+    let endpoint = LlamaRpcEndpoint {
+        host: host.to_owned(),
+        port,
+        rpc_protocol_version: PINNED_GGML_RPC_PROTOCOL_VERSION.to_owned(),
+        runtime_abi: runtime_abi.to_owned(),
+        backend,
+        ready: configured_ready(ready),
+    };
+    validate_llama_rpc_endpoint(&endpoint).ok()?;
+    Some(endpoint)
+}
+
+fn nonempty_config_value(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty()).then_some(value)
+}
+
+fn configured_ready(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+pub fn validate_llama_rpc_endpoint(endpoint: &LlamaRpcEndpoint) -> Result<(), String> {
+    let host = endpoint.host.trim();
+    if host.is_empty() || host.contains(':') || host.chars().any(char::is_whitespace) {
+        return Err("llama RPC host must use llama.cpp's hostname-or-IPv4 form".to_owned());
+    }
+    if endpoint.port == 0 {
+        return Err("llama RPC port must be between 1 and 65535".to_owned());
+    }
+    if endpoint.rpc_protocol_version != PINNED_GGML_RPC_PROTOCOL_VERSION {
+        return Err(format!(
+            "llama RPC protocol {} is incompatible with pinned protocol {}",
+            endpoint.rpc_protocol_version, PINNED_GGML_RPC_PROTOCOL_VERSION
+        ));
+    }
+    if nonempty_config_value(&endpoint.runtime_abi).is_none() {
+        return Err("llama RPC runtime ABI must not be empty".to_owned());
+    }
+    if !matches!(endpoint.backend.as_str(), "cuda" | "metal" | "cpu") {
+        return Err("llama RPC backend must be cuda, metal, or cpu".to_owned());
+    }
+    Ok(())
 }
 
 fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
@@ -388,6 +607,17 @@ mod tests {
 
     use super::*;
 
+    fn rpc_endpoint(ready: bool) -> LlamaRpcEndpoint {
+        LlamaRpcEndpoint {
+            host: "192.0.2.10".to_owned(),
+            port: 50052,
+            rpc_protocol_version: PINNED_GGML_RPC_PROTOCOL_VERSION.to_owned(),
+            runtime_abi: "infernet-llama-rpc-v1".to_owned(),
+            backend: "cuda".to_owned(),
+            ready,
+        }
+    }
+
     #[test]
     fn parses_linux_mem_available() {
         let input = "MemTotal:       32768000 kB\nMemFree:         1000000 kB\nMemAvailable:   12000000 kB\nCached:           4000000 kB\n";
@@ -505,6 +735,98 @@ mod tests {
     }
 
     #[test]
+    fn rpc_endpoint_requires_explicit_complete_configuration() {
+        assert!(
+            llama_rpc_endpoint_from_config(
+                None,
+                Some("50052"),
+                Some("infernet-llama-rpc-v1"),
+                Some("cuda"),
+                Some("true")
+            )
+            .is_none()
+        );
+        assert!(
+            llama_rpc_endpoint_from_config(
+                Some("192.0.2.10"),
+                Some("0"),
+                Some("infernet-llama-rpc-v1"),
+                Some("cuda"),
+                Some("true")
+            )
+            .is_none()
+        );
+        assert!(
+            llama_rpc_endpoint_from_config(
+                Some("2001:db8::10"),
+                Some("50052"),
+                Some("infernet-llama-rpc-v1"),
+                Some("cuda"),
+                Some("true")
+            )
+            .is_none()
+        );
+        assert!(
+            llama_rpc_endpoint_from_config(
+                Some("192.0.2.10"),
+                Some("50052"),
+                Some("infernet-llama-rpc-v1"),
+                Some("vulkan"),
+                Some("true")
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn rpc_readiness_is_never_inferred_from_an_endpoint() {
+        let not_ready = llama_rpc_endpoint_from_config(
+            Some("192.0.2.10"),
+            Some("50052"),
+            Some("infernet-llama-rpc-v1"),
+            Some("CUDA"),
+            None,
+        )
+        .unwrap();
+        assert!(!not_ready.ready);
+        assert_eq!(not_ready.backend, "cuda");
+        assert_eq!(not_ready.rpc_protocol_version, "4.0.1");
+
+        let ready = llama_rpc_endpoint_from_config(
+            Some("192.0.2.10"),
+            Some("50052"),
+            Some("infernet-llama-rpc-v1"),
+            Some("cuda"),
+            Some("yes"),
+        )
+        .unwrap();
+        assert!(ready.ready);
+    }
+
+    #[test]
+    fn runtime_rpc_state_overrides_and_can_clear_startup_configuration() {
+        let configured = rpc_endpoint(false);
+        let mut state = LocalLlamaRpcState::default();
+        assert_eq!(state.resolve(Some(configured.clone())), Some(configured));
+
+        let running = rpc_endpoint(true);
+        state.set(Some(running.clone()));
+        assert_eq!(state.resolve(None), Some(running));
+
+        state.set(None);
+        assert_eq!(state.resolve(Some(rpc_endpoint(true))), None);
+    }
+
+    #[test]
+    fn runtime_setter_validation_rejects_wire_protocol_mismatch() {
+        let mut endpoint = rpc_endpoint(true);
+        endpoint.rpc_protocol_version = "3.0.0".to_owned();
+
+        let error = validate_llama_rpc_endpoint(&endpoint).unwrap_err();
+        assert!(error.contains("pinned protocol 4.0.1"));
+    }
+
+    #[test]
     fn detects_current_machine_with_consistent_capacity() {
         let capabilities = detect_node_capabilities();
 
@@ -513,6 +835,13 @@ mod tests {
             "cuda" | "metal" | "cpu"
         ));
         assert!(!capabilities.device_name.is_empty());
+        assert!(
+            capabilities
+                .machine_id
+                .as_ref()
+                .is_some_and(|machine_id| machine_id.len() == 32),
+            "supported launch hosts must advertise a hashed physical machine id"
+        );
         assert!(capabilities.logical_cpu_cores >= 1);
         assert!(capabilities.max_sessions >= 1);
         assert!(capabilities.active_sessions <= capabilities.max_sessions);
@@ -520,6 +849,12 @@ mod tests {
         assert!(
             capabilities.available_accelerator_memory_bytes
                 <= capabilities.total_accelerator_memory_bytes
+        );
+        assert!(
+            DETECTED_HARDWARE
+                .get()
+                .is_some_and(|hardware| hardware.llama_rpc.is_none()),
+            "static hardware detection must never imply RPC readiness"
         );
     }
 

@@ -1,4 +1,5 @@
 #include "llama.h"
+#include "ggml-backend.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -57,6 +58,47 @@ static bool parse_i32(const char * text, int32_t & out) {
     }
     out = static_cast<int32_t>(value);
     return true;
+}
+
+static void register_rpc_servers(const std::string & servers) {
+    if (servers.empty()) {
+        return;
+    }
+    auto * rpc_reg = ggml_backend_reg_by_name("RPC");
+    if (!rpc_reg) {
+        throw std::runtime_error("llama.cpp RPC backend is unavailable");
+    }
+    using add_rpc_server_fn = ggml_backend_reg_t (*)(const char * endpoint);
+    auto * add_server = reinterpret_cast<add_rpc_server_fn>(
+        ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_add_server"));
+    if (!add_server) {
+        throw std::runtime_error("llama.cpp RPC add-server function is unavailable");
+    }
+
+    std::stringstream stream(servers);
+    std::string endpoint;
+    size_t registered = 0;
+    while (std::getline(stream, endpoint, ',')) {
+        const size_t first = endpoint.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) {
+            continue;
+        }
+        endpoint.erase(0, first);
+        const size_t last = endpoint.find_last_not_of(" \t\r\n");
+        endpoint.erase(last + 1);
+        if (endpoint.find(':') == std::string::npos) {
+            throw std::runtime_error("invalid RPC endpoint: " + endpoint);
+        }
+        ggml_backend_reg_t remote = add_server(endpoint.c_str());
+        if (!remote) {
+            throw std::runtime_error("failed to register RPC endpoint: " + endpoint);
+        }
+        ggml_backend_register(remote);
+        registered += 1;
+    }
+    if (registered == 0) {
+        throw std::runtime_error("--rpc did not contain any usable endpoints");
+    }
 }
 
 static std::vector<float> read_f32_file(const std::string & path) {
@@ -153,7 +195,7 @@ static std::string format_chat_prompt(const llama_model * model, const std::stri
 
 static void print_usage(const char * argv0) {
     std::cerr
-        << "usage: " << argv0 << " --model file.gguf --layer-start N --layer-end N --hidden-size N --threads N --prompt text [--gpu-layers N] [--max-context N] [--full-model] [--input activation.bin] [--output activation.bin]\n"
+        << "usage: " << argv0 << " --model file.gguf --layer-start N --layer-end N --hidden-size N --threads N --prompt text [--rpc host:port,...] [--gpu-layers N] [--max-context N] [--full-model] [--input activation.bin] [--output activation.bin]\n"
         << "\n"
         << "Runs a patched llama.cpp layer-range graph. If --input is omitted, tokens are embedded and execution starts at layer 0.\n"
         << "If --layer-end is less than the model layer count, hidden activations are written to --output.\n"
@@ -167,6 +209,7 @@ int main(int argc, char ** argv) {
     std::string prompt;
     std::string input_path;
     std::string output_path;
+    std::string rpc_servers;
     uint32_t layer_start = 0;
     uint32_t layer_end = 0;
     uint32_t hidden_size = 0;
@@ -192,6 +235,8 @@ int main(int argc, char ** argv) {
             input_path = need_value("--input");
         } else if (arg == "--output") {
             output_path = need_value("--output");
+        } else if (arg == "--rpc") {
+            rpc_servers = need_value("--rpc");
         } else if (arg == "--layer-start") {
             if (!parse_u32(need_value("--layer-start"), layer_start)) {
                 throw std::runtime_error("invalid --layer-start");
@@ -235,6 +280,7 @@ int main(int argc, char ** argv) {
         }
 
         ggml_backend_load_all();
+        register_rpc_servers(rpc_servers);
 
         llama_model_params model_params = llama_model_default_params();
         // llama.cpp treats a negative value as all available layers. CPU-only
