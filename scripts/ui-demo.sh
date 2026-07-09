@@ -19,6 +19,34 @@ done
 
 cd "$ROOT_DIR"
 
+if ! command -v cargo >/dev/null 2>&1; then
+  cat >&2 <<'EOF'
+Infernet dev mode needs Rust/Cargo, but cargo was not found.
+
+Install Rust on this Mac:
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+  source "$HOME/.cargo/env"
+
+If macOS asks for compiler tools, install them too:
+  xcode-select --install
+
+Then rerun:
+  ./scripts/ui-demo.sh
+EOF
+  exit 1
+fi
+
+if ! command -v npm >/dev/null 2>&1; then
+  cat >&2 <<'EOF'
+Infernet dev mode needs Node/npm, but npm was not found.
+
+Install Node.js, then rerun:
+  brew install node
+  ./scripts/ui-demo.sh
+EOF
+  exit 1
+fi
+
 pids=()
 cleanup() {
   for pid in "${pids[@]:-}"; do

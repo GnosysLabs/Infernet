@@ -12,6 +12,30 @@ $Processes = @()
 
 Set-Location $RootDir
 
+if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+  throw @"
+Infernet dev mode needs Rust/Cargo, but cargo was not found.
+
+Install Rust from:
+  https://rustup.rs/
+
+Then restart PowerShell and rerun:
+  .\scripts\ui-demo.ps1
+"@
+}
+
+if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
+  throw @"
+Infernet dev mode needs Node/npm, but npm was not found.
+
+Install Node.js from:
+  https://nodejs.org/
+
+Then restart PowerShell and rerun:
+  .\scripts\ui-demo.ps1
+"@
+}
+
 try {
   if ($WithDemoPeers) {
     cargo build -p infernet-worker

@@ -786,6 +786,9 @@ async fn acquire_advertised_model_records(
         plan.iter().map(|record| record.info.layers),
     );
     if !missing_ranges.is_empty() {
+        if !allow_direct_fetch {
+            return Ok(());
+        }
         return Err(format!(
             "{} is visible on the network, but its advertised model records are incomplete; missing layer ranges: {}",
             manifest.display_name,
