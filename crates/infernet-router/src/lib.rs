@@ -85,11 +85,15 @@ fn merge_advertisement(existing: &mut NodeAdvertisement, advertisement: &NodeAdv
     }
 
     for shard in &advertisement.hosted_shards {
-        if !existing.hosted_shards.iter().any(|existing| {
+        if let Some(existing_shard) = existing.hosted_shards.iter_mut().find(|existing| {
             existing.model_id == shard.model_id
                 && existing.layers == shard.layers
                 && existing.runtime_kind == shard.runtime_kind
         }) {
+            if existing_shard.seed_manifest.is_none() && shard.seed_manifest.is_some() {
+                existing_shard.seed_manifest = shard.seed_manifest.clone();
+            }
+        } else {
             existing.hosted_shards.push(shard.clone());
         }
     }
@@ -244,6 +248,7 @@ mod tests {
                 tokenizer: None,
                 metadata: None,
                 shard_hash: None,
+                seed_manifest: None,
             }],
             model_shards: Vec::new(),
         }

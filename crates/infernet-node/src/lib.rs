@@ -19,8 +19,11 @@ use infernet_protocol::{
 use infernet_router::ShardRegistry;
 use infernet_runtime::{DemoRuntime, LayerRuntime, activation_checksum};
 use libp2p::{
-    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder, core::connection::ConnectedPoint,
-    gossipsub, identity, mdns, multiaddr::Protocol, noise, request_response,
+    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
+    core::connection::ConnectedPoint,
+    gossipsub, identity, mdns,
+    multiaddr::Protocol,
+    noise, request_response,
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux,
 };
@@ -654,13 +657,15 @@ fn refresh_advertisement_model_shards(
                     if !seed_record_is_executable(&manifest) {
                         return None;
                     }
+                    let seed_manifest = Box::new(manifest.clone());
                     Some(ShardDescriptor {
-                        model_id: manifest.model_id,
+                        model_id: manifest.model_id.clone(),
                         layers: manifest.layers,
-                        runtime_kind: manifest.runtime_kind,
-                        tokenizer: Some(manifest.tokenizer),
-                        metadata: Some(manifest.metadata),
-                        shard_hash: Some(manifest.shard_hash),
+                        runtime_kind: manifest.runtime_kind.clone(),
+                        tokenizer: Some(manifest.tokenizer.clone()),
+                        metadata: Some(manifest.metadata.clone()),
+                        shard_hash: Some(manifest.shard_hash.clone()),
+                        seed_manifest: Some(seed_manifest),
                     })
                 })
                 .collect();

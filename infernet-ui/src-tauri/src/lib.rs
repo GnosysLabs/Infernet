@@ -18,7 +18,7 @@ use infernet_model::{
 use infernet_node::{
     DiscoveryConfig, SeededModelSummary, ShardCache, ShardCacheConfig, discover_for,
     empty_advertisement, fetch_model_shard_over_libp2p, import_seed_model_from_file_with_progress,
-    infer_over_libp2p, run_model_distribution_node,
+    infer_over_libp2p, run_model_distribution_node, sha256_bytes,
 };
 use infernet_protocol::{
     ModelShardInfo, NodeAdvertisement, PROTOCOL_VERSION, RouteHop, TraceEvent,
@@ -216,6 +216,12 @@ struct ModelImportProgress {
     total_bytes: Option<u64>,
 }
 
+#[derive(Debug, Clone)]
+struct AdvertisedModelRecord {
+    info: ModelShardInfo,
+    seed_manifest: Option<SeedShardManifest>,
+}
+
 #[derive(Debug, Deserialize)]
 struct HuggingFaceModelInfo {
     siblings: Option<Vec<HuggingFaceSibling>>,
@@ -336,7 +342,8 @@ async fn run_demo_inference(
         .map_err(|error| error.to_string())?;
 
     if manifest.runtime_kind != RuntimeKind::Demo {
-        acquire_advertised_model_records(&app, &state, &cache_config, &manifest, &registry).await?;
+        acquire_advertised_model_records(&app, &state, &cache_config, &manifest, &registry, true)
+            .await?;
         let (refreshed_registry, local_peer_id, topic) =
             discover_registry(&app, &state, &cache_config, DEFAULT_DISCOVERY_TIMEOUT_MS).await?;
         let manifest = manifest_for_model(
@@ -724,6 +731,8 @@ async fn collect_snapshot(
             return Err(error.to_string());
         }
     };
+    acquire_advertised_model_records(app, state, &cache_config, &manifest, &registry, false)
+        .await?;
 
     Ok(snapshot_from_registry(
         local_peer_id,
@@ -760,6 +769,7 @@ async fn acquire_advertised_model_records(
     cache_config: &ShardCacheConfig,
     manifest: &ModelManifest,
     registry: &ShardRegistry,
+    allow_direct_fetch: bool,
 ) -> Result<(), String> {
     if manifest.runtime_kind == RuntimeKind::Demo {
         return Ok(());
@@ -773,7 +783,7 @@ async fn acquire_advertised_model_records(
 
     let missing_ranges = missing_ranges_from_layer_ranges(
         manifest.layer_count,
-        plan.iter().map(|shard| shard.layers),
+        plan.iter().map(|record| record.info.layers),
     );
     if !missing_ranges.is_empty() {
         return Err(format!(
@@ -785,13 +795,13 @@ async fn acquire_advertised_model_records(
 
     let mut static_peers = configured_static_peers(state)?;
     merge_static_peer_advertisements(&mut static_peers, registry.advertisements());
-    for shard in plan {
+    for record in plan {
         if cache
             .find(
-                &shard.model_id,
-                shard.layers,
-                Some(&shard.checksum),
-                Some(&shard.version),
+                &record.info.model_id,
+                record.info.layers,
+                Some(&record.info.checksum),
+                Some(&record.info.version),
             )
             .map_err(|error| error.to_string())?
             .is_some()
@@ -799,13 +809,47 @@ async fn acquire_advertised_model_records(
             continue;
         }
 
+        if let Some(seed_manifest) = record.seed_manifest.as_ref() {
+            emit_model_import_progress(
+                app,
+                &manifest.model_id,
+                "Installing model record",
+                format!(
+                    "layers {}:{}",
+                    record.info.layers.start, record.info.layers.end
+                ),
+                0,
+                Some(record.info.size_bytes),
+            );
+            install_advertised_seed_record(&cache, &record.info, seed_manifest)?;
+            emit_model_import_progress(
+                app,
+                &manifest.model_id,
+                "Model record ready",
+                format!(
+                    "layers {}:{}",
+                    record.info.layers.start, record.info.layers.end
+                ),
+                record.info.size_bytes,
+                Some(record.info.size_bytes),
+            );
+            continue;
+        }
+
+        if !allow_direct_fetch {
+            continue;
+        }
+
         emit_model_import_progress(
             app,
             &manifest.model_id,
             "Downloading model record",
-            format!("layers {}:{}", shard.layers.start, shard.layers.end),
+            format!(
+                "layers {}:{}",
+                record.info.layers.start, record.info.layers.end
+            ),
             0,
-            Some(shard.size_bytes),
+            Some(record.info.size_bytes),
         );
         let (mut config, _) = discovery_config_from_state(state)?;
         config.static_peers = static_peers.clone();
@@ -813,9 +857,9 @@ async fn acquire_advertised_model_records(
             config,
             cache_config.clone(),
             manifest.model_id.clone(),
-            shard.layers,
-            Some(shard.checksum.clone()),
-            Some(shard.version.clone()),
+            record.info.layers,
+            Some(record.info.checksum.clone()),
+            Some(record.info.version.clone()),
             Duration::from_millis(DEFAULT_MODEL_FETCH_TIMEOUT_MS),
         )
         .await
@@ -824,9 +868,12 @@ async fn acquire_advertised_model_records(
             app,
             &manifest.model_id,
             "Model record ready",
-            format!("layers {}:{}", shard.layers.start, shard.layers.end),
-            shard.size_bytes,
-            Some(shard.size_bytes),
+            format!(
+                "layers {}:{}",
+                record.info.layers.start, record.info.layers.end
+            ),
+            record.info.size_bytes,
+            Some(record.info.size_bytes),
         );
     }
 
@@ -1001,6 +1048,28 @@ fn discovered_model_manifests(registry: &ShardRegistry) -> Vec<ModelManifest> {
         .flat_map(|advertisement| advertisement.hosted_shards.iter())
         .filter(|shard| shard.runtime_kind != RuntimeKind::Demo)
     {
+        if let Some(seed_manifest) = shard.seed_manifest.as_deref() {
+            by_model
+                .entry(shard.model_id.clone())
+                .and_modify(|manifest| {
+                    manifest.layer_count = manifest.layer_count.max(seed_manifest.layer_count);
+                    manifest.hidden_size = manifest.hidden_size.max(seed_manifest.hidden_size);
+                    if manifest.quantization.is_none() {
+                        manifest.quantization = seed_manifest.metadata.quantization.clone();
+                    }
+                })
+                .or_insert_with(|| ModelManifest {
+                    model_id: seed_manifest.model_id.clone(),
+                    display_name: seed_manifest.display_name.clone(),
+                    architecture: seed_manifest.architecture.clone(),
+                    layer_count: seed_manifest.layer_count,
+                    hidden_size: seed_manifest.hidden_size,
+                    activation_dtype: seed_manifest.activation_dtype.clone(),
+                    quantization: seed_manifest.metadata.quantization.clone(),
+                    runtime_kind: seed_manifest.runtime_kind.clone(),
+                });
+            continue;
+        }
         by_model
             .entry(shard.model_id.clone())
             .and_modify(|manifest| {
@@ -1202,33 +1271,90 @@ fn peer_view_from_advertisement(advertisement: &NodeAdvertisement) -> PeerView {
     }
 }
 
-fn advertised_model_record_plan(registry: &ShardRegistry, model_id: &str) -> Vec<ModelShardInfo> {
-    let mut by_range = BTreeMap::<(u32, u32), ModelShardInfo>::new();
-    for shard in registry
-        .advertisements()
-        .into_iter()
-        .flat_map(|advertisement| advertisement.model_shards)
-        .filter(|shard| shard.model_id == model_id)
-    {
-        by_range
-            .entry((shard.layers.start, shard.layers.end))
-            .and_modify(|existing| {
-                if (
-                    shard.version.clone(),
-                    shard.size_bytes,
-                    shard.checksum.clone(),
-                ) < (
-                    existing.version.clone(),
-                    existing.size_bytes,
-                    existing.checksum.clone(),
-                ) {
-                    *existing = shard.clone();
-                }
-            })
-            .or_insert(shard);
+fn advertised_model_record_plan(
+    registry: &ShardRegistry,
+    model_id: &str,
+) -> Vec<AdvertisedModelRecord> {
+    let mut by_range = BTreeMap::<(u32, u32), AdvertisedModelRecord>::new();
+    for advertisement in registry.advertisements() {
+        for info in advertisement
+            .model_shards
+            .iter()
+            .filter(|shard| shard.model_id == model_id)
+        {
+            let seed_manifest = advertisement
+                .hosted_shards
+                .iter()
+                .find(|descriptor| {
+                    descriptor.model_id == info.model_id && descriptor.layers == info.layers
+                })
+                .and_then(|descriptor| descriptor.seed_manifest.as_deref())
+                .cloned();
+            let record = AdvertisedModelRecord {
+                info: info.clone(),
+                seed_manifest,
+            };
+
+            by_range
+                .entry((info.layers.start, info.layers.end))
+                .and_modify(|existing| {
+                    if existing.seed_manifest.is_none() && record.seed_manifest.is_some() {
+                        *existing = record.clone();
+                    } else if existing.seed_manifest.is_none()
+                        && record.seed_manifest.is_none()
+                        && (
+                            record.info.version.clone(),
+                            record.info.size_bytes,
+                            record.info.checksum.clone(),
+                        ) < (
+                            existing.info.version.clone(),
+                            existing.info.size_bytes,
+                            existing.info.checksum.clone(),
+                        )
+                    {
+                        *existing = record.clone();
+                    }
+                })
+                .or_insert(record);
+        }
     }
 
     by_range.into_values().collect()
+}
+
+fn verify_advertised_seed_payload(info: &ModelShardInfo, payload: &[u8]) -> Result<(), String> {
+    let actual_checksum = sha256_bytes(payload);
+    if actual_checksum != info.checksum {
+        return Err(format!(
+            "advertised model record checksum mismatch for {} {}:{}; expected {}, got {}",
+            info.model_id, info.layers.start, info.layers.end, info.checksum, actual_checksum
+        ));
+    }
+    if payload.len() as u64 != info.size_bytes {
+        return Err(format!(
+            "advertised model record size mismatch for {} {}:{}; expected {}, got {}",
+            info.model_id,
+            info.layers.start,
+            info.layers.end,
+            info.size_bytes,
+            payload.len()
+        ));
+    }
+
+    Ok(())
+}
+
+fn install_advertised_seed_record(
+    cache: &ShardCache,
+    info: &ModelShardInfo,
+    seed_manifest: &SeedShardManifest,
+) -> Result<(), String> {
+    let payload = serde_json::to_vec_pretty(seed_manifest).map_err(|error| error.to_string())?;
+    verify_advertised_seed_payload(info, &payload)?;
+    cache
+        .store_downloaded(info, payload)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 fn missing_ranges_from_layer_ranges(
@@ -1414,13 +1540,15 @@ fn local_cache_advertisement(
         let payload = cache.read_payload(&record.info).ok()?;
         let manifest = serde_json::from_slice::<SeedShardManifest>(&payload).ok()?;
         if seed_record_is_executable(&manifest) {
+            let seed_manifest = Box::new(manifest.clone());
             hosted_shards.push(ShardDescriptor {
-                model_id: manifest.model_id,
+                model_id: manifest.model_id.clone(),
                 layers: manifest.layers,
-                runtime_kind: manifest.runtime_kind,
-                tokenizer: Some(manifest.tokenizer),
-                metadata: Some(manifest.metadata),
-                shard_hash: Some(manifest.shard_hash),
+                runtime_kind: manifest.runtime_kind.clone(),
+                tokenizer: Some(manifest.tokenizer.clone()),
+                metadata: Some(manifest.metadata.clone()),
+                shard_hash: Some(manifest.shard_hash.clone()),
+                seed_manifest: Some(seed_manifest),
             });
         }
         model_shards.push(record.info);
@@ -2129,11 +2257,15 @@ fn merge_peer_advertisement(existing: &mut NodeAdvertisement, peer: &NodeAdverti
         }
     }
     for shard in &peer.hosted_shards {
-        if !existing.hosted_shards.iter().any(|existing| {
+        if let Some(existing_shard) = existing.hosted_shards.iter_mut().find(|existing| {
             existing.model_id == shard.model_id
                 && existing.layers == shard.layers
                 && existing.runtime_kind == shard.runtime_kind
         }) {
+            if existing_shard.seed_manifest.is_none() && shard.seed_manifest.is_some() {
+                existing_shard.seed_manifest = shard.seed_manifest.clone();
+            }
+        } else {
             existing.hosted_shards.push(shard.clone());
         }
     }
@@ -2573,6 +2705,66 @@ mod tests {
             .find(|model| model.model_id == "gemma-4-12b-it-iq4-xs")
             .unwrap();
         assert_eq!(view.quantization.as_deref(), Some("IQ4_XS"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn advertised_seed_manifest_installs_verified_model_record() {
+        let root = std::env::temp_dir().join(format!("infernet-ui-advertised-{}", unix_ms()));
+        let cache_config = ShardCacheConfig::new(root.join("shards"));
+        let cache = ShardCache::new(cache_config.clone()).unwrap();
+        let layers = LayerRange::new(0, 8).unwrap();
+        let seed_manifest = SeedShardManifest {
+            model_id: "gemma-4-12b-it-iq4-xs".to_owned(),
+            display_name: "Gemma 4 12B IT IQ4 XS".to_owned(),
+            architecture: "gemma4".to_owned(),
+            layer_count: 48,
+            hidden_size: 3840,
+            activation_dtype: "f16".to_owned(),
+            runtime_kind: RuntimeKind::LlamaCpp,
+            layers,
+            tokenizer: infernet_model::TokenizerCompatibility {
+                family: "gemma4".to_owned(),
+                checksum: None,
+            },
+            metadata: infernet_model::ShardMetadata {
+                architecture: "gemma4".to_owned(),
+                quantization: Some("IQ4_XS".to_owned()),
+                source_checksum: Some("source-checksum".to_owned()),
+                protocol_version: PROTOCOL_VERSION,
+            },
+            source: infernet_model::SeedSourceMetadata {
+                path: "/remote/gemma.gguf".to_owned(),
+                checksum_sha256: "source-checksum".to_owned(),
+                file_size_bytes: 12_345,
+            },
+            shard_hash: "seed-hash".to_owned(),
+            payload_kind: "metadata-only".to_owned(),
+        };
+        let payload = serde_json::to_vec_pretty(&seed_manifest).unwrap();
+        let info = ModelShardInfo {
+            model_id: seed_manifest.model_id.clone(),
+            layers,
+            checksum: sha256_bytes(&payload),
+            size_bytes: payload.len() as u64,
+            version: "v1".to_owned(),
+            protocol_version: PROTOCOL_VERSION,
+        };
+
+        install_advertised_seed_record(&cache, &info, &seed_manifest).unwrap();
+
+        let installed = cache
+            .find(
+                &info.model_id,
+                layers,
+                Some(&info.checksum),
+                Some(&info.version),
+            )
+            .unwrap()
+            .expect("advertised record should be installed");
+        assert_eq!(installed.info, info);
+        assert_eq!(cache.read_payload(&installed.info).unwrap(), payload);
 
         let _ = std::fs::remove_dir_all(root);
     }

@@ -17,6 +17,7 @@ fn advertisement(peer_id: &str, model_id: &str, layers: LayerRange) -> NodeAdver
             tokenizer: None,
             metadata: None,
             shard_hash: None,
+            seed_manifest: None,
         }],
         model_shards: Vec::new(),
     }

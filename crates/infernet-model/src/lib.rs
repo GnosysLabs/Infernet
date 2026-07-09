@@ -203,6 +203,8 @@ pub struct ShardDescriptor {
     pub metadata: Option<ShardMetadata>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shard_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_manifest: Option<Box<SeedShardManifest>>,
 }
 
 impl ShardDescriptor {
@@ -214,6 +216,7 @@ impl ShardDescriptor {
             tokenizer: None,
             metadata: None,
             shard_hash: None,
+            seed_manifest: None,
         }
     }
 
@@ -230,6 +233,7 @@ impl ShardDescriptor {
                 protocol_version: 1,
             }),
             shard_hash: None,
+            seed_manifest: None,
         }
     }
 }
