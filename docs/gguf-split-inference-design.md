@@ -46,8 +46,8 @@ Sources:
 - Llama 3.2 1B GGUF candidate:
   <https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF>
 
-Local source inspection used llama.cpp commit
-`a646006f09d2f76f2d62d6c0d5e8e8490d570720` from 2026-07-08.
+Local bridge work currently builds against llama.cpp commit `32e41fa` as
+resolved by the runtime preparation script on 2026-07-08.
 
 ## GGUF Findings
 
@@ -336,14 +336,25 @@ The UI should visualize:
 
 - Stock llama.cpp cannot prove Infernet's model-ownership claim without a
   layer-range loader/evaluator patch or an independent GGUF execution engine.
+- Infernet now carries a narrow llama.cpp patch in `scripts/prepare-llama-runtime.mjs`
+  plus the `llama-runtime/infernet-bridge.cpp` sidecar. The patch adds
+  Infernet layer-range model parameters, skips tensors outside a worker's
+  assigned range, accepts imported hidden-state activations for middle shards,
+  exports boundary hidden state for non-final shards, and samples one token on
+  the final shard.
 - Distributed KV cache is the hard part after single-pass activation forwarding.
-- Activation tensors may be large enough that JSON `Vec<f32>` becomes unusable;
-  binary tensor frames are needed for real models.
+- Activation tensors are still serialized through the existing libp2p JSON
+  request/response frame as `Vec<f32>`. The bridge itself writes binary f32 temp
+  files at each worker boundary, but the network tensor codec still needs a
+  compact binary frame.
 - Peers can see intermediate activations. This milestone must not claim prompt
   privacy from participating workers.
-- Physical sharding is required before claiming that no peer has the full model.
-- The first implementation should fail loudly for unsupported GGUF execution
-  instead of falling back to the demo runtime.
+- Physical tensor-only shards are still required before claiming that no peer
+  has the full model source file. Current GGUF peers may cache the verified
+  source and load only their assigned layer range from it.
+- The first bridge supports prompt-pass plus one sampled token. Persistent
+  session state, KV-cache forwarding, and streaming multi-token generation are
+  future runtime work.
 
 ## Immediate Implementation Sequence
 
@@ -352,11 +363,10 @@ The UI should visualize:
 3. Add a shard-builder command that emits sidecar metadata for a GGUF layer
    range.
 4. Update routing to support `RuntimeKind::LlamaCpp`.
-5. Make runtime execution explicitly select demo vs llama.cpp. Until the
-   layer-range bridge lands, the desktop app may download a complete verified
-   GGUF source over `/infernet/model-blob/1` and run local llama.cpp token
-   generation as a correctness fallback.
+5. Make runtime execution explicitly select demo vs llama.cpp. LlamaCpp workers
+   now invoke `infernet-llama-bridge` through `/infernet/activation/1`; the old
+   full-local `llama-cli` fallback has been removed from the inference path.
 6. Remove UI execution modes and present models as the primary navigation.
-7. Add the llama.cpp bridge behind a feature flag or separate crate.
+7. Package the llama.cpp bridge as a Tauri sidecar.
 8. Add binary activation frames and session/KV metadata.
 9. Materialize physical shards and enforce workers load only their shard file.

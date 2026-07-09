@@ -27,7 +27,8 @@
     "active": true,
     "targets": "all",
     "externalBin": [
-      "binaries/llama-cli"
+      "binaries/llama-cli",
+      "binaries/infernet-llama-bridge"
     ],
     "resources": [
       "binaries"

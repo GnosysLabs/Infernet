@@ -6,8 +6,7 @@ use std::{
     io::Write,
     net::{IpAddr, UdpSocket},
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
-    time::{SystemTime, UNIX_EPOCH},
+    sync::Mutex,
 };
 
 use futures::StreamExt;
@@ -28,14 +27,12 @@ use infernet_router::ShardRegistry;
 use libp2p::{Multiaddr, PeerId, identity};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::process::Command;
 
 const DEFAULT_TOPIC: &str = "infernet/grid-demo/1";
 const DEFAULT_DISCOVERY_TIMEOUT_MS: u64 = 4_000;
-const DEFAULT_INFERENCE_TIMEOUT_MS: u64 = 6_000;
+const DEFAULT_INFERENCE_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_MODEL_FETCH_TIMEOUT_MS: u64 = 6_000;
 const DEFAULT_MODEL_SOURCE_FETCH_TIMEOUT_MS: u64 = 60 * 60 * 1_000;
-const MIN_LOCAL_GGUF_LIMIT_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 const UI_LISTEN_PORT: u16 = 9777;
 const DEFAULT_BOOTSTRAP_PEERS: &[&str] = &[
     "12D3KooWRJrnpHPQTWdThpDGZMwRCHhEBL4JCAxFMwYMfFavxa2h@/ip4/217.77.11.197/tcp/9777/p2p/12D3KooWRJrnpHPQTWdThpDGZMwRCHhEBL4JCAxFMwYMfFavxa2h",
@@ -346,49 +343,6 @@ async fn run_demo_inference(
     if manifest.runtime_kind != RuntimeKind::Demo {
         acquire_advertised_model_records(&app, &state, &cache_config, &manifest, &registry, true)
             .await?;
-        let (refreshed_registry, local_peer_id, topic) =
-            discover_registry(&app, &state, &cache_config, DEFAULT_DISCOVERY_TIMEOUT_MS).await?;
-        let manifest = manifest_for_model(
-            Some(&manifest.model_id),
-            &cache_config,
-            Some(&refreshed_registry),
-        )
-        .map_err(|error| error.to_string())?;
-        let trace_id = format!("llama-{}", unix_ms());
-        let local_route = vec![RouteHopView {
-            peer_id: local_peer_id.clone(),
-            short_peer_id: short_peer_id(&local_peer_id),
-            address: "local".to_owned(),
-            layer_start: 0,
-            layer_end: manifest.layer_count,
-        }];
-        emit_progress(
-            &app,
-            ProgressEvent::RouteDiscovered {
-                route: local_route.clone(),
-            },
-        );
-        replay_route_progress(&app, &trace_id, &local_route, manifest.hidden_size).await;
-        let output = generate_with_llama_cli(&app, &cache_config, &manifest, &prompt).await?;
-        emit_progress(
-            &app,
-            ProgressEvent::FinalOutput {
-                trace_id: trace_id.clone(),
-                output: output.clone(),
-            },
-        );
-        let snapshot = snapshot_from_registry(
-            local_peer_id,
-            topic,
-            &manifest,
-            &refreshed_registry,
-            &cache_config,
-        );
-        return Ok(RunDemoResponse {
-            output,
-            trace_id,
-            snapshot,
-        });
     }
 
     let snapshot = collect_snapshot(
@@ -420,7 +374,14 @@ async fn run_demo_inference(
         },
     );
 
-    let (config, _) = discovery_config_from_state(&state)?;
+    let (mut config, local_peer_id) = discovery_config_from_state(&state)?;
+    config.keypair = identity::Keypair::generate_ed25519();
+    if let Some(mut local_advertisement) =
+        local_cache_advertisement(&cache_config, local_peer_id.clone())
+    {
+        local_advertisement.addresses = local_connect_addresses(&local_peer_id);
+        config.static_peers.push(local_advertisement);
+    }
     let hidden_size = manifest.hidden_size;
     let result = match infer_over_libp2p(
         config,
@@ -1067,10 +1028,7 @@ fn model_view_from_manifest(
     let runnable = manifest.runtime_kind == RuntimeKind::Demo
         || (manifest.runtime_kind == RuntimeKind::LlamaCpp
             && installed
-            && local_source_path_for_model(cache_config, &manifest.model_id)
-                .and_then(|path| std::fs::metadata(path).ok())
-                .is_some_and(|metadata| metadata.len() <= local_gguf_size_limit_bytes())
-            && find_llama_cli(None).is_some());
+            && local_source_path_for_model(cache_config, &manifest.model_id).is_some());
     ModelView {
         model_id: manifest.model_id.clone(),
         display_name: manifest.display_name.clone(),
@@ -1297,17 +1255,11 @@ fn model_status(
         return "Available on the network".to_owned();
     }
 
-    let Some(source_path) = local_source_path_for_model(cache_config, &manifest.model_id) else {
+    if local_source_path_for_model(cache_config, &manifest.model_id).is_none() {
         return "Model records installed. Infernet will download the verified GGUF source from peers before chat.".to_owned();
-    };
-    if std::fs::metadata(source_path)
-        .map(|metadata| metadata.len() > local_gguf_size_limit_bytes())
-        .unwrap_or(false)
-    {
-        return "Installed locally. This machine does not have enough memory for safe local fallback execution.".to_owned();
     }
 
-    "Installed locally. Token runtime is being bundled with the app.".to_owned()
+    "Installed locally. Ready for distributed inference.".to_owned()
 }
 
 fn normalize_quantization_label(value: &str) -> String {
@@ -1693,110 +1645,6 @@ fn seed_record_is_executable(config: &ShardCacheConfig, manifest: &SeedShardMani
         || executable_source_path_for_manifest(config, manifest).is_some()
 }
 
-async fn generate_with_llama_cli(
-    app: &AppHandle,
-    cache_config: &ShardCacheConfig,
-    manifest: &ModelManifest,
-    prompt: &str,
-) -> Result<String, String> {
-    let model_path = local_source_path_for_model(cache_config, &manifest.model_id).ok_or_else(|| {
-        format!(
-            "{} is available, but the verified GGUF source is not in this machine's cache yet. Keep a seeding peer online or add the model locally, then try again.",
-            manifest.display_name
-        )
-    })?;
-    let llama_cli = find_llama_cli(Some(app)).ok_or_else(|| {
-        "The bundled llama.cpp runtime is missing from this app build. Rebuild Infernet so it can package the token runtime.".to_owned()
-    })?;
-    let model_size = std::fs::metadata(&model_path)
-        .map_err(|error| format!("failed to read {}: {error}", model_path.display()))?
-        .len();
-    let allow_large = env::var("INFERNET_ALLOW_LARGE_GGUF").as_deref() == Ok("1");
-    let size_limit = local_gguf_size_limit_bytes();
-    if model_size > size_limit && !allow_large {
-        return Err(format!(
-            "{} is {}. This machine's local GGUF safety limit is {}. This model needs a smaller quantization, more memory, or the split GGUF token runtime.",
-            model_path.display(),
-            format_bytes(model_size),
-            format_bytes(size_limit),
-        ));
-    }
-
-    let mut command = Command::new(&llama_cli);
-    if let Some(runtime_dir) = llama_cli.parent() {
-        command.current_dir(runtime_dir);
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let mut library_dirs = llama_runtime_library_dirs(Some(app), &llama_cli);
-        if let Some(path) = env::var_os("PATH") {
-            library_dirs.extend(env::split_paths(&path));
-        }
-        if let Ok(path) = env::join_paths(library_dirs) {
-            command.env("PATH", path);
-        }
-    }
-
-    let output = command
-        .arg("-m")
-        .arg(&model_path)
-        .arg("-p")
-        .arg(prompt)
-        .arg("-n")
-        .arg("64")
-        .arg("--no-display-prompt")
-        .arg("--simple-io")
-        .env("LLAMA_LOG_LEVEL", "error")
-        .output()
-        .await
-        .map_err(|error| format!("failed to launch {}: {error}", llama_cli.display()))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    if !output.status.success() {
-        return Err(if stderr.is_empty() {
-            format!("llama.cpp exited with {}", output.status)
-        } else {
-            stderr
-        });
-    }
-
-    if stdout.is_empty() {
-        return Err(if stderr.is_empty() {
-            "llama.cpp produced no output".to_owned()
-        } else {
-            stderr
-        });
-    }
-
-    Ok(stdout)
-}
-
-#[cfg(target_os = "windows")]
-fn llama_runtime_library_dirs(app: Option<&AppHandle>, llama_cli: &Path) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-
-    if let Some(parent) = llama_cli.parent() {
-        dirs.push(parent.to_path_buf());
-    }
-    if let Some(app) = app {
-        if let Ok(resource_dir) = app.path().resource_dir() {
-            dirs.push(resource_dir.clone());
-            dirs.push(resource_dir.join("binaries"));
-        }
-    }
-    if let Ok(current_exe) = env::current_exe() {
-        if let Some(parent) = current_exe.parent() {
-            dirs.push(parent.to_path_buf());
-            dirs.push(parent.join("binaries"));
-        }
-    }
-
-    dirs.sort();
-    dirs.dedup();
-    dirs
-}
-
 fn local_source_path_for_model(cache_config: &ShardCacheConfig, model_id: &str) -> Option<PathBuf> {
     let cache = ShardCache::new(cache_config.clone()).ok()?;
     let records = cache.list().ok()?;
@@ -1814,238 +1662,10 @@ fn local_source_path_for_model(cache_config: &ShardCacheConfig, model_id: &str) 
     None
 }
 
-fn find_llama_cli(app: Option<&AppHandle>) -> Option<PathBuf> {
-    if let Ok(path) = env::var("INFERNET_LLAMA_CLI") {
-        let path = PathBuf::from(path);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-
-    for candidate in bundled_llama_cli_candidates(app) {
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-
-    let executable_names = if cfg!(windows) {
-        vec!["llama-cli.exe", "llama.exe", "main.exe"]
-    } else {
-        vec!["llama-cli", "llama", "main"]
-    };
-    let mut search_dirs = Vec::new();
-    if let Ok(current_exe) = env::current_exe() {
-        if let Some(parent) = current_exe.parent() {
-            search_dirs.push(parent.to_path_buf());
-        }
-    }
-    if let Some(path) = env::var_os("PATH") {
-        search_dirs.extend(env::split_paths(&path));
-    }
-
-    for directory in search_dirs {
-        for name in &executable_names {
-            let candidate = directory.join(*name);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-
-    None
-}
-
-fn bundled_llama_cli_candidates(app: Option<&AppHandle>) -> Vec<PathBuf> {
-    let executable_name = if cfg!(windows) {
-        "llama-cli.exe"
-    } else {
-        "llama-cli"
-    };
-    let sidecar_name = bundled_llama_cli_sidecar_name();
-    let mut candidates = Vec::new();
-
-    if let Some(app) = app {
-        if let Ok(resource_dir) = app.path().resource_dir() {
-            candidates.push(resource_dir.join(executable_name));
-            candidates.push(resource_dir.join("binaries").join(executable_name));
-            if let Some(sidecar_name) = sidecar_name {
-                candidates.push(resource_dir.join(sidecar_name));
-                candidates.push(resource_dir.join("binaries").join(sidecar_name));
-            }
-        }
-    }
-
-    if let Ok(current_exe) = env::current_exe() {
-        if let Some(parent) = current_exe.parent() {
-            candidates.push(parent.join(executable_name));
-            candidates.push(parent.join("binaries").join(executable_name));
-            if let Some(resources) = parent.parent().map(|path| path.join("Resources")) {
-                candidates.push(resources.join(executable_name));
-                candidates.push(resources.join("binaries").join(executable_name));
-            }
-        }
-    }
-
-    if let Some(sidecar_name) = sidecar_name {
-        candidates.push(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("binaries")
-                .join(sidecar_name),
-        );
-    }
-
-    candidates
-}
-
-fn bundled_llama_cli_sidecar_name() -> Option<&'static str> {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    {
-        return Some("llama-cli-aarch64-apple-darwin");
-    }
-    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-    {
-        return Some("llama-cli-x86_64-apple-darwin");
-    }
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    {
-        return Some("llama-cli-x86_64-pc-windows-msvc.exe");
-    }
-    #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
-    {
-        return Some("llama-cli-aarch64-pc-windows-msvc.exe");
-    }
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    {
-        return Some("llama-cli-x86_64-unknown-linux-gnu");
-    }
-    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-    {
-        return Some("llama-cli-aarch64-unknown-linux-gnu");
-    }
-    #[allow(unreachable_code)]
-    None
-}
-
-fn local_gguf_size_limit_bytes() -> u64 {
-    static LIMIT: OnceLock<u64> = OnceLock::new();
-    *LIMIT.get_or_init(|| {
-        env::var("INFERNET_MAX_LOCAL_GGUF_BYTES")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or_else(|| {
-                total_system_memory_bytes()
-                    .map(|bytes| (bytes.saturating_mul(45) / 100).max(MIN_LOCAL_GGUF_LIMIT_BYTES))
-                    .unwrap_or(MIN_LOCAL_GGUF_LIMIT_BYTES)
-            })
-    })
-}
-
-#[cfg(target_os = "macos")]
-fn total_system_memory_bytes() -> Option<u64> {
-    let output = std::process::Command::new("sysctl")
-        .arg("-n")
-        .arg("hw.memsize")
-        .output()
-        .ok()?;
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse::<u64>()
-        .ok()
-}
-
-#[cfg(target_os = "linux")]
-fn total_system_memory_bytes() -> Option<u64> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let line = meminfo.lines().find(|line| line.starts_with("MemTotal:"))?;
-    let kib = line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|value| value.parse::<u64>().ok())?;
-    Some(kib.saturating_mul(1024))
-}
-
-#[cfg(target_os = "windows")]
-fn total_system_memory_bytes() -> Option<u64> {
-    let output = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory",
-        ])
-        .output()
-        .ok()?;
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse::<u64>()
-        .ok()
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-fn total_system_memory_bytes() -> Option<u64> {
-    None
-}
-
-fn format_bytes(bytes: u64) -> String {
-    let gib = bytes as f64 / 1024.0 / 1024.0 / 1024.0;
-    if gib >= 1.0 {
-        format!("{gib:.1} GB")
-    } else {
-        let mib = bytes as f64 / 1024.0 / 1024.0;
-        format!("{mib:.0} MB")
-    }
-}
-
-async fn replay_route_progress(
-    app: &AppHandle,
-    trace_id: &str,
-    route: &[RouteHopView],
-    hidden_size: usize,
-) {
-    let activation_size_bytes = hidden_size.saturating_mul(2);
-
-    for (index, hop) in route.iter().enumerate() {
-        emit_progress(
-            app,
-            ProgressEvent::HopStarted {
-                trace_id: trace_id.to_owned(),
-                peer_id: hop.peer_id.clone(),
-                short_peer_id: hop.short_peer_id.clone(),
-                layer_start: hop.layer_start,
-                layer_end: hop.layer_end,
-                activation_size_bytes,
-            },
-        );
-        tokio::time::sleep(Duration::from_millis(120)).await;
-        emit_progress(
-            app,
-            ProgressEvent::HopCompleted {
-                trace_id: trace_id.to_owned(),
-                peer_id: hop.peer_id.clone(),
-                short_peer_id: hop.short_peer_id.clone(),
-                layer_start: hop.layer_start,
-                layer_end: hop.layer_end,
-                next_peer_id: route.get(index + 1).map(|next| next.peer_id.clone()),
-                activation_size_bytes,
-                timing_ms: 120,
-                activation_checksum: format!("{:016x}", route_progress_checksum(hop, index)),
-            },
-        );
-    }
-}
-
-fn route_progress_checksum(hop: &RouteHopView, index: usize) -> u64 {
-    hop.peer_id
-        .bytes()
-        .fold(0xcbf29ce484222325 ^ index as u64, |hash, byte| {
-            hash.wrapping_mul(0x100000001b3) ^ u64::from(byte)
-        })
-        ^ u64::from(hop.layer_start)
-        ^ (u64::from(hop.layer_end) << 32)
-}
-
+#[cfg(test)]
 fn unix_ms() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or(0)
 }

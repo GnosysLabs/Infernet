@@ -5,8 +5,8 @@ always a distributed network: your computer is one node in the same peer graph
 as every other participant. Users select a model; the scheduler decides whether
 the route is local-only, mixed local/remote, or remote-only.
 
-The current stable milestone proves a real peer-to-peer topology for a tiny demo
-model:
+The current stable milestone proves the peer-to-peer topology with a tiny demo
+model and introduces the first real GGUF layer bridge:
 
 - workers advertise shard metadata over libp2p mDNS + gossipsub;
 - each worker hosts only its assigned layer range;
@@ -14,7 +14,9 @@ model:
   requests over libp2p request-response;
 - each worker processes its hop and forwards to the next peer over
   `/infernet/activation/1`;
-- no client command needs to hardcode peer order.
+- no client command needs to hardcode peer order;
+- `infernet-llama-bridge` patches llama.cpp so a worker can load/evaluate one
+  contiguous Llama/Gemma-family layer range and forward f32 activations.
 
 Read the designs first:
 
@@ -22,11 +24,10 @@ Read the designs first:
 - [docs/gguf-split-inference-design.md](docs/gguf-split-inference-design.md)
 - [docs/model-distribution-design.md](docs/model-distribution-design.md)
 
-The next milestone targets `llama-3.2-1b`, a Llama 3.2 1B GGUF model. The
-repository can now build Infernet GGUF shard sidecar metadata, advertise
-LlamaCpp shard ranges, and route them by runtime kind. Real llama.cpp
-layer-range execution is intentionally guarded until the native bridge can load
-only the assigned layer range.
+The GGUF bridge is correctness-first, not performance-first. The first version
+runs a prompt pass across routed shards and samples one final token on the last
+shard. Persistent KV-cache streaming for multi-token generation is still future
+work.
 
 ## Peer Discovery
 
@@ -179,9 +180,10 @@ cargo run -p infernet-worker -- shard build \
 
 The sidecar records model id, architecture, layer range, tokenizer checksum,
 source GGUF checksum, GGUF tensor directory selection, and shard hash. It does
-not yet materialize a physical tensor-only shard. Physical shards and the
-llama.cpp layer-range bridge are required before claiming that a real worker
-does not possess the full model file.
+not yet materialize a physical tensor-only shard. Today, peers cache the
+verified GGUF source and the patched bridge skips tensors outside the assigned
+layer range while loading/evaluating that worker's shard. Physical tensor-only
+shard files are still the next storage milestone.
 
 ## Desktop UI Demo
 
@@ -301,10 +303,9 @@ Current limitations:
 - Model distribution uses `/infernet/model/1` for metadata records and
   `/infernet/model-blob/1` for chunked GGUF source transfer. Resume and
   multi-source downloads are future work.
-- The activation payload is JSON-encoded `f32` demo data, not a real model
-  tensor codec.
-- GGUF source download and local llama.cpp token execution are wired through the
-  desktop app. True split-GGUF layer execution still needs the llama.cpp
-  layer-range activation bridge.
+- Demo activations are JSON-encoded `f32`; GGUF split inference forwards f32
+  hidden-state frames between routed peers.
+- The current GGUF bridge supports a prompt pass plus one sampled token. It does
+  not yet keep distributed KV state for streaming multi-token generation.
 - Peers are trusted for this phase; there is no correctness proof or privacy
   protection from the worker executing a layer.

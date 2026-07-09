@@ -1,11 +1,13 @@
 pub mod model_distribution;
 
 use std::collections::HashMap;
+use std::env;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::mem;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 use std::{fs, io};
 
@@ -35,6 +37,7 @@ pub use model_distribution::{
     import_seed_model_from_file_with_progress, sha256_bytes, sha256_file, source_cache_path,
     source_cache_root,
 };
+use serde::Deserialize;
 use tokio::time::{Instant, interval, sleep};
 
 #[derive(Debug, Clone)]
@@ -403,10 +406,14 @@ pub async fn run_worker_node(mut discovery: DiscoveryConfig, worker: WorkerConfi
         .transpose()?;
 
     let mut publish_interval = interval(discovery.publish_interval);
+    let mut static_peer_dial_interval = interval(Duration::from_secs(10));
     let mut pending_forwards = HashMap::new();
 
     loop {
         tokio::select! {
+            _ = static_peer_dial_interval.tick(), if !discovery.static_peers.is_empty() => {
+                add_static_peer_addresses(&mut swarm, &discovery.static_peers);
+            }
             _ = publish_interval.tick(), if discovery.advertisement.is_some() => {
                 refresh_advertisement_model_shards(
                     &mut discovery.advertisement,
@@ -431,6 +438,7 @@ pub async fn run_worker_node(mut discovery: DiscoveryConfig, worker: WorkerConfi
                             handle_worker_activation_event(
                                 &mut swarm,
                                 &worker,
+                                &discovery.static_peers,
                                 event,
                                 &mut pending_forwards,
                             )?;
@@ -478,9 +486,14 @@ pub async fn run_model_distribution_node(
     listen_on(&mut swarm, &discovery.p2p_listen)?;
 
     let mut publish_interval = interval(discovery.publish_interval);
+    let mut static_peer_dial_interval = interval(Duration::from_secs(10));
+    let mut pending_forwards = HashMap::new();
 
     loop {
         tokio::select! {
+            _ = static_peer_dial_interval.tick(), if !discovery.static_peers.is_empty() => {
+                add_static_peer_addresses(&mut swarm, &discovery.static_peers);
+            }
             _ = publish_interval.tick() => {
                 refresh_advertisement_model_shards(&mut discovery.advertisement, Some(&shard_cache))?;
                 if let Some(advertisement) = &discovery.advertisement {
@@ -512,7 +525,16 @@ pub async fn run_model_distribution_node(
                         GridNetworkEvent::ModelBlob(event) => {
                             handle_model_blob_network_event(&mut swarm, Some(&shard_cache), &peer_id, event)?;
                         }
-                        GridNetworkEvent::Activation(_) => {}
+                        GridNetworkEvent::Activation(event) => {
+                            handle_cached_activation_event(
+                                &mut swarm,
+                                &shard_cache,
+                                &peer_id,
+                                &discovery.static_peers,
+                                event,
+                                &mut pending_forwards,
+                            )?;
+                        }
                     }
                 }
             }
@@ -952,37 +974,35 @@ pub async fn infer_over_libp2p(
     )
     .await?;
 
-    if manifest.runtime_kind != RuntimeKind::Demo {
-        bail!(
-            "model {} discovered a complete route, but the {} shard runtime is not linked yet; see docs/gguf-split-inference-design.md",
-            manifest.model_id,
-            manifest.runtime_kind.as_str()
-        );
-    }
-
-    let activation = DemoRuntime::prompt_to_activation(&prompt, hidden_size);
+    let demo_mode = manifest.runtime_kind == RuntimeKind::Demo;
+    let activation = if demo_mode {
+        DemoRuntime::prompt_to_activation(&prompt, hidden_size)
+    } else {
+        Vec::new()
+    };
     let request = ActivationRequest::new(
         manifest.model_id.clone(),
         route.clone(),
         hidden_size,
         activation,
-        Some(PromptMetadata {
-            prompt,
-            demo_mode: true,
-        }),
+        Some(PromptMetadata { prompt, demo_mode }),
     );
     let first_hop = request
         .current_hop()
         .cloned()
         .ok_or_else(|| anyhow!("route must contain at least one hop"))?;
-    let outbound_id = send_activation_request(&mut swarm, &first_hop, request)?;
+    let outbound_id =
+        send_activation_request_with_relays(&mut swarm, &config.static_peers, &first_hop, request)?;
     let response = wait_for_client_response(
         &mut swarm,
         &mut registry,
         &mut config,
         &topic,
         outbound_id,
-        Duration::from_secs(15),
+        match manifest.runtime_kind {
+            RuntimeKind::Demo => Duration::from_secs(15),
+            RuntimeKind::LlamaCpp => Duration::from_secs(600),
+        },
     )
     .await?;
 
@@ -1150,32 +1170,43 @@ pub fn process_activation_step(
         .current_hop()
         .cloned()
         .expect("validation ensures a current hop exists");
-    let runtime = match config.runtime_kind {
-        RuntimeKind::Demo => DemoRuntime::new(config.owned_layers, config.hidden_size),
-        RuntimeKind::LlamaCpp => {
-            return Err(ActivationResponse::failure(
-                trace_id,
-                config.peer_id.clone(),
-                "llama.cpp shard runtime is not linked yet; route discovery and metadata are available, but real GGUF layer execution requires the Infernet llama.cpp bridge described in docs/gguf-split-inference-design.md",
-                request.trace,
-            ));
-        }
-    };
     let started = Instant::now();
+    let mut output_text = None;
+    let timing_ms;
 
-    request.activation = match runtime.execute(hop.layers, &request.activation) {
-        Ok(activation) => activation,
-        Err(error) => {
-            return Err(ActivationResponse::failure(
-                trace_id,
-                config.peer_id.clone(),
-                error.to_string(),
-                request.trace,
-            ));
+    match config.runtime_kind {
+        RuntimeKind::Demo => {
+            let runtime = DemoRuntime::new(config.owned_layers, config.hidden_size);
+            request.activation = match runtime.execute(hop.layers, &request.activation) {
+                Ok(activation) => activation,
+                Err(error) => {
+                    return Err(ActivationResponse::failure(
+                        trace_id,
+                        config.peer_id.clone(),
+                        error.to_string(),
+                        request.trace,
+                    ));
+                }
+            };
+            timing_ms = elapsed_ms(started);
         }
-    };
+        RuntimeKind::LlamaCpp => match execute_llama_cpp_shard(config, hop.layers, &request) {
+            Ok(output) => {
+                request.activation = output.activation;
+                output_text = output.output_text;
+                timing_ms = output.timing_ms;
+            }
+            Err(error) => {
+                return Err(ActivationResponse::failure(
+                    trace_id,
+                    config.peer_id.clone(),
+                    error.to_string(),
+                    request.trace,
+                ));
+            }
+        },
+    }
 
-    let timing_ms = elapsed_ms(started);
     let next_peer_id = request.next_hop().map(|next| next.peer_id.clone());
     let trace_event = TraceEvent {
         peer_id: config.peer_id.clone(),
@@ -1192,7 +1223,8 @@ pub fn process_activation_step(
         request.current_hop_index += 1;
         Ok(ActivationStep::Forward(request))
     } else {
-        let output = DemoRuntime::decode_activation(&request.activation);
+        let output =
+            output_text.unwrap_or_else(|| DemoRuntime::decode_activation(&request.activation));
         Ok(ActivationStep::Final(ActivationResponse::success(
             request,
             config.peer_id.clone(),
@@ -1200,6 +1232,351 @@ pub fn process_activation_step(
             timing_ms,
         )))
     }
+}
+
+#[derive(Debug)]
+struct LlamaShardOutput {
+    activation: Vec<f32>,
+    output_text: Option<String>,
+    timing_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct LlamaBridgeJson {
+    ok: bool,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    n_tokens: Option<usize>,
+    #[serde(default)]
+    hidden_size: Option<usize>,
+    #[serde(default)]
+    output_f32_count: Option<usize>,
+    #[serde(default)]
+    output_text: Option<String>,
+    #[serde(default)]
+    timing_ms: Option<f64>,
+}
+
+fn execute_llama_cpp_shard(
+    config: &WorkerConfig,
+    layers: LayerRange,
+    request: &ActivationRequest,
+) -> Result<LlamaShardOutput> {
+    let prompt = request
+        .prompt
+        .as_ref()
+        .ok_or_else(|| anyhow!("llama.cpp activation request is missing prompt metadata"))?;
+    if prompt.demo_mode {
+        bail!("llama.cpp activation request was marked as demo_mode");
+    }
+
+    let cache_config = config
+        .shard_cache
+        .as_ref()
+        .ok_or_else(|| anyhow!("llama.cpp worker has no shard cache configured"))?;
+    let cache = ShardCache::new(cache_config.clone())?;
+    let (manifest, model_path) =
+        executable_seed_manifest_for_layers(&cache, &config.model_id, layers)?.ok_or_else(
+            || {
+                anyhow!(
+                    "missing verified executable GGUF source for {} {}:{}",
+                    config.model_id,
+                    layers.start,
+                    layers.end
+                )
+            },
+        )?;
+    if manifest.runtime_kind != RuntimeKind::LlamaCpp {
+        bail!(
+            "expected llama.cpp shard for {} {}:{}, got {}",
+            config.model_id,
+            layers.start,
+            layers.end,
+            manifest.runtime_kind.as_str()
+        );
+    }
+
+    let bridge = find_llama_bridge_binary().ok_or_else(|| {
+        anyhow!(
+            "infernet-llama-bridge binary is missing; run npm run prepare-runtime or set INFERNET_LLAMA_BRIDGE"
+        )
+    })?;
+
+    let temp_root = env::temp_dir().join("infernet-activation-frames");
+    fs::create_dir_all(&temp_root)
+        .with_context(|| format!("failed to create {}", temp_root.display()))?;
+    let frame_id = format!("{}-{}", request.trace_id, request.current_hop_index);
+    let input_path = temp_root.join(format!("{frame_id}-in.f32"));
+    let output_path = temp_root.join(format!("{frame_id}-out.f32"));
+
+    if !request.activation.is_empty() {
+        write_f32_activation(&input_path, &request.activation)?;
+    }
+
+    let mut command = Command::new(&bridge);
+    if let Some(runtime_dir) = bridge.parent() {
+        command.current_dir(runtime_dir);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let mut library_dirs = Vec::new();
+        if let Some(parent) = bridge.parent() {
+            library_dirs.push(parent.to_path_buf());
+        }
+        if let Some(path) = env::var_os("PATH") {
+            library_dirs.extend(env::split_paths(&path));
+        }
+        if let Ok(path) = env::join_paths(library_dirs) {
+            command.env("PATH", path);
+        }
+    }
+
+    command
+        .arg("--model")
+        .arg(&model_path)
+        .arg("--layer-start")
+        .arg(layers.start.to_string())
+        .arg("--layer-end")
+        .arg(layers.end.to_string())
+        .arg("--hidden-size")
+        .arg(config.hidden_size.to_string())
+        .arg("--prompt")
+        .arg(&prompt.prompt);
+    if !request.activation.is_empty() {
+        command.arg("--input").arg(&input_path);
+    }
+    if request.next_hop().is_some() {
+        command.arg("--output").arg(&output_path);
+    }
+
+    let output = command.output().with_context(|| {
+        format!(
+            "failed to run {} for {} {}:{}",
+            bridge.display(),
+            config.model_id,
+            layers.start,
+            layers.end
+        )
+    })?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let json_line = stdout
+        .lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with('{'))
+        .ok_or_else(|| {
+            anyhow!(
+                "infernet-llama-bridge produced no JSON output; status={:?}; stderr={}",
+                output.status.code(),
+                stderr.trim()
+            )
+        })?;
+    let bridge_output: LlamaBridgeJson = serde_json::from_str(json_line)
+        .with_context(|| format!("failed to parse infernet-llama-bridge JSON: {json_line}"))?;
+
+    if !output.status.success() || !bridge_output.ok {
+        bail!(
+            "infernet-llama-bridge failed for {} {}:{}: {}{}",
+            config.model_id,
+            layers.start,
+            layers.end,
+            bridge_output
+                .error
+                .unwrap_or_else(|| format!("exit status {:?}", output.status.code())),
+            if stderr.trim().is_empty() {
+                String::new()
+            } else {
+                format!("; stderr={}", stderr.trim())
+            }
+        );
+    }
+
+    if let Some(hidden_size) = bridge_output.hidden_size {
+        if hidden_size != config.hidden_size {
+            bail!(
+                "infernet-llama-bridge hidden size mismatch: {} vs {}",
+                hidden_size,
+                config.hidden_size
+            );
+        }
+    }
+
+    let activation = if request.next_hop().is_some() {
+        let activation = read_f32_activation(&output_path)?;
+        if let Some(expected) = bridge_output.output_f32_count {
+            if activation.len() != expected {
+                bail!(
+                    "infernet-llama-bridge wrote {} f32 values, JSON reported {}",
+                    activation.len(),
+                    expected
+                );
+            }
+        }
+        if let Some(n_tokens) = bridge_output.n_tokens {
+            let expected = n_tokens
+                .checked_mul(config.hidden_size)
+                .ok_or_else(|| anyhow!("activation shape overflow"))?;
+            if activation.len() != expected {
+                bail!(
+                    "activation shape mismatch from bridge: got {} f32 values, expected {} tokens x {} hidden = {}",
+                    activation.len(),
+                    n_tokens,
+                    config.hidden_size,
+                    expected
+                );
+            }
+        }
+        activation
+    } else {
+        Vec::new()
+    };
+
+    let _ = fs::remove_file(&input_path);
+    let _ = fs::remove_file(&output_path);
+
+    Ok(LlamaShardOutput {
+        activation,
+        output_text: bridge_output.output_text,
+        timing_ms: bridge_output
+            .timing_ms
+            .map(|value| value.max(0.0).round() as u64)
+            .unwrap_or(0),
+    })
+}
+
+fn write_f32_activation(path: &Path, values: &[f32]) -> Result<()> {
+    let mut file =
+        fs::File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
+    for value in values {
+        file.write_all(&value.to_le_bytes())
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn read_f32_activation(path: &Path) -> Result<Vec<f32>> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if bytes.len() % mem::size_of::<f32>() != 0 {
+        bail!(
+            "{} is not aligned to f32 values: {} bytes",
+            path.display(),
+            bytes.len()
+        );
+    }
+    let mut values = Vec::with_capacity(bytes.len() / mem::size_of::<f32>());
+    for chunk in bytes.chunks_exact(mem::size_of::<f32>()) {
+        values.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    Ok(values)
+}
+
+fn find_llama_bridge_binary() -> Option<PathBuf> {
+    if let Ok(path) = env::var("INFERNET_LLAMA_BRIDGE") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    for candidate in bundled_llama_bridge_candidates() {
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    let mut executable_names = vec![platform_executable_name("infernet-llama-bridge")];
+    if let Some(sidecar_name) = bundled_llama_bridge_sidecar_name() {
+        executable_names.push(sidecar_name.to_owned());
+    }
+    if let Some(path) = env::var_os("PATH") {
+        for directory in env::split_paths(&path) {
+            for name in &executable_names {
+                let candidate = directory.join(name);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn bundled_llama_bridge_candidates() -> Vec<PathBuf> {
+    let executable_name = platform_executable_name("infernet-llama-bridge");
+    let sidecar_name = bundled_llama_bridge_sidecar_name();
+    let mut candidates = Vec::new();
+
+    if let Ok(current_exe) = env::current_exe() {
+        if let Some(parent) = current_exe.parent() {
+            candidates.push(parent.join(&executable_name));
+            candidates.push(parent.join("binaries").join(&executable_name));
+            if let Some(sidecar_name) = sidecar_name {
+                candidates.push(parent.join(sidecar_name));
+                candidates.push(parent.join("binaries").join(sidecar_name));
+            }
+            if let Some(resources) = parent.parent().map(|path| path.join("Resources")) {
+                candidates.push(resources.join(&executable_name));
+                candidates.push(resources.join("binaries").join(&executable_name));
+                if let Some(sidecar_name) = sidecar_name {
+                    candidates.push(resources.join(sidecar_name));
+                    candidates.push(resources.join("binaries").join(sidecar_name));
+                }
+            }
+        }
+    }
+
+    let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    if let Some(repo_root) = crate_dir.parent().and_then(Path::parent) {
+        let binaries = repo_root
+            .join("infernet-ui")
+            .join("src-tauri")
+            .join("binaries");
+        candidates.push(binaries.join(&executable_name));
+        if let Some(sidecar_name) = sidecar_name {
+            candidates.push(binaries.join(sidecar_name));
+        }
+    }
+
+    candidates
+}
+
+fn platform_executable_name(base: &str) -> String {
+    if cfg!(windows) {
+        format!("{base}.exe")
+    } else {
+        base.to_owned()
+    }
+}
+
+fn bundled_llama_bridge_sidecar_name() -> Option<&'static str> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        return Some("infernet-llama-bridge-aarch64-apple-darwin");
+    }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        return Some("infernet-llama-bridge-x86_64-apple-darwin");
+    }
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        return Some("infernet-llama-bridge-x86_64-pc-windows-msvc.exe");
+    }
+    #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+    {
+        return Some("infernet-llama-bridge-aarch64-pc-windows-msvc.exe");
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        return Some("infernet-llama-bridge-x86_64-unknown-linux-gnu");
+    }
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    {
+        return Some("infernet-llama-bridge-aarch64-unknown-linux-gnu");
+    }
+    #[allow(unreachable_code)]
+    None
 }
 
 fn validate_activation_request(config: &WorkerConfig, request: &ActivationRequest) -> Result<()> {
@@ -1329,52 +1706,130 @@ async fn wait_for_client_response(
 fn handle_worker_activation_event(
     swarm: &mut Swarm<GridBehaviour>,
     worker: &WorkerConfig,
+    activation_relays: &[NodeAdvertisement],
+    network_event: ActivationNetworkEvent,
+    pending_forwards: &mut HashMap<request_response::OutboundRequestId, PendingOutbound>,
+) -> Result<()> {
+    match network_event {
+        ActivationNetworkEvent::Request { request, channel } => handle_worker_activation_request(
+            swarm,
+            worker,
+            activation_relays,
+            request,
+            channel,
+            pending_forwards,
+        )?,
+        ActivationNetworkEvent::Response {
+            request_id,
+            response,
+        } => {
+            if let Some(PendingOutbound::Forward { channel, .. }) =
+                pending_forwards.remove(&request_id)
+            {
+                send_response(swarm, channel, response);
+            }
+        }
+        ActivationNetworkEvent::OutboundFailure {
+            peer,
+            request_id,
+            error,
+        } => {
+            if let Some(PendingOutbound::Forward {
+                channel,
+                trace_id,
+                peer_id,
+                trace,
+            }) = pending_forwards.remove(&request_id)
+            {
+                send_response(
+                    swarm,
+                    channel,
+                    ActivationResponse::failure(
+                        trace_id,
+                        peer_id,
+                        format!("forward to {peer} failed: {error}"),
+                        trace,
+                    ),
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_worker_activation_request(
+    swarm: &mut Swarm<GridBehaviour>,
+    worker: &WorkerConfig,
+    activation_relays: &[NodeAdvertisement],
+    mut request: ActivationRequest,
+    channel: request_response::ResponseChannel<ActivationResponse>,
+    pending_forwards: &mut HashMap<request_response::OutboundRequestId, PendingOutbound>,
+) -> Result<()> {
+    if request
+        .current_hop()
+        .is_some_and(|hop| hop.peer_id != worker.peer_id)
+    {
+        return forward_activation_request(
+            swarm,
+            &worker.peer_id,
+            activation_relays,
+            request,
+            channel,
+            pending_forwards,
+        );
+    }
+
+    loop {
+        match process_activation_step(worker, request) {
+            Ok(ActivationStep::Final(response)) => {
+                send_response(swarm, channel, response);
+                return Ok(());
+            }
+            Ok(ActivationStep::Forward(next_request)) => {
+                if next_request
+                    .current_hop()
+                    .is_some_and(|hop| hop.peer_id == worker.peer_id)
+                {
+                    request = next_request;
+                    continue;
+                }
+                return forward_activation_request(
+                    swarm,
+                    &worker.peer_id,
+                    activation_relays,
+                    next_request,
+                    channel,
+                    pending_forwards,
+                );
+            }
+            Err(response) => {
+                send_response(swarm, channel, response);
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn handle_cached_activation_event(
+    swarm: &mut Swarm<GridBehaviour>,
+    cache: &ShardCache,
+    peer_id: &str,
+    activation_relays: &[NodeAdvertisement],
     network_event: ActivationNetworkEvent,
     pending_forwards: &mut HashMap<request_response::OutboundRequestId, PendingOutbound>,
 ) -> Result<()> {
     match network_event {
         ActivationNetworkEvent::Request { request, channel } => {
-            let trace_id = request.trace_id;
-
-            match process_activation_step(worker, request) {
-                Ok(ActivationStep::Final(response)) => {
-                    send_response(swarm, channel, response);
-                }
-                Ok(ActivationStep::Forward(request)) => {
-                    let next_hop = request
-                        .current_hop()
-                        .cloned()
-                        .ok_or_else(|| anyhow!("forwarded request has no current hop"))?;
-                    match send_activation_request(swarm, &next_hop, request.clone()) {
-                        Ok(request_id) => {
-                            pending_forwards.insert(
-                                request_id,
-                                PendingOutbound::Forward {
-                                    channel,
-                                    trace_id,
-                                    peer_id: worker.peer_id.clone(),
-                                    trace: request.trace,
-                                },
-                            );
-                        }
-                        Err(error) => {
-                            send_response(
-                                swarm,
-                                channel,
-                                ActivationResponse::failure(
-                                    trace_id,
-                                    worker.peer_id.clone(),
-                                    format!("failed to forward activation: {error:#}"),
-                                    request.trace.clone(),
-                                ),
-                            );
-                        }
-                    }
-                }
-                Err(response) => {
-                    send_response(swarm, channel, response);
-                }
-            }
+            handle_cached_activation_request(
+                swarm,
+                cache,
+                peer_id,
+                activation_relays,
+                request,
+                channel,
+                pending_forwards,
+            )?;
         }
         ActivationNetworkEvent::Response {
             request_id,
@@ -1413,6 +1868,149 @@ fn handle_worker_activation_event(
     }
 
     Ok(())
+}
+
+fn handle_cached_activation_request(
+    swarm: &mut Swarm<GridBehaviour>,
+    cache: &ShardCache,
+    peer_id: &str,
+    activation_relays: &[NodeAdvertisement],
+    mut request: ActivationRequest,
+    channel: request_response::ResponseChannel<ActivationResponse>,
+    pending_forwards: &mut HashMap<request_response::OutboundRequestId, PendingOutbound>,
+) -> Result<()> {
+    loop {
+        let trace_id = request.trace_id;
+        if request
+            .current_hop()
+            .is_some_and(|hop| hop.peer_id != peer_id)
+        {
+            return forward_activation_request(
+                swarm,
+                peer_id,
+                activation_relays,
+                request,
+                channel,
+                pending_forwards,
+            );
+        }
+
+        let worker = match worker_config_for_activation(cache, peer_id, &request) {
+            Ok(worker) => worker,
+            Err(error) => {
+                send_response(
+                    swarm,
+                    channel,
+                    ActivationResponse::failure(
+                        trace_id,
+                        peer_id.to_owned(),
+                        error.to_string(),
+                        request.trace,
+                    ),
+                );
+                return Ok(());
+            }
+        };
+
+        match process_activation_step(&worker, request) {
+            Ok(ActivationStep::Final(response)) => {
+                send_response(swarm, channel, response);
+                return Ok(());
+            }
+            Ok(ActivationStep::Forward(next_request)) => {
+                if next_request
+                    .current_hop()
+                    .is_some_and(|hop| hop.peer_id == peer_id)
+                {
+                    request = next_request;
+                    continue;
+                }
+                return forward_activation_request(
+                    swarm,
+                    peer_id,
+                    activation_relays,
+                    next_request,
+                    channel,
+                    pending_forwards,
+                );
+            }
+            Err(response) => {
+                send_response(swarm, channel, response);
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn forward_activation_request(
+    swarm: &mut Swarm<GridBehaviour>,
+    local_peer_id: &str,
+    activation_relays: &[NodeAdvertisement],
+    request: ActivationRequest,
+    channel: request_response::ResponseChannel<ActivationResponse>,
+    pending_forwards: &mut HashMap<request_response::OutboundRequestId, PendingOutbound>,
+) -> Result<()> {
+    let trace_id = request.trace_id;
+    let next_hop = request
+        .current_hop()
+        .cloned()
+        .ok_or_else(|| anyhow!("forwarded request has no current hop"))?;
+    match send_activation_request_with_relays(swarm, activation_relays, &next_hop, request.clone())
+    {
+        Ok(request_id) => {
+            pending_forwards.insert(
+                request_id,
+                PendingOutbound::Forward {
+                    channel,
+                    trace_id,
+                    peer_id: local_peer_id.to_owned(),
+                    trace: request.trace,
+                },
+            );
+        }
+        Err(error) => {
+            send_response(
+                swarm,
+                channel,
+                ActivationResponse::failure(
+                    trace_id,
+                    local_peer_id.to_owned(),
+                    format!("failed to forward activation: {error:#}"),
+                    request.trace.clone(),
+                ),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn worker_config_for_activation(
+    cache: &ShardCache,
+    peer_id: &str,
+    request: &ActivationRequest,
+) -> Result<WorkerConfig> {
+    let hop = request
+        .current_hop()
+        .ok_or_else(|| anyhow!("missing route hop {}", request.current_hop_index))?;
+    let (manifest, _) = executable_seed_manifest_for_layers(cache, &request.model_id, hop.layers)?
+        .ok_or_else(|| {
+            anyhow!(
+                "peer {} does not have executable shard {} {}:{}",
+                peer_id,
+                request.model_id,
+                hop.layers.start,
+                hop.layers.end
+            )
+        })?;
+
+    Ok(WorkerConfig {
+        peer_id: peer_id.to_owned(),
+        model_id: manifest.model_id,
+        runtime_kind: manifest.runtime_kind,
+        owned_layers: manifest.layers,
+        hidden_size: manifest.hidden_size,
+        shard_cache: Some(cache.config().clone()),
+    })
 }
 
 fn handle_model_network_event(
@@ -1597,6 +2195,34 @@ fn executable_seed_manifest_for_source(
     Ok(None)
 }
 
+fn executable_seed_manifest_for_layers(
+    cache: &ShardCache,
+    model_id: &str,
+    layers: LayerRange,
+) -> Result<Option<(SeedShardManifest, PathBuf)>> {
+    for record in cache.list()? {
+        if record.info.model_id != model_id || record.info.layers != layers {
+            continue;
+        }
+        let payload = cache.read_payload(&record.info)?;
+        let manifest = match serde_json::from_slice::<SeedShardManifest>(&payload) {
+            Ok(manifest) => manifest,
+            Err(_) => continue,
+        };
+        if manifest.model_id != model_id || manifest.layers != layers {
+            continue;
+        }
+        if manifest.runtime_kind == RuntimeKind::Demo {
+            return Ok(Some((manifest, PathBuf::new())));
+        }
+        if let Some(source_path) = executable_source_path_for_manifest(cache.config(), &manifest) {
+            return Ok(Some((manifest, source_path)));
+        }
+    }
+
+    Ok(None)
+}
+
 fn read_source_chunk(path: &Path, offset: u64, len: usize) -> Result<Vec<u8>> {
     let mut file =
         fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
@@ -1633,6 +2259,51 @@ fn send_activation_request(
     };
 
     Ok(request_id)
+}
+
+fn send_activation_request_with_relays(
+    swarm: &mut Swarm<GridBehaviour>,
+    activation_relays: &[NodeAdvertisement],
+    hop: &RouteHop,
+    request: ActivationRequest,
+) -> Result<request_response::OutboundRequestId> {
+    let local_peer_id = swarm.local_peer_id().to_string();
+    let relay_hop = activation_relay_hop(&local_peer_id, activation_relays, hop);
+    let send_hop = relay_hop.as_ref().unwrap_or(hop);
+    if send_hop.peer_id != hop.peer_id {
+        println!(
+            "activation_relay target_peer={} relay_peer={} trace_id={}",
+            hop.peer_id, send_hop.peer_id, request.trace_id
+        );
+    }
+    send_activation_request(swarm, send_hop, request)
+}
+
+fn activation_relay_hop(
+    local_peer_id: &str,
+    activation_relays: &[NodeAdvertisement],
+    target_hop: &RouteHop,
+) -> Option<RouteHop> {
+    if route_hop_is_loopback(target_hop) {
+        return None;
+    }
+
+    activation_relays
+        .iter()
+        .filter(|relay| relay.peer_id != local_peer_id && relay.peer_id != target_hop.peer_id)
+        .find_map(|relay| {
+            relay.addresses.first().map(|address| RouteHop {
+                peer_id: relay.peer_id.clone(),
+                address: address.clone(),
+                layers: target_hop.layers,
+            })
+        })
+}
+
+fn route_hop_is_loopback(hop: &RouteHop) -> bool {
+    hop.address.contains("/ip4/127.")
+        || hop.address.contains("/ip6/::1")
+        || hop.address.contains("/ip6/0:0:0:0:0:0:0:1")
 }
 
 fn send_model_shard_request(
@@ -2191,6 +2862,13 @@ mod tests {
         }
     }
 
+    fn relay(peer_id: &str) -> NodeAdvertisement {
+        empty_advertisement(
+            peer_id.to_owned(),
+            format!("/ip4/203.0.113.10/tcp/9777/p2p/{peer_id}"),
+        )
+    }
+
     #[test]
     fn activation_step_forwards_to_next_hop() {
         let route = vec![hop("peer-a", 0, 3), hop("peer-b", 3, 6)];
@@ -2226,6 +2904,31 @@ mod tests {
                 .unwrap()
                 .contains("route requested LayerRange")
         );
+    }
+
+    #[test]
+    fn activation_relay_selected_for_non_loopback_remote_hop() {
+        let target = RouteHop {
+            peer_id: "peer-b".to_owned(),
+            address: "/ip4/10.0.0.2/tcp/9777/p2p/peer-b".to_owned(),
+            layers: LayerRange::new(0, 3).unwrap(),
+        };
+
+        let relay = activation_relay_hop("peer-a", &[relay("relay-peer")], &target).unwrap();
+
+        assert_eq!(relay.peer_id, "relay-peer");
+        assert_eq!(relay.layers, target.layers);
+    }
+
+    #[test]
+    fn activation_relay_skips_loopback_target() {
+        let target = RouteHop {
+            peer_id: "peer-b".to_owned(),
+            address: "/ip4/127.0.0.1/tcp/9777/p2p/peer-b".to_owned(),
+            layers: LayerRange::new(0, 3).unwrap(),
+        };
+
+        assert!(activation_relay_hop("peer-a", &[relay("relay-peer")], &target).is_none());
     }
 
     #[tokio::test]

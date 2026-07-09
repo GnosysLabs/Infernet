@@ -485,9 +485,11 @@ hop completion appear in the UI at the exact moment each remote worker finishes.
 Current Phase 2 research and implementation notes live in
 [gguf-split-inference-design.md](gguf-split-inference-design.md). The selected
 first target is `llama-3.2-1b`. The repository now supports GGUF sidecar
-shard metadata and runtime-kind-aware routing, but real llama.cpp layer-range
-execution is deliberately blocked until a native bridge can load only the
-assigned layer range.
+shard metadata, runtime-kind-aware routing, and the first patched llama.cpp
+sidecar bridge for contiguous layer-range execution. That bridge is currently a
+prompt-pass/one-token proof path; binary network tensor frames, persistent
+distributed KV state, and physical tensor-only shard files remain open runtime
+work.
 
 ## Open Questions
 
