@@ -52,6 +52,12 @@ import type {
 
 type Page = "chat" | "models" | "downloads" | "settings";
 type Message = { id: string; role: "user" | "assistant"; text: string };
+type TransferStatus = "active" | "complete" | "error";
+type TransferActivity = ModelImportProgress & {
+  id: string;
+  status: TransferStatus;
+  updatedAt: number;
+};
 
 const DEFAULT_PROMPT = "";
 const INITIAL_MESSAGES: Message[] = [
@@ -76,6 +82,7 @@ export default function App() {
   const [hops, setHops] = useState<HopProgress[]>([]);
   const [route, setRoute] = useState<RouteHopView[]>([]);
   const [lastError, setLastError] = useState<string | null>(null);
+  const [transferActivities, setTransferActivities] = useState<TransferActivity[]>([]);
 
   const selectedModelView = useMemo(
     () => snapshot.availableModels.find((model) => model.modelId === selectedModel),
@@ -85,6 +92,7 @@ export default function App() {
   const peerCount = uniquePeerCount(activeRoute);
   const remotePeerCount = snapshot.networkPeerCount;
   const completedHops = hops.filter((hop) => hop.status === "complete").length;
+  const activeTransfers = transferActivities.filter((activity) => activity.status === "active").length;
 
   const applyProgressEvent = useCallback((event: ProgressEvent) => {
     if (event.type === "routeDiscovered") {
@@ -176,6 +184,19 @@ export default function App() {
     };
   }, [applyProgressEvent]);
 
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listenForModelImportProgress((event) => {
+      setTransferActivities((current) => upsertTransferActivity(current, event));
+    }).then((dispose) => {
+      unlisten = dispose;
+    });
+
+    return () => {
+      unlisten?.();
+    };
+  }, []);
+
   function handleModelChange(modelId: string) {
     setSelectedModel(modelId);
     setPage("chat");
@@ -259,6 +280,9 @@ export default function App() {
             model={selectedModelView}
             route={activeRoute}
             hops={hops}
+            snapshot={snapshot}
+            transferActivities={transferActivities}
+            activeTransfers={activeTransfers}
             peerCount={peerCount}
             completedHops={completedHops}
             lastError={lastError}
@@ -278,7 +302,13 @@ export default function App() {
           />
         ) : null}
 
-        {page === "downloads" ? <DownloadsPage snapshot={snapshot} developerMode={developerMode} /> : null}
+        {page === "downloads" ? (
+          <DownloadsPage
+            snapshot={snapshot}
+            transferActivities={transferActivities}
+            developerMode={developerMode}
+          />
+        ) : null}
 
         {page === "settings" ? (
           <SettingsPage
@@ -398,6 +428,9 @@ function ChatPage({
   model,
   route,
   hops,
+  snapshot,
+  transferActivities,
+  activeTransfers,
   peerCount,
   completedHops,
   lastError,
@@ -414,6 +447,9 @@ function ChatPage({
   model?: ModelView;
   route: RouteHopView[];
   hops: HopProgress[];
+  snapshot: GridSnapshot;
+  transferActivities: TransferActivity[];
+  activeTransfers: number;
   peerCount: number;
   completedHops: number;
   lastError: string | null;
@@ -424,6 +460,7 @@ function ChatPage({
 }) {
   const networkVisible = showNetwork || developerMode;
   const canSend = Boolean(model);
+  const shouldShowNetworkSummary = Boolean(model) && !(isRunning || hops.length > 0 || lastError);
 
   return (
     <section className="chat-screen">
@@ -458,6 +495,7 @@ function ChatPage({
           <RunStatusCard
             isRunning={isRunning}
             peerCount={peerCount}
+            activeTransfers={activeTransfers}
             completedHops={completedHops}
             totalHops={route.length}
             lastError={lastError}
@@ -466,8 +504,25 @@ function ChatPage({
           />
         ) : null}
 
+        {shouldShowNetworkSummary ? (
+          <NetworkSummaryCard
+            snapshot={snapshot}
+            route={route}
+            activeTransfers={activeTransfers}
+            showNetwork={networkVisible}
+            setShowNetwork={setShowNetwork}
+          />
+        ) : null}
+
         {networkVisible ? (
-          <NetworkActivity route={route} hops={hops} model={model} />
+          <NetworkActivity
+            route={route}
+            hops={hops}
+            snapshot={snapshot}
+            transferActivities={transferActivities}
+            model={model}
+            developerMode={developerMode}
+          />
         ) : null}
       </div>
 
@@ -501,6 +556,7 @@ function ChatPage({
 function RunStatusCard({
   isRunning,
   peerCount,
+  activeTransfers,
   completedHops,
   totalHops,
   lastError,
@@ -509,6 +565,7 @@ function RunStatusCard({
 }: {
   isRunning: boolean;
   peerCount: number;
+  activeTransfers: number;
   completedHops: number;
   totalHops: number;
   lastError: string | null;
@@ -522,6 +579,8 @@ function RunStatusCard({
       : "Response ready";
   const detail = peerCount > 1
     ? `Connected to ${peerCount} peers`
+    : activeTransfers > 0
+      ? `${activeTransfers} shard transfer${activeTransfers === 1 ? "" : "s"} active`
     : "Running on Community Compute";
   const phase = lastError
     ? lastError
@@ -546,15 +605,62 @@ function RunStatusCard({
   );
 }
 
+function NetworkSummaryCard({
+  snapshot,
+  route,
+  activeTransfers,
+  showNetwork,
+  setShowNetwork,
+}: {
+  snapshot: GridSnapshot;
+  route: RouteHopView[];
+  activeTransfers: number;
+  showNetwork: boolean;
+  setShowNetwork: (show: boolean) => void;
+}) {
+  const routeLabel = route.length > 0
+    ? `${route.length} shard group${route.length === 1 ? "" : "s"} routed`
+    : snapshot.missingRanges
+      ? "Route incomplete"
+      : "Finding route";
+  const transferLabel = activeTransfers > 0
+    ? `${activeTransfers} download${activeTransfers === 1 ? "" : "s"} active`
+    : "No active downloads";
+
+  return (
+    <div className="network-summary-card">
+      <div>
+        <strong>AI Grid activity</strong>
+        <span>{routeLabel} - {transferLabel} - {snapshot.networkPeerCount} remote peer{snapshot.networkPeerCount === 1 ? "" : "s"}</span>
+      </div>
+      <button className="text-button" onClick={() => setShowNetwork(!showNetwork)}>
+        {showNetwork ? "Hide network activity" : "Show network activity"}
+      </button>
+    </div>
+  );
+}
+
 function NetworkActivity({
   route,
   hops,
+  snapshot,
+  transferActivities,
   model,
+  developerMode,
 }: {
   route: RouteHopView[];
   hops: HopProgress[];
+  snapshot: GridSnapshot;
+  transferActivities: TransferActivity[];
   model?: ModelView;
+  developerMode: boolean;
 }) {
+  const coveredLayers = snapshot.coverage.filter((segment) => segment.covered).length;
+  const totalLayers = snapshot.layerCount || model?.layerCount || 0;
+  const coveragePercent = totalLayers > 0 ? Math.round((coveredLayers / totalLayers) * 100) : 0;
+  const activeTransfers = transferActivities.filter((activity) => activity.status === "active");
+  const recentTransfers = transferActivities.slice(0, 6);
+
   return (
     <div className="network-activity">
       <div className="activity-header">
@@ -565,26 +671,126 @@ function NetworkActivity({
         <SlidersHorizontal size={17} />
       </div>
 
-      <div className="activity-timeline">
-        {route.length === 0 ? (
-          <div className="empty-state">No route is available for this model yet.</div>
+      <div className="activity-grid">
+        <ActivityStat label="Remote peers" value={String(snapshot.networkPeerCount)} />
+        <ActivityStat label="Route coverage" value={totalLayers > 0 ? `${coveragePercent}%` : "Unknown"} />
+        <ActivityStat label="Route groups" value={String(route.length)} />
+        <ActivityStat label="Active transfers" value={String(activeTransfers.length)} />
+      </div>
+
+      {snapshot.missingRanges ? (
+        <div className="activity-warning">
+          <strong>Route missing</strong>
+          <span>{snapshot.missingRanges}</span>
+        </div>
+      ) : null}
+
+      <div className="activity-section">
+        <div className="activity-section-title">
+          <strong>Shard Transfers</strong>
+          <span>{activeTransfers.length > 0 ? "Downloading and verifying model bytes" : "No active transfer right now"}</span>
+        </div>
+        {recentTransfers.length === 0 ? (
+          <div className="empty-state compact">No shard download events have arrived yet.</div>
         ) : (
-          route.map((hop, index) => {
-            const progress = hops.find((item) => item.key === hopKey(hop.peerId, hop.layerStart, hop.layerEnd));
-            return (
-              <div className="activity-hop" key={`${hop.peerId}-${hop.layerStart}`}>
-                <span>{index + 1}</span>
-                <div>
-                  <strong>{progress?.status === "complete" ? "Completed" : progress?.status === "running" ? "Running" : "Ready"}</strong>
-                  <small>
-                    Layer group {hop.layerStart}:{hop.layerEnd}
-                    {progress?.timingMs ? ` - ${progress.timingMs} ms` : ""}
-                  </small>
-                </div>
-              </div>
-            );
-          })
+          <div className="transfer-list">
+            {recentTransfers.map((activity) => (
+              <TransferActivityRow activity={activity} key={activity.id} />
+            ))}
+          </div>
         )}
+      </div>
+
+      <div className="activity-section">
+        <div className="activity-section-title">
+          <strong>Inference Route</strong>
+          <span>{route.length > 0 ? "Layer groups selected for execution" : "Waiting for complete executable shard coverage"}</span>
+        </div>
+        <div className="activity-timeline">
+          {route.length === 0 ? (
+            <div className="empty-state compact">No route is available for this model yet.</div>
+          ) : (
+            route.map((hop, index) => {
+              const progress = hops.find((item) => item.key === hopKey(hop.peerId, hop.layerStart, hop.layerEnd));
+              return (
+                <div className="activity-hop" key={`${hop.peerId}-${hop.layerStart}`}>
+                  <span>{index + 1}</span>
+                  <div>
+                    <strong>{progress?.status === "complete" ? "Completed" : progress?.status === "running" ? "Running" : "Ready"}</strong>
+                    <small>
+                      Layers {hop.layerStart}:{hop.layerEnd} - peer {hop.shortPeerId}
+                      {progress?.activationSizeBytes ? ` - ${formatBytes(progress.activationSizeBytes)} activation` : ""}
+                      {progress?.timingMs ? ` - ${progress.timingMs} ms` : ""}
+                    </small>
+                    {developerMode ? <code>{hop.address || hop.peerId}</code> : null}
+                  </div>
+                </div>
+              );
+            })
+          )}
+        </div>
+      </div>
+
+      <div className="activity-section">
+        <div className="activity-section-title">
+          <strong>Discovered Executable Peers</strong>
+          <span>{snapshot.peers.length > 0 ? "Peers advertising verified physical shards" : "No executable shard peers visible yet"}</span>
+        </div>
+        {snapshot.peers.length === 0 ? (
+          <div className="empty-state compact">Connected peers have not advertised executable shards for this model.</div>
+        ) : (
+          <div className="peer-inventory">
+            {snapshot.peers.map((peer) => (
+              <div className="peer-inventory-row" key={peer.peerId}>
+                <div>
+                  <strong>{peer.shortPeerId}</strong>
+                  <span>{peer.shards.length} shard group{peer.shards.length === 1 ? "" : "s"} - protocol v{peer.protocolVersion}</span>
+                </div>
+                <div className="shard-chip-row">
+                  {peer.shards.map((shard) => (
+                    <span className="shard-chip" key={`${peer.peerId}-${shard.modelId}-${shard.layerStart}-${shard.layerEnd}`}>
+                      {shard.layerStart}:{shard.layerEnd}
+                    </span>
+                  ))}
+                </div>
+                {developerMode ? <code>{peer.addresses[0] ?? peer.peerId}</code> : null}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ActivityStat({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="activity-stat">
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
+
+function TransferActivityRow({ activity }: { activity: TransferActivity }) {
+  const percent = activity.totalBytes
+    ? Math.min(100, Math.round((activity.downloadedBytes / activity.totalBytes) * 100))
+    : null;
+  return (
+    <div className={`transfer-row ${activity.status}`}>
+      <div>
+        <strong>{activity.stage}</strong>
+        <span>{activity.detail}</span>
+      </div>
+      <div className="transfer-progress">
+        <ProgressBar progress={percent ?? (activity.status === "active" ? 22 : 100)} />
+        <small>
+          {percent !== null
+            ? `${percent}% - ${formatBytes(activity.downloadedBytes)} / ${formatBytes(activity.totalBytes ?? 0)}`
+            : activity.status === "error"
+              ? "Failed"
+              : "Waiting for size"}
+        </small>
       </div>
     </div>
   );
@@ -923,37 +1129,94 @@ function ImportProgressCard({ progress }: { progress: ModelImportProgress | null
   );
 }
 
-function DownloadsPage({ snapshot, developerMode }: { snapshot: GridSnapshot; developerMode: boolean }) {
+function DownloadsPage({
+  snapshot,
+  transferActivities,
+  developerMode,
+}: {
+  snapshot: GridSnapshot;
+  transferActivities: TransferActivity[];
+  developerMode: boolean;
+}) {
   const distribution = snapshot.distribution;
+  const activeTransfers = transferActivities.filter((activity) => activity.status === "active");
+  const recentTransfers = transferActivities.slice(0, 10);
 
   return (
     <section className="downloads-screen">
       <div className="section-heading">
         <h2>Downloads</h2>
-        <p>Contribution and storage activity for this node.</p>
+        <p>Shard transfer, storage, and contribution activity for this node.</p>
       </div>
 
       <div className="download-metrics">
         <DownloadMetric icon={<HardDrive size={20} />} label="Storage used" value={formatBytes(distribution.storageUsedBytes)} />
-        <DownloadMetric icon={<Download size={20} />} label="Downloads" value={String(distribution.currentDownloads)} />
-        <DownloadMetric icon={<UploadCloud size={20} />} label="Uploads" value={String(distribution.currentUploads)} />
-        <DownloadMetric icon={<CheckCircle2 size={20} />} label="Contribution" value="Enabled" />
+        <DownloadMetric icon={<Download size={20} />} label="Active downloads" value={String(activeTransfers.length)} />
+        <DownloadMetric icon={<UploadCloud size={20} />} label="Hosted shards" value={String(distribution.installedShards.length)} />
+        <DownloadMetric icon={<CheckCircle2 size={20} />} label="Network models" value={String(snapshot.availableModels.length)} />
       </div>
 
-      <div className="download-list">
-        {distribution.installedShards.length === 0 ? (
-          <div className="empty-state">No local model shards installed.</div>
+      <div className="download-panel">
+        <div className="activity-section-title">
+          <strong>Live Transfers</strong>
+          <span>{activeTransfers.length > 0 ? "Downloading model shards from peers" : "No active shard downloads"}</span>
+        </div>
+        {recentTransfers.length === 0 ? (
+          <div className="empty-state compact">No transfer events have been seen in this session.</div>
         ) : (
-          distribution.installedShards.map((shard) => (
-            <div className="download-row" key={`${shard.modelId}-${shard.layerStart}-${shard.layerEnd}-${shard.checksum}`}>
-              <div>
-                <strong>{shard.modelId}</strong>
-                <span>{formatBytes(shard.sizeBytes)} - {shard.version}</span>
+          <div className="transfer-list">
+            {recentTransfers.map((activity) => (
+              <TransferActivityRow activity={activity} key={activity.id} />
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div className="download-panel">
+        <div className="activity-section-title">
+          <strong>Installed Shards</strong>
+          <span>{distribution.installedShards.length} verified physical shard{distribution.installedShards.length === 1 ? "" : "s"} stored locally</span>
+        </div>
+        <div className="download-list">
+          {distribution.installedShards.length === 0 ? (
+            <div className="empty-state compact">No local model shards installed.</div>
+          ) : (
+            distribution.installedShards.map((shard) => (
+              <div className="download-row" key={`${shard.modelId}-${shard.layerStart}-${shard.layerEnd}-${shard.checksum}`}>
+                <div>
+                  <strong>{shard.modelId}</strong>
+                  <span>Layers {shard.layerStart}:{shard.layerEnd} - {formatBytes(shard.sizeBytes)} - {shard.version}</span>
+                </div>
+                <span>Hosted</span>
+                <small>{developerMode ? shard.checksum : shortHash(shard.checksum)}</small>
               </div>
-              <span>Hosted</span>
-              {developerMode ? <small>{shard.layerStart}:{shard.layerEnd}</small> : null}
-            </div>
-          ))
+            ))
+          )}
+        </div>
+      </div>
+
+      <div className="download-panel">
+        <div className="activity-section-title">
+          <strong>Replication Health</strong>
+          <span>How many peers are advertising each shard group</span>
+        </div>
+        {distribution.replicationHealth.length === 0 ? (
+          <div className="empty-state compact">No replicated shard groups are visible yet.</div>
+        ) : (
+          <div className="replication-list">
+            {distribution.replicationHealth.map((item) => (
+              <div className="replication-row" key={`${item.modelId}-${item.layerStart}-${item.layerEnd}`}>
+                <div>
+                  <strong>{item.modelId}</strong>
+                  <span>Layers {item.layerStart}:{item.layerEnd}</span>
+                </div>
+                <div className="replication-meter">
+                  <ProgressBar progress={Math.min(100, Math.round((item.replicas / item.targetReplicas) * 100))} />
+                  <small>{item.replicas} / {item.targetReplicas} replicas</small>
+                </div>
+              </div>
+            ))}
+          </div>
         )}
       </div>
     </section>
@@ -1161,6 +1424,42 @@ function uniquePeerCount(route: RouteHopView[]): number {
   return new Set(route.map((hop) => hop.peerId)).size;
 }
 
+function upsertTransferActivity(
+  current: TransferActivity[],
+  event: ModelImportProgress,
+): TransferActivity[] {
+  const activity: TransferActivity = {
+    ...event,
+    id: transferActivityId(event),
+    status: transferStatus(event.stage),
+    updatedAt: Date.now(),
+  };
+  const next = current.some((item) => item.id === activity.id)
+    ? current.map((item) => (item.id === activity.id ? activity : item))
+    : [activity, ...current];
+
+  return next
+    .sort((left, right) => right.updatedAt - left.updatedAt)
+    .slice(0, 24);
+}
+
+function transferActivityId(event: ModelImportProgress): string {
+  const layerMatch = event.detail.match(/layers\s+\d+:\d+/i);
+  const scope = layerMatch?.[0] ?? event.stage;
+  return `${event.modelId}:${scope}`;
+}
+
+function transferStatus(stage: string): TransferStatus {
+  const normalized = stage.toLowerCase();
+  if (normalized.includes("failed") || normalized.includes("error")) {
+    return "error";
+  }
+  if (normalized.includes("ready")) {
+    return "complete";
+  }
+  return "active";
+}
+
 function phaseLabel(completedHops: number, totalHops: number): string {
   if (totalHops === 0) {
     return "Finding compute";
@@ -1194,6 +1493,13 @@ function friendlyImportError(error: string): string {
   }
 
   return error;
+}
+
+function shortHash(value: string): string {
+  if (value.length <= 14) {
+    return value;
+  }
+  return `${value.slice(0, 8)}...${value.slice(-6)}`;
 }
 
 function formatBytes(bytes: number): string {
