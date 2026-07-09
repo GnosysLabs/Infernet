@@ -74,10 +74,10 @@ function main() {
   if (preparedPrebuilt) {
     const missingTools = missingSourceBuildTools();
     if (missingTools.length > 0) {
-      prepareFallbackBridge(
-        `source bridge build tools missing: ${missingTools.join(", ")}`
+      fail(
+        `cannot build required Infernet split-layer bridge; missing build tool(s): ${missingTools.join(", ")}. ` +
+        "Install CMake and a C++ compiler, rerun npm run prepare-runtime, or set INFERNET_LLAMA_BRIDGE to a real infernet-llama-bridge binary."
       );
-      return;
     }
   }
 
@@ -236,32 +236,6 @@ function buildFromSource() {
 
   copyRuntime(built, sidecarPath, "llama.cpp source build");
   copyRuntime(bridgeBuilt, bridgeSidecarPath, "Infernet llama.cpp bridge source build");
-}
-
-function prepareFallbackBridge(reason) {
-  if (process.env.INFERNET_REQUIRE_REAL_LLAMA_BRIDGE === "1") {
-    fail(`${reason}; refusing fallback bridge because INFERNET_REQUIRE_REAL_LLAMA_BRIDGE=1`);
-  }
-
-  log(`${reason}; preparing fallback Infernet bridge so the app can start`);
-  run("cargo", [
-    "build",
-    "--release",
-    "-p",
-    "infernet-llama-bridge-stub",
-    "--bin",
-    "infernet-llama-bridge",
-  ]);
-
-  const built = [
-    resolve(repoRoot, "target", "release", `infernet-llama-bridge${executableSuffix}`),
-    resolve(repoRoot, "target", "release", "infernet-llama-bridge"),
-  ].find(fileExists);
-  if (!built) {
-    fail("fallback Infernet bridge build finished, but the binary was not found");
-  }
-  copyRuntime(built, bridgeSidecarPath, "fallback Infernet llama.cpp bridge");
-  log("fallback bridge is for app startup and whole-model local fallback only; real split-layer GGUF execution still needs the CMake-built bridge");
 }
 
 function prepareInfernetBridgeSource() {

@@ -2322,13 +2322,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "infernet-llama-bridge-stub"
-version = "0.1.0"
-dependencies = [
- "serde_json",
-]
-
-[[package]]
 name = "infernet-model"
 version = "0.1.0"
 dependencies = [

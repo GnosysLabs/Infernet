@@ -29,6 +29,11 @@ runs a prompt pass across routed shards and samples one final token on the last
 shard. Persistent KV-cache streaming for multi-token generation is still future
 work.
 
+Infernet intentionally does not ship a fake or degraded replacement for
+`infernet-llama-bridge`. If the real split-layer bridge cannot be built or
+provided, runtime preparation fails. A crash at this stage means a required
+runtime dependency is missing and must be fixed, not hidden.
+
 ## Peer Discovery
 
 Each `infernet-worker serve` process creates a libp2p peer identity and joins a
@@ -307,5 +312,7 @@ Current limitations:
   hidden-state frames between routed peers.
 - The current GGUF bridge supports a prompt pass plus one sampled token. It does
   not yet keep distributed KV state for streaming multi-token generation.
+- Runtime preparation requires the real `infernet-llama-bridge`; missing CMake
+  or C++ build tooling is a hard failure, not a fallback path.
 - Peers are trusted for this phase; there is no correctness proof or privacy
   protection from the worker executing a layer.

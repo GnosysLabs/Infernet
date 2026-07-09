@@ -355,6 +355,9 @@ The UI should visualize:
 - The first bridge supports prompt-pass plus one sampled token. Persistent
   session state, KV-cache forwarding, and streaming multi-token generation are
   future runtime work.
+- There is no non-functional bridge fallback. If the real
+  `infernet-llama-bridge` cannot be built or provided, runtime preparation must
+  fail with the missing dependency instead of presenting the app as runnable.
 
 ## Immediate Implementation Sequence
 
