@@ -72,13 +72,7 @@ function main() {
     return;
   }
   if (preparedPrebuilt) {
-    const missingTools = missingSourceBuildTools();
-    if (missingTools.length > 0) {
-      fail(
-        `cannot build required Infernet split-layer bridge; missing build tool(s): ${missingTools.join(", ")}. ` +
-        "Install CMake and a C++ compiler, rerun npm run prepare-runtime, or set INFERNET_LLAMA_BRIDGE to a real infernet-llama-bridge binary."
-      );
-    }
+    ensureSourceBuildRequirements();
   }
 
   buildFromSource();
@@ -171,8 +165,7 @@ function prepareMacosPrebuilt() {
 }
 
 function buildFromSource() {
-  ensureCommand("git");
-  ensureCommand("cmake");
+  ensureSourceBuildRequirements();
 
   mkdirSync(buildRoot, { recursive: true });
   if (!existsSync(join(sourceDir, ".git"))) {
@@ -668,19 +661,119 @@ function findOnPath(names) {
   return null;
 }
 
-function ensureCommand(command) {
-  const result = spawnSync(command, ["--version"], { encoding: "utf8" });
-  if (result.error || result.status !== 0) {
-    fail(`required build tool is missing: ${command}`);
+function ensureSourceBuildRequirements() {
+  const missing = missingSourceBuildRequirements();
+  if (missing.length === 0) {
+    return;
   }
+
+  fail(
+    `cannot build required Infernet split-layer bridge; missing requirement(s): ${missing.join("; ")}.\n` +
+    sourceBuildInstallHint()
+  );
 }
 
-function missingSourceBuildTools() {
-  return ["git", "cmake"].filter((command) => !commandAvailable(command));
+function missingSourceBuildRequirements() {
+  const missing = [];
+  if (!commandAvailable("git")) {
+    missing.push("git");
+  }
+  if (!commandAvailable("cmake")) {
+    missing.push("cmake");
+  }
+  if (!hasCppToolchain()) {
+    missing.push(cppToolchainRequirement());
+  }
+  return missing;
+}
+
+function hasCppToolchain() {
+  if (isWindows) {
+    return commandExists("cl", ["/?"])
+      || commandSuccessful("clang++", ["--version"])
+      || commandSuccessful("g++", ["--version"])
+      || visualStudioCppToolsInstalled();
+  }
+  if (isMacos) {
+    return commandSuccessful("clang++", ["--version"]) || commandSuccessful("xcrun", ["-find", "clang++"]);
+  }
+  return commandSuccessful("c++", ["--version"])
+    || commandSuccessful("g++", ["--version"])
+    || commandSuccessful("clang++", ["--version"]);
+}
+
+function cppToolchainRequirement() {
+  if (isWindows) {
+    return "C++ compiler toolchain (Visual Studio Build Tools 2022 with Desktop development with C++, or clang++)";
+  }
+  if (isMacos) {
+    return "C++ compiler toolchain (Xcode Command Line Tools: xcode-select --install)";
+  }
+  return "C++ compiler toolchain (build-essential/g++ or clang++)";
+}
+
+function sourceBuildInstallHint() {
+  if (isWindows) {
+    return [
+      "Install on Windows:",
+      "  winget install --id Kitware.CMake -e",
+      "  winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override \"--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --passive --wait\"",
+      "Then open a new PowerShell and rerun npm run prepare-runtime."
+    ].join("\n");
+  }
+  if (isMacos) {
+    return [
+      "Install on macOS:",
+      "  xcode-select --install",
+      "  brew install cmake",
+      "Then rerun npm run prepare-runtime."
+    ].join("\n");
+  }
+  return [
+    "Install on Debian/Ubuntu:",
+    "  sudo apt-get update && sudo apt-get install -y git cmake build-essential",
+    "Then rerun npm run prepare-runtime."
+  ].join("\n");
+}
+
+function visualStudioCppToolsInstalled() {
+  const candidates = ["vswhere"];
+  const programFilesX86 = process.env["ProgramFiles(x86)"];
+  if (programFilesX86) {
+    candidates.push(join(programFilesX86, "Microsoft Visual Studio", "Installer", "vswhere.exe"));
+  }
+  for (const candidate of candidates) {
+    const result = spawnSync(candidate, [
+      "-latest",
+      "-products",
+      "*",
+      "-requires",
+      "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+      "-property",
+      "installationPath",
+    ], { encoding: "utf8" });
+    if (!result.error && result.status === 0 && result.stdout.trim()) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function commandAvailable(command) {
   const result = spawnSync(command, ["--version"], { encoding: "utf8" });
+  if (result.error || result.status !== 0) {
+    return false;
+  }
+  return true;
+}
+
+function commandExists(command, args = ["--version"]) {
+  const result = spawnSync(command, args, { encoding: "utf8" });
+  return !result.error;
+}
+
+function commandSuccessful(command, args = ["--version"]) {
+  const result = spawnSync(command, args, { encoding: "utf8" });
   return !result.error && result.status === 0;
 }
 

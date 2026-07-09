@@ -34,6 +34,48 @@ Infernet intentionally does not ship a fake or degraded replacement for
 provided, runtime preparation fails. A crash at this stage means a required
 runtime dependency is missing and must be fixed, not hidden.
 
+## Setup Requirements
+
+Infernet downloads official llama.cpp prebuilt binaries when they are available,
+but the split-layer `infernet-llama-bridge` is an Infernet patch and must be
+built locally unless `INFERNET_LLAMA_BRIDGE` points at a real bridge binary.
+Setup does not silently install OS-level build tools.
+
+Required for development:
+
+- Rust toolchain
+- Node.js and npm
+- Git
+- CMake
+- C++ compiler toolchain
+
+Windows:
+
+```powershell
+winget install --id Kitware.CMake -e
+winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override "--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --passive --wait"
+```
+
+After installing, open a new PowerShell so `cmake`, `cl`, and Visual Studio
+environment discovery are visible.
+
+macOS:
+
+```sh
+xcode-select --install
+brew install cmake
+```
+
+Debian/Ubuntu:
+
+```sh
+sudo apt-get update
+sudo apt-get install -y git cmake build-essential
+```
+
+If any required bridge dependency is missing, `npm run prepare-runtime` fails
+with the missing requirement instead of launching a degraded app.
+
 ## Peer Discovery
 
 Each `infernet-worker serve` process creates a libp2p peer identity and joins a
