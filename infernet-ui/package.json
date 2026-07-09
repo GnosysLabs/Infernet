@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "prepare-runtime": "node ../scripts/prepare-llama-runtime.mjs",
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",

@@ -395,7 +395,7 @@ pub fn import_seed_model_from_file_with_progress(
             },
             metadata: ShardMetadata {
                 architecture: manifest.architecture.clone(),
-                quantization: None,
+                quantization: manifest.quantization.clone(),
                 source_checksum: Some(source_checksum.clone()),
                 protocol_version: PROTOCOL_VERSION,
             },

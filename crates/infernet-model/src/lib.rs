@@ -110,6 +110,8 @@ pub struct ModelManifest {
     pub layer_count: u32,
     pub hidden_size: usize,
     pub activation_dtype: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quantization: Option<String>,
     pub runtime_kind: RuntimeKind,
 }
 
@@ -122,6 +124,7 @@ impl ModelManifest {
             layer_count: 12,
             hidden_size: 16,
             activation_dtype: "f32".to_owned(),
+            quantization: None,
             runtime_kind: RuntimeKind::Demo,
         }
     }
@@ -134,6 +137,7 @@ impl ModelManifest {
             layer_count: 16,
             hidden_size: 2048,
             activation_dtype: "f16".to_owned(),
+            quantization: None,
             runtime_kind: RuntimeKind::LlamaCpp,
         }
     }
@@ -172,6 +176,7 @@ impl ModelManifest {
                     field: "embedding_length".to_owned(),
                 })?,
             activation_dtype: "f16".to_owned(),
+            quantization: info.quantization.clone(),
             runtime_kind: RuntimeKind::LlamaCpp,
         })
     }
@@ -220,7 +225,7 @@ impl ShardDescriptor {
             tokenizer: None,
             metadata: Some(ShardMetadata {
                 architecture: manifest.architecture.clone(),
-                quantization: None,
+                quantization: manifest.quantization.clone(),
                 source_checksum: None,
                 protocol_version: 1,
             }),

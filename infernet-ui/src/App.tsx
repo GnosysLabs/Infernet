@@ -763,7 +763,7 @@ function ModelsPage({
             >
               <div>
                 <strong>{model.displayName}</strong>
-                <span>{model.activationDtype.toUpperCase()} - {runtimeLabel(model.runtimeKind)}</span>
+                <span>{(model.quantization ?? model.activationDtype).toUpperCase()} - {runtimeLabel(model.runtimeKind)}</span>
               </div>
               <div className="library-status">
                 <span>{installed ? "Installed" : downloading ? "Preparing" : "Available"}</span>
@@ -1191,7 +1191,8 @@ function isRuntimePendingMessage(message: string): boolean {
   return lower.includes("gguf execution runtime is not connected yet")
     || lower.includes("split-gguf token execution")
     || lower.includes("does not have executable gguf tensors")
-    || lower.includes("token generation is not connected yet");
+    || lower.includes("token generation is not connected yet")
+    || lower.includes("bundled llama.cpp runtime is missing");
 }
 
 function friendlyImportError(error: string): string {

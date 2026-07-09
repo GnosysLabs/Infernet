@@ -190,7 +190,7 @@ model:
 - route coverage;
 - chat prompt, hop-by-hop progress, and final output.
 
-Start four workers and launch the desktop UI:
+Launch the desktop UI:
 
 ```sh
 scripts/ui-demo.sh
@@ -202,6 +202,16 @@ On Windows PowerShell:
 .\scripts\ui-demo.ps1
 ```
 
+The old four-peer demo is still available, but it is now explicit:
+
+```sh
+scripts/ui-demo.sh --with-demo-peers
+```
+
+```powershell
+.\scripts\ui-demo.ps1 -WithDemoPeers
+```
+
 For frontend-only visual development without Tauri commands:
 
 ```sh
@@ -211,8 +221,9 @@ npm run dev
 ```
 
 The browser-only Vite view uses mock data. Use `npm run tauri dev` or
-`scripts/ui-demo.sh` when you need real libp2p discovery and activation
-forwarding.
+`scripts/ui-demo.sh` for the real app node. Use `scripts/ui-demo.sh
+--with-demo-peers` only when you explicitly want the old four-worker toy
+network.
 
 ## Manual Local Run
 

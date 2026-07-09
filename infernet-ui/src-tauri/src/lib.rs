@@ -93,6 +93,7 @@ struct ModelView {
     runtime_kind: String,
     layer_count: u32,
     activation_dtype: String,
+    quantization: Option<String>,
     installed: bool,
     runnable: bool,
     status: String,
@@ -359,7 +360,7 @@ async fn run_demo_inference(
             },
         );
         replay_route_progress(&app, &trace_id, &local_route, manifest.hidden_size).await;
-        let output = generate_with_llama_cli(&cache_config, &manifest, &prompt).await?;
+        let output = generate_with_llama_cli(&app, &cache_config, &manifest, &prompt).await?;
         emit_progress(
             &app,
             ProgressEvent::FinalOutput {
@@ -905,13 +906,17 @@ fn model_view_from_manifest(
             && local_source_path_for_model(cache_config, &manifest.model_id)
                 .and_then(|path| std::fs::metadata(path).ok())
                 .is_some_and(|metadata| metadata.len() <= local_gguf_size_limit_bytes())
-            && find_llama_cli().is_some());
+            && find_llama_cli(None).is_some());
     ModelView {
         model_id: manifest.model_id.clone(),
         display_name: manifest.display_name.clone(),
         runtime_kind: manifest.runtime_kind.as_str().to_owned(),
         layer_count: manifest.layer_count,
         activation_dtype: manifest.activation_dtype.clone(),
+        quantization: manifest
+            .quantization
+            .as_deref()
+            .map(normalize_quantization_label),
         installed,
         runnable,
         status: model_status(manifest, installed, runnable, cache_config),
@@ -964,6 +969,11 @@ fn installed_model_manifests(cache_config: &ShardCacheConfig) -> Vec<ModelManife
                 layer_count: manifest.layer_count,
                 hidden_size: manifest.hidden_size,
                 activation_dtype: manifest.activation_dtype,
+                quantization: manifest
+                    .metadata
+                    .quantization
+                    .as_deref()
+                    .map(normalize_quantization_label),
                 runtime_kind: manifest.runtime_kind,
             })
         })
@@ -1007,6 +1017,11 @@ fn discovered_model_manifests(registry: &ShardRegistry) -> Vec<ModelManifest> {
                 layer_count: shard.layers.end,
                 hidden_size: 0,
                 activation_dtype: "f16".to_owned(),
+                quantization: shard
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.quantization.as_deref())
+                    .map(normalize_quantization_label),
                 runtime_kind: shard.runtime_kind.clone(),
             });
     }
@@ -1028,6 +1043,7 @@ fn discovered_model_manifests(registry: &ShardRegistry) -> Vec<ModelManifest> {
                 layer_count: shard.layers.end,
                 hidden_size: 0,
                 activation_dtype: "f16".to_owned(),
+                quantization: None,
                 runtime_kind: RuntimeKind::LlamaCpp,
             });
     }
@@ -1105,7 +1121,50 @@ fn model_status(
         return "Installed locally. This machine does not have enough memory for safe local fallback execution.".to_owned();
     }
 
-    "Installed locally. Set INFERNET_LLAMA_CLI to a llama.cpp binary to chat.".to_owned()
+    "Installed locally. Token runtime is being bundled with the app.".to_owned()
+}
+
+fn normalize_quantization_label(value: &str) -> String {
+    match value.strip_prefix("gguf_file_type_") {
+        Some("0") => "F32",
+        Some("1") => "F16",
+        Some("2") => "Q4_0",
+        Some("3") => "Q4_1",
+        Some("7") => "Q8_0",
+        Some("8") => "Q5_0",
+        Some("9") => "Q5_1",
+        Some("10") => "Q2_K",
+        Some("11") => "Q3_K_S",
+        Some("12") => "Q3_K_M",
+        Some("13") => "Q3_K_L",
+        Some("14") => "Q4_K_S",
+        Some("15") => "Q4_K_M",
+        Some("16") => "Q5_K_S",
+        Some("17") => "Q5_K_M",
+        Some("18") => "Q6_K",
+        Some("19") => "IQ2_XXS",
+        Some("20") => "IQ2_XS",
+        Some("21") => "Q2_K_S",
+        Some("22") => "IQ3_XS",
+        Some("23") => "IQ3_XXS",
+        Some("24") => "IQ1_S",
+        Some("25") => "IQ4_NL",
+        Some("26") => "IQ3_S",
+        Some("27") => "IQ3_M",
+        Some("28") => "IQ2_S",
+        Some("29") => "IQ2_M",
+        Some("30") => "IQ4_XS",
+        Some("31") => "IQ1_M",
+        Some("32") => "BF16",
+        Some("36") => "TQ1_0",
+        Some("37") => "TQ2_0",
+        Some("38") => "MXFP4_MOE",
+        Some("39") => "NVFP4",
+        Some("40") => "Q1_0",
+        Some("41") => "Q2_0",
+        _ => value,
+    }
+    .to_owned()
 }
 
 fn peer_view_from_advertisement(advertisement: &NodeAdvertisement) -> PeerView {
@@ -1384,10 +1443,13 @@ fn local_cache_advertisement(
 }
 
 fn seed_record_is_executable(manifest: &SeedShardManifest) -> bool {
-    manifest.runtime_kind == RuntimeKind::Demo || manifest.payload_kind != "metadata-only"
+    manifest.runtime_kind == RuntimeKind::Demo
+        || manifest.payload_kind != "metadata-only"
+        || Path::new(&manifest.source.path).is_file()
 }
 
 async fn generate_with_llama_cli(
+    app: &AppHandle,
     cache_config: &ShardCacheConfig,
     manifest: &ModelManifest,
     prompt: &str,
@@ -1398,8 +1460,8 @@ async fn generate_with_llama_cli(
             manifest.display_name
         )
     })?;
-    let llama_cli = find_llama_cli().ok_or_else(|| {
-        "Token generation is not connected yet. Set INFERNET_LLAMA_CLI to a llama.cpp binary for small local GGUF tests; split GGUF token execution still needs the Infernet runtime bridge.".to_owned()
+    let llama_cli = find_llama_cli(Some(app)).ok_or_else(|| {
+        "The bundled llama.cpp runtime is missing from this app build. Rebuild Infernet so it can package the token runtime.".to_owned()
     })?;
     let model_size = std::fs::metadata(&model_path)
         .map_err(|error| format!("failed to read {}: {error}", model_path.display()))?
@@ -1468,11 +1530,17 @@ fn local_source_path_for_model(cache_config: &ShardCacheConfig, model_id: &str) 
     None
 }
 
-fn find_llama_cli() -> Option<PathBuf> {
+fn find_llama_cli(app: Option<&AppHandle>) -> Option<PathBuf> {
     if let Ok(path) = env::var("INFERNET_LLAMA_CLI") {
         let path = PathBuf::from(path);
         if path.is_file() {
             return Some(path);
+        }
+    }
+
+    for candidate in bundled_llama_cli_candidates(app) {
+        if candidate.is_file() {
+            return Some(candidate);
         }
     }
 
@@ -1500,6 +1568,77 @@ fn find_llama_cli() -> Option<PathBuf> {
         }
     }
 
+    None
+}
+
+fn bundled_llama_cli_candidates(app: Option<&AppHandle>) -> Vec<PathBuf> {
+    let executable_name = if cfg!(windows) {
+        "llama-cli.exe"
+    } else {
+        "llama-cli"
+    };
+    let sidecar_name = bundled_llama_cli_sidecar_name();
+    let mut candidates = Vec::new();
+
+    if let Some(app) = app {
+        if let Ok(resource_dir) = app.path().resource_dir() {
+            candidates.push(resource_dir.join(executable_name));
+            candidates.push(resource_dir.join("binaries").join(executable_name));
+            if let Some(sidecar_name) = sidecar_name {
+                candidates.push(resource_dir.join(sidecar_name));
+                candidates.push(resource_dir.join("binaries").join(sidecar_name));
+            }
+        }
+    }
+
+    if let Ok(current_exe) = env::current_exe() {
+        if let Some(parent) = current_exe.parent() {
+            candidates.push(parent.join(executable_name));
+            candidates.push(parent.join("binaries").join(executable_name));
+            if let Some(resources) = parent.parent().map(|path| path.join("Resources")) {
+                candidates.push(resources.join(executable_name));
+                candidates.push(resources.join("binaries").join(executable_name));
+            }
+        }
+    }
+
+    if let Some(sidecar_name) = sidecar_name {
+        candidates.push(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("binaries")
+                .join(sidecar_name),
+        );
+    }
+
+    candidates
+}
+
+fn bundled_llama_cli_sidecar_name() -> Option<&'static str> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        return Some("llama-cli-aarch64-apple-darwin");
+    }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        return Some("llama-cli-x86_64-apple-darwin");
+    }
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        return Some("llama-cli-x86_64-pc-windows-msvc.exe");
+    }
+    #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+    {
+        return Some("llama-cli-aarch64-pc-windows-msvc.exe");
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        return Some("llama-cli-x86_64-unknown-linux-gnu");
+    }
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    {
+        return Some("llama-cli-aarch64-unknown-linux-gnu");
+    }
+    #[allow(unreachable_code)]
     None
 }
 
@@ -2322,6 +2461,75 @@ mod tests {
             target_cache.read_payload(&legacy_record.info).unwrap(),
             b"legacy gemma metadata"
         );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_seed_record_with_source_file_advertises_route_and_quantization() {
+        let root = std::env::temp_dir().join(format!("infernet-ui-local-gguf-{}", unix_ms()));
+        let cache_config = ShardCacheConfig::new(root.join("shards"));
+        let cache = ShardCache::new(cache_config.clone()).unwrap();
+        let source = root.join("gemma-4-12b-it-IQ4_XS.gguf");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&source, b"local gguf placeholder").unwrap();
+
+        let layers = LayerRange::new(0, 48).unwrap();
+        let seed_manifest = SeedShardManifest {
+            model_id: "gemma-4-12b-it-iq4-xs".to_owned(),
+            display_name: "Gemma 4 12B IT IQ4 XS".to_owned(),
+            architecture: "gemma4".to_owned(),
+            layer_count: 48,
+            hidden_size: 3840,
+            activation_dtype: "f16".to_owned(),
+            runtime_kind: RuntimeKind::LlamaCpp,
+            layers,
+            tokenizer: infernet_model::TokenizerCompatibility {
+                family: "gemma4".to_owned(),
+                checksum: None,
+            },
+            metadata: infernet_model::ShardMetadata {
+                architecture: "gemma4".to_owned(),
+                quantization: Some("gguf_file_type_30".to_owned()),
+                source_checksum: Some("checksum".to_owned()),
+                protocol_version: PROTOCOL_VERSION,
+            },
+            source: infernet_model::SeedSourceMetadata {
+                path: source.display().to_string(),
+                checksum_sha256: "checksum".to_owned(),
+                file_size_bytes: 123,
+            },
+            shard_hash: "hash".to_owned(),
+            payload_kind: "metadata-only".to_owned(),
+        };
+        cache
+            .import_payload(
+                serde_json::to_vec(&seed_manifest).unwrap(),
+                seed_manifest.model_id.clone(),
+                layers,
+                "v1",
+            )
+            .unwrap();
+
+        let advertisement =
+            local_cache_advertisement(&cache_config, "local-peer".to_owned()).unwrap();
+        assert_eq!(advertisement.hosted_shards.len(), 1);
+        assert_eq!(advertisement.hosted_shards[0].layers, layers);
+
+        let mut registry = ShardRegistry::new();
+        registry.upsert(advertisement);
+        let manifest =
+            manifest_for_model(Some("gemma-4-12b-it-iq4-xs"), &cache_config, Some(&registry))
+                .unwrap();
+        let route = registry.route_for_model(&manifest).unwrap();
+        assert_eq!(route.len(), 1);
+        assert_eq!(route[0].layers, layers);
+
+        let view = available_model_views(&cache_config, Some(&registry))
+            .into_iter()
+            .find(|model| model.model_id == "gemma-4-12b-it-iq4-xs")
+            .unwrap();
+        assert_eq!(view.quantization.as_deref(), Some("IQ4_XS"));
 
         let _ = std::fs::remove_dir_all(root);
     }

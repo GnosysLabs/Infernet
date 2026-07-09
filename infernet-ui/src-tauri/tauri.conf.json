@@ -4,8 +4,8 @@
   "version": "0.1.0",
   "identifier": "dev.infernet.ui",
   "build": {
-    "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build",
+    "beforeDevCommand": "npm run prepare-runtime && npm run dev",
+    "beforeBuildCommand": "npm run prepare-runtime && npm run build",
     "devUrl": "http://127.0.0.1:5173",
     "frontendDist": "../dist"
   },
@@ -25,6 +25,9 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all"
+    "targets": "all",
+    "externalBin": [
+      "binaries/llama-cli"
+    ]
   }
 }

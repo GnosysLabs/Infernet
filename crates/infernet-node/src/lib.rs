@@ -642,7 +642,9 @@ fn refresh_advertisement_model_shards(
 }
 
 fn seed_record_is_executable(manifest: &SeedShardManifest) -> bool {
-    manifest.runtime_kind == RuntimeKind::Demo || manifest.payload_kind != "metadata-only"
+    manifest.runtime_kind == RuntimeKind::Demo
+        || manifest.payload_kind != "metadata-only"
+        || Path::new(&manifest.source.path).is_file()
 }
 
 pub fn process_activation_step(

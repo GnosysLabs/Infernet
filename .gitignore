@@ -6,6 +6,8 @@ infernet-ui/src-tauri/target/
 .infernet/
 **/.infernet/
 third_party/
+target/llama.cpp-runtime/
+infernet-ui/src-tauri/binaries/llama-cli-*
 *.log
 .DS_Store
 .env

@@ -11,6 +11,7 @@ export interface ModelView {
   runtimeKind: string;
   layerCount: number;
   activationDtype: string;
+  quantization?: string | null;
   installed: boolean;
   runnable: boolean;
   status: string;
