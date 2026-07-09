@@ -19,8 +19,8 @@ use infernet_protocol::{
 use infernet_router::ShardRegistry;
 use infernet_runtime::{DemoRuntime, LayerRuntime, activation_checksum};
 use libp2p::{
-    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder, gossipsub, identity, mdns, noise,
-    request_response,
+    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder, core::connection::ConnectedPoint,
+    gossipsub, identity, mdns, multiaddr::Protocol, noise, request_response,
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux,
 };
@@ -611,6 +611,29 @@ pub fn empty_advertisement(peer_id: String, address: String) -> NodeAdvertisemen
     }
 }
 
+fn observed_peer_advertisement(
+    peer_id: PeerId,
+    endpoint: &ConnectedPoint,
+) -> Option<NodeAdvertisement> {
+    let remote_address = endpoint.get_remote_address();
+    if remote_address.is_empty() {
+        return None;
+    }
+
+    let mut address = remote_address.clone();
+    if !address
+        .iter()
+        .any(|protocol| matches!(protocol, Protocol::P2p(_)))
+    {
+        address.push(Protocol::P2p(peer_id));
+    }
+
+    Some(empty_advertisement(
+        peer_id.to_string(),
+        address.to_string(),
+    ))
+}
+
 fn refresh_advertisement_model_shards(
     advertisement: &mut Option<NodeAdvertisement>,
     cache: Option<&ShardCache>,
@@ -1124,6 +1147,9 @@ fn handle_grid_event(
             peer_id, endpoint, ..
         } => {
             swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+            if let Some(advertisement) = observed_peer_advertisement(peer_id, &endpoint) {
+                registry.merge(advertisement);
+            }
             println!(
                 "libp2p_connected peer_id={} endpoint={:?}",
                 peer_id, endpoint

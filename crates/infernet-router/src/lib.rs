@@ -47,6 +47,13 @@ impl ShardRegistry {
             .insert(advertisement.peer_id.clone(), advertisement);
     }
 
+    pub fn merge(&mut self, advertisement: NodeAdvertisement) {
+        self.advertisements
+            .entry(advertisement.peer_id.clone())
+            .and_modify(|existing| merge_advertisement(existing, &advertisement))
+            .or_insert(advertisement);
+    }
+
     pub fn extend(&mut self, advertisements: impl IntoIterator<Item = NodeAdvertisement>) {
         for advertisement in advertisements {
             self.upsert(advertisement);
@@ -67,6 +74,44 @@ impl ShardRegistry {
 
     pub fn route_for_model(&self, manifest: &ModelManifest) -> Result<Vec<RouteHop>, RouterError> {
         build_greedy_route(manifest, &self.advertisements())
+    }
+}
+
+fn merge_advertisement(existing: &mut NodeAdvertisement, advertisement: &NodeAdvertisement) {
+    for address in &advertisement.addresses {
+        if !existing.addresses.contains(address) {
+            existing.addresses.push(address.clone());
+        }
+    }
+
+    for shard in &advertisement.hosted_shards {
+        if !existing.hosted_shards.iter().any(|existing| {
+            existing.model_id == shard.model_id
+                && existing.layers == shard.layers
+                && existing.runtime_kind == shard.runtime_kind
+        }) {
+            existing.hosted_shards.push(shard.clone());
+        }
+    }
+
+    for shard in &advertisement.model_shards {
+        if !existing
+            .model_shards
+            .iter()
+            .any(|existing| existing == shard)
+        {
+            existing.model_shards.push(shard.clone());
+        }
+    }
+
+    if advertisement.available_ram_bytes.is_some() {
+        existing.available_ram_bytes = advertisement.available_ram_bytes;
+    }
+    if advertisement.available_vram_bytes.is_some() {
+        existing.available_vram_bytes = advertisement.available_vram_bytes;
+    }
+    if advertisement.latency_hint_ms.is_some() {
+        existing.latency_hint_ms = advertisement.latency_hint_ms;
     }
 }
 
