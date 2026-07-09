@@ -20,9 +20,8 @@ infernet-protocol.workspace = true
 infernet-router.workspace = true
 futures.workspace = true
 libp2p.workspace = true
-reqwest = { version = "0.12.23", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde.workspace = true
 serde_json.workspace = true
 tauri.workspace = true
-tauri-plugin-dialog = "2"
 tokio.workspace = true
+uuid.workspace = true

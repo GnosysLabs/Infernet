@@ -184,7 +184,11 @@ impl ModelManifest {
     pub fn automatic_layer_plan(&self) -> Result<Vec<LayerRange>, ModelError> {
         let target_layers = match self.runtime_kind {
             RuntimeKind::Demo => 3,
-            RuntimeKind::LlamaCpp => 1,
+            // Until partial-graph execution is proven for each llama.cpp architecture,
+            // keep imported GGUF models in one executable package. This avoids
+            // duplicating global tensors into every transformer-layer shard and also
+            // gives unsupported split architectures a correct full-model fallback.
+            RuntimeKind::LlamaCpp => self.layer_count,
         };
 
         plan_layer_ranges(self.layer_count, target_layers)
@@ -356,14 +360,11 @@ mod tests {
     }
 
     #[test]
-    fn plans_llama32_1b_automatically() {
+    fn plans_llama32_1b_as_one_complete_runtime_package() {
         let manifest = ModelManifest::llama32_1b();
         let ranges = manifest.automatic_layer_plan().unwrap();
 
-        assert_eq!(ranges.len(), 16);
-        assert!(ranges.iter().all(|range| range.len() == 1));
-        assert_eq!(ranges[0], LayerRange::new(0, 1).unwrap());
-        assert_eq!(ranges[15], LayerRange::new(15, 16).unwrap());
+        assert_eq!(ranges, vec![LayerRange::new(0, 16).unwrap()]);
         assert_eq!(
             validate_contiguous_coverage(manifest.layer_count, ranges),
             Ok(())

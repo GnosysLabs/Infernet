@@ -1,11 +1,7 @@
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
-import { open } from "@tauri-apps/plugin-dialog";
 import type {
-  AddModelResponse,
   GridSnapshot,
-  HuggingFaceFileView,
-  HuggingFaceSettings,
   LocalIdentity,
   ModelImportProgress,
   ProgressEvent,
@@ -62,59 +58,6 @@ export async function getGridSnapshot(
 
 export async function runDistributedInference(prompt: string, modelId: string): Promise<RunDemoResponse> {
   return invoke<RunDemoResponse>("run_demo_inference", { prompt, modelId });
-}
-
-export async function addLocalGgufModel(
-  path: string,
-  version = "v1",
-): Promise<AddModelResponse> {
-  return invoke<AddModelResponse>("add_local_gguf_model", { path, version });
-}
-
-export async function chooseLocalModelFile(): Promise<string | null> {
-  const selected = await open({
-    multiple: false,
-    directory: false,
-    title: "Choose a GGUF model",
-    filters: [{ name: "GGUF models", extensions: ["gguf"] }],
-  });
-
-  return typeof selected === "string" ? selected : null;
-}
-
-export async function getHuggingFaceSettings(): Promise<HuggingFaceSettings> {
-  return invoke<HuggingFaceSettings>("get_huggingface_settings");
-}
-
-export async function saveHuggingFaceToken(token: string): Promise<HuggingFaceSettings> {
-  return invoke<HuggingFaceSettings>("save_huggingface_token", { token });
-}
-
-export async function clearHuggingFaceToken(): Promise<HuggingFaceSettings> {
-  return invoke<HuggingFaceSettings>("clear_huggingface_token");
-}
-
-export async function inspectHuggingFaceRepo(
-  repoId: string,
-  token?: string,
-): Promise<HuggingFaceFileView[]> {
-  return invoke<HuggingFaceFileView[]>("inspect_huggingface_repo", { repoId, token });
-}
-
-export async function addHuggingFaceModel(
-  repoId: string,
-  filename: string,
-  token?: string,
-  revision = "main",
-  version = "v1",
-): Promise<AddModelResponse> {
-  return invoke<AddModelResponse>("add_huggingface_model", {
-    repoId,
-    filename,
-    token,
-    revision,
-    version,
-  });
 }
 
 export async function listenForProgress(

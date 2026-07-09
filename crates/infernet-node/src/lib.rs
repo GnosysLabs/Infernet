@@ -7,13 +7,14 @@ use std::mem;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::thread;
 use std::time::Duration;
 use std::{fs, io};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
-use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, StreamExt};
+use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, StreamExt, channel::oneshot};
 use infernet_model::{LayerRange, ModelManifest, RuntimeKind, SeedShardManifest, ShardDescriptor};
 use infernet_protocol::{
     ACTIVATION_PROTOCOL, ActivationRequest, ActivationResponse, MODEL_BLOB_PROTOCOL,
@@ -24,7 +25,7 @@ use infernet_router::ShardRegistry;
 use infernet_runtime::{DemoRuntime, LayerRuntime, activation_checksum};
 use libp2p::{
     Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
-    core::connection::ConnectedPoint,
+    core::{connection::ConnectedPoint, transport::ListenerId},
     gossipsub, identity, mdns,
     multiaddr::Protocol,
     noise, request_response,
@@ -32,17 +33,20 @@ use libp2p::{
     tcp, yamux,
 };
 pub use model_distribution::{
-    CachedShardRecord, INFERNET_SHARD_FORMAT_VERSION, INFERNET_SHARD_MANIFEST_FILE,
-    INFERNET_SHARD_RUNTIME_ABI, INFERNET_SHARD_TENSOR_FILE, InfernetShardPackageManifest,
-    InfernetShardPayloadManifest, PAYLOAD_KIND_GGUF_SHARD, PAYLOAD_KIND_INFERNET_SHARD,
-    PAYLOAD_KIND_METADATA_ONLY, SeedShardBuildProgress, SeededModelSummary, ShardCache,
-    ShardCacheConfig, ShardCacheStats, executable_source_path_for_manifest,
-    import_seed_model_from_file, import_seed_model_from_file_with_build_progress,
-    import_seed_model_from_file_with_progress, is_executable_shard_record, sha256_bytes,
-    sha256_file, source_cache_path, source_cache_root,
+    CachedShardRecord, INFERNET_FULL_MODEL_RUNTIME_ABI, INFERNET_SHARD_FORMAT_VERSION,
+    INFERNET_SHARD_MANIFEST_FILE, INFERNET_SHARD_RUNTIME_ABI, INFERNET_SHARD_TENSOR_FILE,
+    InfernetShardPackageManifest, InfernetShardPayloadManifest, PAYLOAD_KIND_FULL_MODEL,
+    PAYLOAD_KIND_GGUF_SHARD, PAYLOAD_KIND_INFERNET_SHARD, PAYLOAD_KIND_METADATA_ONLY,
+    SeedShardBuildProgress, SeededModelSummary, ShardCache, ShardCacheConfig, ShardCacheStats,
+    executable_source_path_for_manifest, import_seed_model_from_file,
+    import_seed_model_from_file_with_build_progress, import_seed_model_from_file_with_progress,
+    is_executable_shard_record, seed_manifest_for_network, sha256_bytes, sha256_file,
+    source_cache_path, source_cache_root,
 };
 use serde::Deserialize;
 use tokio::time::{Instant, interval, sleep};
+
+pub type ModelDistributionReadiness = oneshot::Sender<std::result::Result<String, String>>;
 
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
@@ -145,6 +149,17 @@ pub struct ModelSourceFetchResult {
 const MODEL_BLOB_CHUNK_BYTES: u32 = 4 * 1024 * 1024;
 const MODEL_BLOB_HEADER_MAX_BYTES: usize = 64 * 1024;
 const MODEL_FETCH_PEER_RETRY_COOLDOWN: Duration = Duration::from_secs(5);
+const LLAMA_BRIDGE_EXECUTION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const LLAMA_BRIDGE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const LLAMA_BRIDGE_MAX_LIBRARY_THREADS: usize = 4;
+
+struct RemoveFileOnDrop(PathBuf);
+
+impl Drop for RemoveFileOnDrop {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
 
 #[derive(NetworkBehaviour)]
 struct GridBehaviour {
@@ -476,8 +491,32 @@ pub async fn run_worker_node(mut discovery: DiscoveryConfig, worker: WorkerConfi
 }
 
 pub async fn run_model_distribution_node(
+    discovery: DiscoveryConfig,
+    cache_config: ShardCacheConfig,
+) -> Result<()> {
+    let mut readiness = None;
+    run_model_distribution_node_inner(discovery, cache_config, &mut readiness).await
+}
+
+pub async fn run_model_distribution_node_with_readiness(
+    discovery: DiscoveryConfig,
+    cache_config: ShardCacheConfig,
+    readiness: ModelDistributionReadiness,
+) -> Result<()> {
+    let mut readiness = Some(readiness);
+    let result = run_model_distribution_node_inner(discovery, cache_config, &mut readiness).await;
+
+    if let Err(error) = &result {
+        signal_model_distribution_readiness(&mut readiness, Err(format!("{error:#}")));
+    }
+
+    result
+}
+
+async fn run_model_distribution_node_inner(
     mut discovery: DiscoveryConfig,
     cache_config: ShardCacheConfig,
+    readiness: &mut Option<ModelDistributionReadiness>,
 ) -> Result<()> {
     let topic = gossipsub::IdentTopic::new(discovery.topic.clone());
     let mut registry = ShardRegistry::new();
@@ -492,7 +531,7 @@ pub async fn run_model_distribution_node(
 
     let mut swarm = build_grid_swarm(discovery.keypair.clone(), &topic)?;
     add_static_peer_addresses(&mut swarm, &discovery.static_peers);
-    listen_on(&mut swarm, &discovery.p2p_listen)?;
+    let listener_id = listen_on(&mut swarm, &discovery.p2p_listen)?;
 
     let mut publish_interval = interval(discovery.publish_interval);
     let mut static_peer_dial_interval = interval(Duration::from_secs(10));
@@ -518,6 +557,36 @@ pub async fn run_model_distribution_node(
                 }
             }
             event = swarm.select_next_some() => {
+                let ready_address = match &event {
+                    SwarmEvent::NewListenAddr {
+                        listener_id: event_listener_id,
+                        address,
+                    } if *event_listener_id == listener_id => Some(address.to_string()),
+                    SwarmEvent::ListenerClosed {
+                        listener_id: event_listener_id,
+                        reason,
+                        ..
+                    } if *event_listener_id == listener_id => {
+                        let reason = match reason {
+                            Ok(()) => "listener closed unexpectedly".to_owned(),
+                            Err(error) => error.to_string(),
+                        };
+                        bail!("libp2p listener {listener_id} closed: {reason}");
+                    }
+                    SwarmEvent::ListenerError {
+                        listener_id: event_listener_id,
+                        error,
+                    } if *event_listener_id == listener_id => {
+                        let phase = if readiness.is_some() {
+                            "before becoming ready"
+                        } else {
+                            "after startup"
+                        };
+                        bail!("libp2p listener {listener_id} failed {phase}: {error}");
+                    }
+                    _ => None,
+                };
+
                 if let Some(network_event) = handle_grid_event(
                     &mut swarm,
                     event,
@@ -546,8 +615,21 @@ pub async fn run_model_distribution_node(
                         }
                     }
                 }
+
+                if let Some(address) = ready_address {
+                    signal_model_distribution_readiness(readiness, Ok(address));
+                }
             }
         }
+    }
+}
+
+fn signal_model_distribution_readiness(
+    readiness: &mut Option<ModelDistributionReadiness>,
+    result: std::result::Result<String, String>,
+) {
+    if let Some(readiness) = readiness.take() {
+        let _ = readiness.send(result);
     }
 }
 
@@ -630,6 +712,7 @@ pub async fn fetch_model_shard_over_libp2p(
         uuid::Uuid::new_v4()
     ));
     let _ = fs::remove_file(&partial_path);
+    let _partial_cleanup = RemoveFileOnDrop(partial_path.clone());
     let mut downloaded_bytes = 0_u64;
     let mut pending_request: Option<(
         request_response::OutboundRequestId,
@@ -649,6 +732,24 @@ pub async fn fetch_model_shard_over_libp2p(
                 version.as_deref(),
                 &failed_peers,
             ) {
+                if candidate.shard.size_bytes == 0 {
+                    bail!(
+                        "refusing zero-byte model package {} {}:{}",
+                        model_id,
+                        layers.start,
+                        layers.end
+                    );
+                }
+                if candidate.shard.size_bytes > cache.config().max_storage_bytes {
+                    bail!(
+                        "refusing model package {} {}:{}: advertised size {} exceeds cache limit {}",
+                        model_id,
+                        layers.start,
+                        layers.end,
+                        candidate.shard.size_bytes,
+                        cache.config().max_storage_bytes
+                    );
+                }
                 let request = ModelBlobRequest::new_shard(
                     model_id.clone(),
                     layers,
@@ -736,8 +837,21 @@ pub async fn fetch_model_shard_over_libp2p(
                                     continue;
                                 }
 
+                                let next_downloaded = downloaded_bytes
+                                    .checked_add(response.payload.len() as u64)
+                                    .ok_or_else(|| anyhow!("model package download size overflow"))?;
+                                if next_downloaded > candidate.shard.size_bytes {
+                                    bail!(
+                                        "model package download exceeded advertised size for {} {}:{}; got {}, expected {}",
+                                        model_id,
+                                        layers.start,
+                                        layers.end,
+                                        next_downloaded,
+                                        candidate.shard.size_bytes
+                                    );
+                                }
                                 append_source_chunk(&partial_path, &response.payload)?;
-                                downloaded_bytes = downloaded_bytes.saturating_add(response.payload.len() as u64);
+                                downloaded_bytes = next_downloaded;
 
                                 if downloaded_bytes >= candidate.shard.size_bytes {
                                     let cache_record = cache.store_downloaded_file(
@@ -804,6 +918,14 @@ pub async fn fetch_model_source_over_libp2p(
     mut on_progress: impl FnMut(u64, u64) + Send,
 ) -> Result<ModelSourceFetchResult> {
     let cache = ShardCache::new(cache_config.clone())?;
+    if expected_size_bytes > cache.config().max_storage_bytes {
+        bail!(
+            "refusing GGUF source for {}: expected size {} exceeds cache limit {}",
+            model_id,
+            expected_size_bytes,
+            cache.config().max_storage_bytes
+        );
+    }
     let final_path = source_cache_path(&cache_config, &model_id, &source_checksum);
     if final_path.is_file() {
         let actual = sha256_file(&final_path)
@@ -846,6 +968,7 @@ pub async fn fetch_model_source_over_libp2p(
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
     let _ = fs::remove_file(&partial_path);
+    let _partial_cleanup = RemoveFileOnDrop(partial_path.clone());
     let mut downloaded_bytes = 0_u64;
     let mut total_size_bytes = expected_size_bytes;
     let mut pending_request: Option<(request_response::OutboundRequestId, NodeAdvertisement, u64)> =
@@ -938,6 +1061,14 @@ pub async fn fetch_model_source_over_libp2p(
                                 continue;
                             }
                             total_size_bytes = response.total_size_bytes;
+                            if total_size_bytes > cache.config().max_storage_bytes {
+                                bail!(
+                                    "refusing GGUF source for {}: advertised size {} exceeds cache limit {}",
+                                    model_id,
+                                    total_size_bytes,
+                                    cache.config().max_storage_bytes
+                                );
+                            }
                             if response.payload.is_empty() && downloaded_bytes < total_size_bytes {
                                 record_model_fetch_peer_failure(
                                     &mut failed_peers,
@@ -947,8 +1078,19 @@ pub async fn fetch_model_source_over_libp2p(
                                 continue;
                             }
 
+                            let next_downloaded = downloaded_bytes
+                                .checked_add(response.payload.len() as u64)
+                                .ok_or_else(|| anyhow!("GGUF source download size overflow"))?;
+                            if next_downloaded > total_size_bytes {
+                                bail!(
+                                    "GGUF source download exceeded advertised size for {}; got {}, expected {}",
+                                    model_id,
+                                    next_downloaded,
+                                    total_size_bytes
+                                );
+                            }
                             append_source_chunk(&partial_path, &response.payload)?;
-                            downloaded_bytes = downloaded_bytes.saturating_add(response.payload.len() as u64);
+                            downloaded_bytes = next_downloaded;
                             on_progress(downloaded_bytes, total_size_bytes);
 
                             if downloaded_bytes >= total_size_bytes {
@@ -1096,7 +1238,7 @@ pub async fn infer_over_libp2p(
         outbound_id,
         match manifest.runtime_kind {
             RuntimeKind::Demo => Duration::from_secs(15),
-            RuntimeKind::LlamaCpp => Duration::from_secs(600),
+            RuntimeKind::LlamaCpp => Duration::from_secs(15 * 60),
         },
     )
     .await?;
@@ -1224,7 +1366,7 @@ fn refresh_advertisement_model_shards(
                     if !seed_record_is_executable(cache.config(), &manifest) {
                         return None;
                     }
-                    let seed_manifest = Box::new(manifest.clone());
+                    let seed_manifest = Box::new(seed_manifest_for_network(&manifest));
                     Some(ShardDescriptor {
                         model_id: manifest.model_id.clone(),
                         layers: manifest.layers,
@@ -1248,12 +1390,18 @@ fn refresh_advertisement_model_shards(
 
 fn seed_record_is_executable(config: &ShardCacheConfig, manifest: &SeedShardManifest) -> bool {
     let _ = config;
-    manifest.runtime_kind == RuntimeKind::Demo
-        || matches!(
+    match manifest.runtime_kind {
+        RuntimeKind::Demo => matches!(
             manifest.payload_kind.as_str(),
             model_distribution::PAYLOAD_KIND_GGUF_SHARD
                 | model_distribution::PAYLOAD_KIND_INFERNET_SHARD
-        )
+        ),
+        RuntimeKind::LlamaCpp => {
+            manifest.payload_kind == model_distribution::PAYLOAD_KIND_FULL_MODEL
+                && manifest.layers.start == 0
+                && manifest.layers.end == manifest.layer_count
+        }
+    }
 }
 
 pub fn process_activation_step(
@@ -1423,6 +1571,7 @@ fn execute_llama_cpp_shard(
     if let Some(runtime_dir) = bridge.parent() {
         command.current_dir(runtime_dir);
     }
+    constrain_llama_bridge_library_threads(&mut command);
     #[cfg(target_os = "windows")]
     {
         let mut library_dirs = Vec::new();
@@ -1446,8 +1595,16 @@ fn execute_llama_cpp_shard(
         .arg(layers.end.to_string())
         .arg("--hidden-size")
         .arg(config.hidden_size.to_string())
+        .arg("--threads")
+        .arg(llama_bridge_thread_cap().to_string())
         .arg("--prompt")
         .arg(&prompt.prompt);
+    if layers.start == 0 && layers.end == manifest.layer_count {
+        // Compatibility packages must use llama.cpp's unmodified full graph.
+        // Enabling Infernet's partial-graph patch here breaks architectures for
+        // which no split executor exists yet (including Qwen 3.5).
+        command.arg("--full-model");
+    }
     if !request.activation.is_empty() {
         command.arg("--input").arg(&input_path);
     }
@@ -1455,30 +1612,18 @@ fn execute_llama_cpp_shard(
         command.arg("--output").arg(&output_path);
     }
 
-    let output = command.output().with_context(|| {
-        format!(
-            "failed to run {} for {} {}:{}",
-            bridge.display(),
-            config.model_id,
-            layers.start,
-            layers.end
-        )
-    })?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let json_line = stdout
-        .lines()
-        .rev()
-        .find(|line| line.trim_start().starts_with('{'))
-        .ok_or_else(|| {
-            anyhow!(
-                "infernet-llama-bridge produced no JSON output; status={:?}; stderr={}",
-                output.status.code(),
-                stderr.trim()
+    let output = run_llama_bridge_with_timeout(&mut command, LLAMA_BRIDGE_EXECUTION_TIMEOUT)
+        .with_context(|| {
+            format!(
+                "failed to run {} for {} {}:{}",
+                bridge.display(),
+                config.model_id,
+                layers.start,
+                layers.end
             )
         })?;
-    let bridge_output: LlamaBridgeJson = serde_json::from_str(json_line)
-        .with_context(|| format!("failed to parse infernet-llama-bridge JSON: {json_line}"))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let bridge_output = parse_llama_bridge_json(&output)?;
 
     if !output.status.success() || !bridge_output.ok {
         bail!(
@@ -1548,6 +1693,143 @@ fn execute_llama_cpp_shard(
             .map(|value| value.max(0.0).round() as u64)
             .unwrap_or(0),
     })
+}
+
+fn constrain_llama_bridge_library_threads(command: &mut Command) {
+    let thread_cap = llama_bridge_thread_cap();
+
+    // Keep BLAS/OpenMP helpers under the same limit as llama.cpp's native
+    // thread pool, without increasing a lower limit explicitly set by a user.
+    for variable in [
+        "OMP_NUM_THREADS",
+        "OMP_THREAD_LIMIT",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "BLIS_NUM_THREADS",
+    ] {
+        let configured = env::var(variable)
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .map(|value| value.min(thread_cap))
+            .unwrap_or(thread_cap);
+        command.env(variable, configured.to_string());
+    }
+}
+
+fn llama_bridge_thread_cap() -> usize {
+    let available_threads = thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    available_threads
+        .min(LLAMA_BRIDGE_MAX_LIBRARY_THREADS)
+        .max(1)
+}
+
+fn parse_llama_bridge_json(output: &Output) -> Result<LlamaBridgeJson> {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let json_line = stdout
+        .lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with('{'))
+        .ok_or_else(|| {
+            anyhow!(
+                "infernet-llama-bridge produced no JSON output; status={:?}; stderr={}",
+                output.status.code(),
+                stderr.trim()
+            )
+        })?;
+    serde_json::from_str(json_line)
+        .with_context(|| format!("failed to parse infernet-llama-bridge JSON: {json_line}"))
+}
+
+fn run_llama_bridge_with_timeout(command: &mut Command, timeout: Duration) -> Result<Output> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .context("failed to spawn infernet-llama-bridge")?;
+    let child_id = child.id();
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("failed to capture infernet-llama-bridge stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("failed to capture infernet-llama-bridge stderr"))?;
+    let stdout_reader = thread::spawn(move || read_child_output(stdout));
+    let stderr_reader = thread::spawn(move || read_child_output(stderr));
+    let started = std::time::Instant::now();
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout = join_child_output(stdout_reader, "stdout")?;
+                let stderr = join_child_output(stderr_reader, "stderr")?;
+                return Ok(Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            Ok(None) if started.elapsed() >= timeout => {
+                let kill_error = child.kill().err();
+                let wait_error = child.wait().err();
+                let _stdout = join_child_output(stdout_reader, "stdout")?;
+                let stderr = join_child_output(stderr_reader, "stderr")?;
+                let stderr = String::from_utf8_lossy(&stderr);
+                let mut details = Vec::new();
+                if let Some(error) = kill_error {
+                    details.push(format!("kill failed: {error}"));
+                }
+                if let Some(error) = wait_error {
+                    details.push(format!("reap failed: {error}"));
+                }
+                if !stderr.trim().is_empty() {
+                    details.push(format!("stderr={}", stderr.trim()));
+                }
+                let details = if details.is_empty() {
+                    String::new()
+                } else {
+                    format!("; {}", details.join("; "))
+                };
+                bail!(
+                    "infernet-llama-bridge process {child_id} exceeded the {:.1}s execution deadline and was terminated{details}",
+                    timeout.as_secs_f64()
+                );
+            }
+            Ok(None) => {
+                thread::sleep(
+                    LLAMA_BRIDGE_POLL_INTERVAL.min(timeout.saturating_sub(started.elapsed())),
+                );
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = join_child_output(stdout_reader, "stdout");
+                let _ = join_child_output(stderr_reader, "stderr");
+                return Err(error).context("failed to poll infernet-llama-bridge");
+            }
+        }
+    }
+}
+
+fn read_child_output(mut stream: impl Read) -> io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    stream.read_to_end(&mut output)?;
+    Ok(output)
+}
+
+fn join_child_output(
+    reader: thread::JoinHandle<io::Result<Vec<u8>>>,
+    stream_name: &str,
+) -> Result<Vec<u8>> {
+    reader
+        .join()
+        .map_err(|_| anyhow!("infernet-llama-bridge {stream_name} reader panicked"))?
+        .with_context(|| format!("failed to read infernet-llama-bridge {stream_name}"))
 }
 
 fn write_f32_activation(path: &Path, values: &[f32]) -> Result<()> {
@@ -2765,7 +3047,11 @@ fn build_grid_swarm(
                     StreamProtocol::new(ACTIVATION_PROTOCOL),
                     request_response::ProtocolSupport::Full,
                 )],
-                request_response::Config::default().with_request_timeout(Duration::from_secs(5)),
+                // A real GGUF request includes model load and prompt evaluation. The
+                // previous five-second transport deadline guaranteed failure while
+                // the worker kept computing after the client had already given up.
+                request_response::Config::default()
+                    .with_request_timeout(Duration::from_secs(16 * 60)),
             );
             let model = request_response::json::Behaviour::new(
                 [(
@@ -2797,12 +3083,13 @@ fn build_grid_swarm(
     Ok(swarm)
 }
 
-fn listen_on(swarm: &mut Swarm<GridBehaviour>, listen: &str) -> Result<()> {
+fn listen_on(swarm: &mut Swarm<GridBehaviour>, listen: &str) -> Result<ListenerId> {
     let p2p_listen = listen
         .parse::<Multiaddr>()
         .with_context(|| format!("invalid libp2p listen address {listen}"))?;
-    swarm.listen_on(p2p_listen)?;
-    Ok(())
+    swarm
+        .listen_on(p2p_listen)
+        .with_context(|| format!("failed to start libp2p listener on {listen}"))
 }
 
 fn publish_advertisement(
@@ -3071,6 +3358,120 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn llama_bridge_deadline_preserves_normal_json_output() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(
+            r#"printf '%s\n' 'bridge startup' '{"ok":true,"output_text":"token","timing_ms":12.5}'"#,
+        );
+
+        let output = run_llama_bridge_with_timeout(&mut command, Duration::from_secs(2)).unwrap();
+        assert!(output.status.success());
+
+        let parsed = parse_llama_bridge_json(&output).unwrap();
+        assert!(parsed.ok);
+        assert_eq!(parsed.output_text.as_deref(), Some("token"));
+        assert_eq!(parsed.timing_ms, Some(12.5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn llama_bridge_deadline_kills_and_reaps_process() {
+        let pid_path = env::temp_dir().join(format!(
+            "infernet-bridge-timeout-{}.pid",
+            uuid::Uuid::new_v4()
+        ));
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(r#"printf '%s' "$$" > "$1"; exec sleep 30"#)
+            .arg("infernet-bridge-timeout-test")
+            .arg(&pid_path);
+
+        let started = std::time::Instant::now();
+        let error = run_llama_bridge_with_timeout(&mut command, Duration::from_millis(150))
+            .expect_err("long-running bridge should be terminated");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("exceeded the 0.1s execution deadline"),
+            "{error}"
+        );
+        assert!(error.contains("was terminated"), "{error}");
+
+        let pid = fs::read_to_string(&pid_path).unwrap();
+        let status = Command::new("kill")
+            .arg("-0")
+            .arg(pid.trim())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(
+            !status.success(),
+            "timed-out bridge process {pid} is still alive"
+        );
+
+        let _ = fs::remove_file(pid_path);
+    }
+
+    #[tokio::test]
+    async fn model_distribution_reports_actual_listen_address_when_ready() {
+        let root = std::env::temp_dir().join(format!(
+            "infernet-distribution-ready-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut discovery = DiscoveryConfig::new("infernet/test/readiness");
+        discovery.p2p_listen = "/ip4/127.0.0.1/tcp/0".to_owned();
+        let (readiness_sender, readiness_receiver) = oneshot::channel();
+        let service = tokio::spawn(run_model_distribution_node_with_readiness(
+            discovery,
+            ShardCacheConfig::new(root.clone()),
+            readiness_sender,
+        ));
+
+        let address = tokio::time::timeout(Duration::from_secs(5), readiness_receiver)
+            .await
+            .expect("model distribution service did not report readiness")
+            .expect("model distribution readiness channel closed")
+            .expect("model distribution listener failed");
+
+        assert!(address.starts_with("/ip4/127.0.0.1/tcp/"), "{address}");
+        assert!(!address.ends_with("/tcp/0"), "{address}");
+        assert!(!service.is_finished());
+
+        service.abort();
+        let _ = service.await;
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn model_distribution_reports_startup_failure_to_readiness_waiter() {
+        let root = std::env::temp_dir().join(format!(
+            "infernet-distribution-failed-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut discovery = DiscoveryConfig::new("infernet/test/readiness-failure");
+        discovery.p2p_listen = "not-a-multiaddr".to_owned();
+        let (readiness_sender, readiness_receiver) = oneshot::channel();
+        let service = tokio::spawn(run_model_distribution_node_with_readiness(
+            discovery,
+            ShardCacheConfig::new(root.clone()),
+            readiness_sender,
+        ));
+
+        let error = tokio::time::timeout(Duration::from_secs(5), readiness_receiver)
+            .await
+            .expect("model distribution service did not report startup failure")
+            .expect("model distribution readiness channel closed")
+            .expect_err("invalid listen address should fail startup");
+        assert!(error.contains("invalid libp2p listen address"), "{error}");
+        assert!(service.await.unwrap().is_err());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn activation_step_forwards_to_next_hop() {
         let route = vec![hop("peer-a", 0, 3), hop("peer-b", 3, 6)];
@@ -3196,7 +3597,7 @@ mod tests {
             metadata: infernet_model::ShardMetadata {
                 architecture: "gemma".to_owned(),
                 quantization: Some("IQ4_XS".to_owned()),
-                source_checksum: Some(checksum.clone()),
+                source_checksum: Some("source-checksum".to_owned()),
                 protocol_version: PROTOCOL_VERSION,
             },
             source: infernet_model::SeedSourceMetadata {
@@ -3205,7 +3606,7 @@ mod tests {
                 file_size_bytes: 16,
             },
             shard_hash: "seed-hash".to_owned(),
-            payload_kind: model_distribution::PAYLOAD_KIND_INFERNET_SHARD.to_owned(),
+            payload_kind: model_distribution::PAYLOAD_KIND_FULL_MODEL.to_owned(),
         };
         cache
             .import_physical_shard_file(&shard_file, "gemma", layers, "v1", manifest)

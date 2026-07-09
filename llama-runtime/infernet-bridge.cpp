@@ -106,13 +106,47 @@ static std::string token_to_piece(const llama_vocab * vocab, llama_token token) 
     return piece;
 }
 
+static std::string format_chat_prompt(const llama_model * model, const std::string & prompt) {
+    const char * chat_template = llama_model_chat_template(model, nullptr);
+    if (!chat_template) {
+        return prompt;
+    }
+
+    const llama_chat_message message = { "user", prompt.c_str() };
+    std::vector<char> formatted(prompt.size() * 4 + 1024);
+    int32_t length = llama_chat_apply_template(
+        chat_template,
+        &message,
+        1,
+        true,
+        formatted.data(),
+        static_cast<int32_t>(formatted.size()));
+    if (length < 0) {
+        throw std::runtime_error("failed to apply the model's chat template");
+    }
+    if (static_cast<size_t>(length) > formatted.size()) {
+        formatted.resize(static_cast<size_t>(length));
+        length = llama_chat_apply_template(
+            chat_template,
+            &message,
+            1,
+            true,
+            formatted.data(),
+            static_cast<int32_t>(formatted.size()));
+        if (length < 0 || static_cast<size_t>(length) > formatted.size()) {
+            throw std::runtime_error("failed to resize the formatted chat prompt");
+        }
+    }
+    return std::string(formatted.data(), static_cast<size_t>(length));
+}
+
 static void print_usage(const char * argv0) {
     std::cerr
-        << "usage: " << argv0 << " --model file.gguf --layer-start N --layer-end N --hidden-size N --prompt text [--input activation.bin] [--output activation.bin]\n"
+        << "usage: " << argv0 << " --model file.gguf --layer-start N --layer-end N --hidden-size N --threads N --prompt text [--full-model] [--input activation.bin] [--output activation.bin]\n"
         << "\n"
         << "Runs a patched llama.cpp layer-range graph. If --input is omitted, tokens are embedded and execution starts at layer 0.\n"
         << "If --layer-end is less than the model layer count, hidden activations are written to --output.\n"
-        << "If --layer-end reaches the model layer count, the final shard samples one greedy token and returns it as JSON.\n";
+        << "If --layer-end reaches the model layer count, the final shard generates up to 32 greedy tokens and returns them as JSON.\n";
 }
 
 int main(int argc, char ** argv) {
@@ -125,6 +159,8 @@ int main(int argc, char ** argv) {
     uint32_t layer_start = 0;
     uint32_t layer_end = 0;
     uint32_t hidden_size = 0;
+    uint32_t threads = 4;
+    bool full_model = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -155,6 +191,12 @@ int main(int argc, char ** argv) {
             if (!parse_u32(need_value("--hidden-size"), hidden_size)) {
                 throw std::runtime_error("invalid --hidden-size");
             }
+        } else if (arg == "--threads") {
+            if (!parse_u32(need_value("--threads"), threads) || threads == 0 || threads > 64) {
+                throw std::runtime_error("invalid --threads");
+            }
+        } else if (arg == "--full-model") {
+            full_model = true;
         } else if (arg == "--help" || arg == "-h") {
             print_usage(argv[0]);
             return 0;
@@ -176,9 +218,11 @@ int main(int argc, char ** argv) {
         llama_model_params model_params = llama_model_default_params();
         model_params.n_gpu_layers = 0;
         model_params.use_mmap = true;
-        model_params.infernet_partial = true;
-        model_params.infernet_layer_start = layer_start;
-        model_params.infernet_layer_end = layer_end;
+        model_params.infernet_partial = !full_model;
+        if (!full_model) {
+            model_params.infernet_layer_start = layer_start;
+            model_params.infernet_layer_end = layer_end;
+        }
 
         llama_model * model = llama_model_load_from_file(model_path.c_str(), model_params);
         if (!model) {
@@ -197,11 +241,18 @@ int main(int argc, char ** argv) {
             error << "layer range " << layer_start << ":" << layer_end << " exceeds model layers " << model_layers;
             throw std::runtime_error(error.str());
         }
+        if (full_model && (layer_start != 0 || layer_end != model_layers)) {
+            throw std::runtime_error("--full-model requires the complete 0:N layer range");
+        }
 
         const llama_vocab * vocab = llama_model_get_vocab(model);
-        std::vector<llama_token> tokens = tokenize_prompt(vocab, prompt);
+        const std::string formatted_prompt = format_chat_prompt(model, prompt);
+        std::vector<llama_token> tokens = tokenize_prompt(vocab, formatted_prompt);
         if (tokens.empty()) {
             throw std::runtime_error("prompt produced no tokens");
+        }
+        if (tokens.size() > 2048) {
+            throw std::runtime_error("prompt exceeds Infernet's 2048-token safety limit");
         }
 
         std::vector<float> input_activation;
@@ -219,11 +270,15 @@ int main(int argc, char ** argv) {
             throw std::runtime_error("non-zero layer_start requires --input activation");
         }
 
+        constexpr uint32_t max_generated_tokens = 32;
         llama_context_params ctx_params = llama_context_default_params();
-        ctx_params.n_ctx = static_cast<uint32_t>(std::max<size_t>(tokens.size(), 1));
+        const size_t context_tokens = tokens.size() + (layer_end == model_layers ? max_generated_tokens : 0);
+        ctx_params.n_ctx = static_cast<uint32_t>(std::max<size_t>(context_tokens, 1));
         ctx_params.n_batch = static_cast<uint32_t>(tokens.size());
         ctx_params.n_ubatch = static_cast<uint32_t>(tokens.size());
         ctx_params.n_seq_max = 1;
+        ctx_params.n_threads = static_cast<int32_t>(threads);
+        ctx_params.n_threads_batch = static_cast<int32_t>(threads);
         ctx_params.no_perf = false;
         ctx_params.embeddings = layer_end < model_layers;
 
@@ -231,7 +286,9 @@ int main(int argc, char ** argv) {
         if (!ctx) {
             throw std::runtime_error("failed to create llama context");
         }
-        llama_infernet_set_layer_range(ctx, layer_start, layer_end);
+        if (!full_model) {
+            llama_infernet_set_layer_range(ctx, layer_start, layer_end);
+        }
 
         llama_batch batch = llama_batch_init(static_cast<int32_t>(tokens.size()), input_activation.empty() ? 0 : static_cast<int32_t>(hidden_size), 1);
         if (input_activation.empty()) {
@@ -255,14 +312,12 @@ int main(int argc, char ** argv) {
 
         const int64_t start_us = ggml_time_us();
         const int decode_status = llama_decode(ctx, batch);
-        const int64_t end_us = ggml_time_us();
         if (decode_status != 0) {
             std::ostringstream error;
             error << "llama_decode failed with status " << decode_status;
             throw std::runtime_error(error.str());
         }
 
-        const double timing_ms = static_cast<double>(end_us - start_us) / 1000.0;
         const size_t output_values = tokens.size() * static_cast<size_t>(hidden_size);
 
         if (layer_end < model_layers) {
@@ -274,6 +329,8 @@ int main(int argc, char ** argv) {
                 throw std::runtime_error("llama_get_embeddings returned null for shard output");
             }
             write_f32_file(output_path, embeddings, output_values);
+            const int64_t end_us = ggml_time_us();
+            const double timing_ms = static_cast<double>(end_us - start_us) / 1000.0;
             std::cout
                 << "{\"ok\":true"
                 << ",\"n_tokens\":" << tokens.size()
@@ -286,15 +343,36 @@ int main(int argc, char ** argv) {
             llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
             llama_sampler * sampler = llama_sampler_chain_init(sparams);
             llama_sampler_chain_add(sampler, llama_sampler_init_greedy());
-            const llama_token token = llama_sampler_sample(sampler, ctx, -1);
-            const std::string piece = llama_vocab_is_eog(vocab, token) ? "" : token_to_piece(vocab, token);
+            llama_token token = llama_sampler_sample(sampler, ctx, -1);
+            std::string generated;
+            uint32_t generated_tokens = 0;
+            while (generated_tokens < max_generated_tokens && !llama_vocab_is_eog(vocab, token)) {
+                generated += token_to_piece(vocab, token);
+                ++generated_tokens;
+                llama_sampler_accept(sampler, token);
+                if (generated_tokens >= max_generated_tokens) {
+                    break;
+                }
+                llama_batch next_batch = llama_batch_get_one(&token, 1);
+                const int next_status = llama_decode(ctx, next_batch);
+                if (next_status != 0) {
+                    std::ostringstream error;
+                    error << "llama_decode failed while generating token " << generated_tokens
+                          << " with status " << next_status;
+                    throw std::runtime_error(error.str());
+                }
+                token = llama_sampler_sample(sampler, ctx, -1);
+            }
             llama_sampler_free(sampler);
+            const int64_t end_us = ggml_time_us();
+            const double timing_ms = static_cast<double>(end_us - start_us) / 1000.0;
             std::cout
                 << "{\"ok\":true"
                 << ",\"n_tokens\":" << tokens.size()
                 << ",\"hidden_size\":" << hidden_size
                 << ",\"output_f32_count\":0"
-                << ",\"output_text\":\"" << escape_json(piece) << "\""
+                << ",\"generated_tokens\":" << generated_tokens
+                << ",\"output_text\":\"" << escape_json(generated) << "\""
                 << ",\"timing_ms\":" << timing_ms
                 << "}\n";
         }

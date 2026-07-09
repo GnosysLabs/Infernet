@@ -4,14 +4,26 @@ Infernet is an experimental peer-to-peer split-inference system for local and
 community-owned AI compute.
 
 The core idea is simple: the app is always connected to an AI grid. Your
-computer is one node in that grid. A model can be present as many physical layer
-shards spread across many machines, and the scheduler builds an ordered route
-through the peers that can execute those layers.
+computer is one node in that grid. An official Infernet model can be present as
+many physical layer shards spread across many machines, and the scheduler builds
+an ordered route through the peers that can execute those layers.
 
 The user experience should feel like a normal AI chat app. The network exists
-under the surface. Users choose a model and send a message; Infernet discovers
-peers, verifies available shards, downloads missing executable shards when
-needed, builds a route, forwards activations hop by hop, and returns a response.
+under the surface. Users choose an official model and send a message; Infernet
+discovers peers, verifies available shards, downloads only the executable shards
+that machine should host, builds a route, forwards activations hop by hop, and
+returns a response.
+
+Infernet is **not** a general-purpose GGUF runner or model-import tool. The
+launch product supports only curated, signed Infernet model packages. There is
+no user workflow for adding a local file, pasting a Hugging Face URL, or
+converting an arbitrary model. This narrow contract lets the project make a
+small number of distributed models genuinely reliable before expanding its
+official catalog.
+
+The launch flagship is **Infernet Chat**, based on **Gemma 4 26B A4B Instruct
+QAT Q4_0**. Its upstream identity is provenance; users interact with the tested
+Infernet edition.
 
 ## Current State
 
@@ -28,18 +40,19 @@ The current implementation includes:
   bootstrap node.
 - A Tauri desktop app with a chat-first UI, model library, downloads view, and
   optional network activity details.
-- Infernet-native `.infershard` package creation from a local or Hugging Face
-  GGUF file.
+- Infernet-native `.infermodel` manifests and verified `.infershard` execution
+  packages for official models.
 - A local shard cache with verified checksums and executable-shard metadata.
 - P2P model shard transfer over `/infernet/model-blob/1`.
 - P2P activation forwarding over `/infernet/activation/1`.
 - Route construction from live peer advertisements.
-- A patched llama.cpp bridge that can load and evaluate a contiguous layer range
-  from an Infernet shard package.
+- A patched llama.cpp bridge that loads an executable Infernet package. Physical
+  contiguous layer-range execution remains experimental.
 
-The current GGUF runtime is correctness-first. It is not fast and it is not a
-finished product. The first bridge is intended to prove that a real GGUF model
-can be partitioned into physical executable layer shards and routed across peers.
+The current runtime is correctness-first. It is not fast and it is not a
+finished product. The compatibility package keeps one complete model payload so
+the runtime can use the architecture's normal execution graph without storage
+amplification. Physical layer partitioning and routing remain experimental.
 Multi-token distributed KV-cache streaming, advanced scheduling, proofs of
 correct execution, privacy protections, and production NAT traversal are still
 future work.
@@ -53,9 +66,8 @@ Infernet is trying to prove that a model does not have to live on one computer.
 
 In the target architecture:
 
-- One node can introduce a model to the network.
-- Infernet automatically converts the source model into executable layer shard
-  packages.
+- Infernet's release pipeline publishes a curated and signed model edition.
+- Seed nodes introduce only that official package to the network.
 - Other nodes can discover those shards.
 - Nodes can download only the shards they should host.
 - Downloaders immediately become seeders.
@@ -65,9 +77,10 @@ In the target architecture:
 
 Today, the prototype has the first version of that loop:
 
-- A user can add a GGUF model.
-- Infernet builds real `.infershard` layer packages.
-- Those shard packages are cached locally and advertised to peers.
+- A release engineer can build one complete executable `.infershard`
+  compatibility package for an approved upstream artifact.
+- Official packages are published, cached by seed nodes, and advertised to
+  peers.
 - Other peers can fetch shard files peer-to-peer and start serving them.
 - The app only treats a peer as inference-capable when it advertises executable
   Infernet shards, not loose metadata.
@@ -164,9 +177,30 @@ There is no direct TCP activation path in the default inference flow.
 
 This is the most important current subsystem.
 
-When a user adds a `.gguf` model, Infernet treats GGUF as the source/import
-format. It does not merely store a JSON record or a pointer to the full file.
-It creates executable `.infershard` packages in the local shard cache.
+An official model release consists of a model-level `.infermodel` manifest and
+one or more executable `.infershard` packages. The manifest defines model
+identity, version, provenance, compatibility, execution topology, component
+references, sizes, and checksums. Peers use it to determine exactly which
+verified components they need.
+
+GGUF may be used as an upstream tensor artifact inside Infernet's **offline,
+maintainer-only release engineering pipeline**. It is never accepted through
+the app and is not a user-facing Infernet model format.
+
+The logical release layout is:
+
+```text
+infernet-chat-v1.infermodel
+components/
+  component-000.infershard/
+  component-001.infershard/
+  ...
+```
+
+The `.infermodel` manifest is the signed catalog and execution contract. An
+`.infershard` is a content-addressed execution component that a peer can verify,
+cache, run, and seed independently. This separation lets a later release change
+its physical component plan without teaching users about tensor formats.
 
 ### What A Shard Contains
 
@@ -182,90 +216,71 @@ An `.infershard` is a directory package. The current package layout is:
 id, layer range, checksum, source checksum, tokenizer compatibility, and payload
 metadata.
 
-`tensors.gguf` is the executable tensor payload. Today it contains:
+Complete compatibility packages use payload kind `infernet-full-model` and
+runtime ABI `infernet-llama-full-v1`. That explicit capability tag prevents an
+older partial-graph peer from treating the package as a layer shard. Network
+advertisements omit release-build machine paths and other private provenance
+details.
 
-- the original GGUF metadata section
-- tokenizer-compatible metadata
-- all non-layer/global tensors currently required by llama.cpp loading
-- only the `blk.N.*` tensors for the shard's assigned layer range
-- rewritten tensor directory entries
-- rewritten tensor offsets
-- shard checksum, size, version, and protocol metadata
-
-For a layer range `16:17`, the shard includes block tensors for layer `16` and
-excludes block tensors outside that range.
+`tensors.gguf` is the current compatibility payload. The release packager keeps
+one complete `0:N` package. On APFS it can create an isolated copy-on-write
+clone; other filesystems fall back to one ordinary copy. The cache never shares
+a mutable hard-link inode with its upstream release artifact.
 
 ### What Is Duplicated
 
-The current shard writer deliberately keeps global tensors in every shard. That
-includes tensors such as embeddings, output norms, and other non-`blk.N.*`
-tensors.
-
-This is not storage-optimal. It is a correctness-first design. Duplicating
-global tensors lets the patched llama.cpp loader initialize a partial model
-without inventing a new GGUF container format.
-
-Future `.infershard` versions should reduce this duplication.
+The release packager does not duplicate global tensors across per-layer packages.
+The earlier one-layer planner copied large embeddings into every layer package;
+that path is disabled because a 5 GB model could expand beyond 30 GB. Physical
+multi-package splitting remains experimental until each architecture has a
+verified partial graph and a storage-safe tensor plan.
 
 ### What Is Not A Shard
 
 Infernet no longer treats these as executable model capacity:
 
 - metadata-only seed records
-- arbitrary files imported with the legacy `model import` command
+- arbitrary cache payloads produced by legacy/debug tooling
 - bare `model_shards` rows without an executable seed manifest
 - stale cache entries whose physical file is missing
 
 Those records may exist in older caches, but they do not count toward route
 construction and they should not produce model cards in the app.
 
-### Automatic Shard Planning
+### Official Shard Planning
 
-Users do not choose a shard size.
-
-Infernet plans layer ranges automatically from GGUF metadata. The current
-planner is intentionally small-grained:
+Users do not choose a shard size or package layout. Each official model version
+ships with one layout designed and validated for its architecture and Infernet's
+target hardware. The initial compatibility layout is intentionally conservative:
 
 - demo models use small fixed ranges
-- llama.cpp/GGUF imports create one executable `.infershard` package per
-  transformer layer
+- Infernet Chat initially uses a verified complete `0:N` executable package
+- physical layer packages ship only after their partial graph, tensor ownership,
+  routing behavior, and storage footprint pass release validation
 
-One physical layer per package gives the scheduler maximum freedom to group work
-later. The scheduler is not yet hardware-aware. The future scheduler should
-account for RAM, VRAM, disk budget, bandwidth, latency, and network replication
-health, then assign one or more physical layer shards to each capable node.
+This prevents the earlier failure mode where duplicating global tensors across
+layer packages could turn a 5 GB source artifact into more than 30 GB of cache.
+Future Infernet Chat releases can adopt a storage-safe component layout without
+changing the user experience.
 
-## What Happens When You Add A Model
+## Official Model Release Pipeline
 
-From the desktop app:
+This is release engineering tooling for Infernet maintainers, not an app or user
+workflow:
 
-1. The user chooses a local `.gguf` file or downloads one from Hugging Face.
-2. Infernet parses GGUF metadata:
-   - architecture
-   - layer count
-   - hidden size
-   - quantization
-   - tokenizer metadata
-3. Infernet hashes the source file.
-4. Infernet automatically plans layer ranges.
-5. Infernet writes `.infershard` packages into the shard cache.
-6. Each shard is checksummed and recorded with metadata.
-7. The node starts or refreshes the model distribution service.
-8. The node advertises only executable Infernet shards.
-9. Other nodes can discover and download those shards.
+1. A maintainer selects the pinned upstream artifact for an approved model.
+2. The offline packager validates architecture, layer count, hidden size,
+   quantization, tokenizer metadata, and licensing/provenance metadata.
+3. It plans a supported component layout and rejects storage amplification.
+4. It writes executable `.infershard` packages and an `.infermodel` manifest.
+5. Release validation exercises loading, routing, generation, integrity checks,
+   and the target hardware matrix, beginning with an RTX 3090-class node and two
+   Apple Silicon MacBook Pro nodes.
+6. The final manifest and components are checksummed, signed, versioned, and
+   published to official seed nodes.
 
-The UI shows progress for:
-
-- checking/parsing the file
-- verifying/hash reading
-- building shards
-- writing shard `X of Y` for layer range `A:B`
-- starting sharing
-- ready
-
-For multi-GB models, the shard-build step can take real time and significant
-disk I/O. The current format can also require substantial extra disk space
-because global tensors are duplicated into each shard.
+Normal Infernet nodes only discover, download, verify, cache, execute, and seed
+those published packages. They never convert or import a model.
 
 ## What Happens On Another Machine
 
@@ -282,9 +297,10 @@ The current behavior is:
 - the node immediately begins seeding those shards
 - route construction uses the union of local and remote executable shards
 
-This is the beginning of Infernet becoming a self-hosting model repository. Once
-one node introduces a model, other nodes can obtain shards from peers instead of
-from a central HTTP file server.
+This is the beginning of Infernet becoming a self-hosting official model
+repository. Once seed nodes publish an approved model version, other nodes can
+obtain its verified shards from peers instead of repeatedly relying on a central
+HTTP file server.
 
 ## Route Construction
 
@@ -295,7 +311,7 @@ It uses only `hosted_shards` that are executable:
 - model id must match
 - runtime kind must match
 - layer ranges must cover `0..layer_count`
-- the descriptor must include a valid executable GGUF seed manifest
+- the descriptor must match a valid executable Infernet package manifest
 
 If no full route exists, Infernet returns a clear missing-range error:
 
@@ -311,10 +327,10 @@ It means route construction cannot find every required layer.
 
 The app lives in `infernet-ui` and uses Tauri, React, and TypeScript.
 
-The current UI is chat-first:
+The launch UI is chat-first:
 
 - Chat
-- Models
+- Models (the official Infernet catalog)
 - Downloads
 - Settings
 
@@ -341,29 +357,29 @@ Developer/network details are available through the network activity view.
 
 ### Models
 
-The Models page is where users add models.
+The Models page is the official Infernet catalog. It shows curated model
+editions, beginning with:
 
-Supported sources:
+- **Infernet Chat** — based on Gemma 4 26B A4B Instruct QAT Q4_0
 
-- local `.gguf` file
-- Hugging Face GGUF file download
-
-The app chooses shard layout automatically. Users do not choose "4 layers per
-shard" or similar parameters.
+Users can install or activate an available official model; they cannot add a
+local file, enter a Hugging Face repository, or convert another format. Model
+layout, signatures, runtime compatibility, and update policy are part of the
+published Infernet edition.
 
 ### Downloads
 
-The Downloads page is for technical storage and contribution state:
+The Downloads page explains storage and contribution state in useful product
+language:
 
-- installed models
-- installed shards
+- official models stored on this computer
+- active verified model transfers
 - storage used
-- uploads
-- downloads
-- replication health placeholders
+- whether this computer is making model components available to peers
+- recent model activity
 
-The current replication health display is informational. Automatic replication
-and rebalancing are future work.
+Checksums, layer ranges, package versions, and peer identifiers belong in
+developer details. Automatic replication and rebalancing are future work.
 
 ## Setup Requirements
 
@@ -450,9 +466,14 @@ npm run dev
 The browser-only Vite view uses mock data. Use Tauri for real networking,
 sharding, and inference commands.
 
-## CLI Commands
+## Maintainer Release Tooling
 
-Add a local GGUF model and build Infernet shards:
+These commands exist for local protocol development and official release
+engineering. They are not supported user workflows and must not be exposed by
+the desktop app.
+
+Prepare a pinned upstream GGUF as one complete compatibility package in an
+isolated maintainer cache:
 
 ```sh
 cargo run -p infernet-worker -- model add-local \
@@ -497,9 +518,10 @@ cargo run -p infernet-worker -- model list \
   --cache-dir /tmp/infernet-peer
 ```
 
-`model import` is a legacy/debug path for arbitrary cache payloads. It does not
-create executable `.infershard` packages and should not be used for real
-inference.
+`model add-local` and `model import` are internal compatibility/debug commands.
+They do not make arbitrary models part of the Infernet catalog. Production
+nodes accept only package identities, versions, checksums, and signatures from
+the official release channel.
 
 ## Toy Split-Inference Demo
 
@@ -582,12 +604,12 @@ Current WAN limitations:
 
 ## Troubleshooting
 
-### A model appears and then says "unknown model"
+### An official model appears and then says "unknown model"
 
 That means the UI saw a stale or incomplete advertisement. Current builds trust
 executable `infernet-shard` manifests, with legacy `gguf-shard` records accepted
-only for compatibility. Pull latest on every machine and re-add the model on the
-seed node so it builds `.infershard` packages.
+only for compatibility. Refresh the official package on the seed node and make
+sure every machine trusts the same Infernet release manifest.
 
 ### A route is missing `0:N`
 
@@ -595,12 +617,12 @@ No peer is advertising executable shard coverage for those layers. Adding a
 model name is not enough. At least one peer must have verified `.infershard`
 packages for the required layer ranges.
 
-### The model import reaches 100% and keeps working
+### An official model download reaches 100% and keeps working
 
-Hash verification is done, but shard building is still writing `.infershard`
-packages. Current builds show `Building Infernet shards` and `Writing
-.infershard X of Y`. Large models can still take time because this is real disk
-I/O.
+The transfer may be complete while integrity verification is still reading the
+downloaded bytes. The activity view should identify this stage as “Checking
+model integrity,” rather than presenting it as an import or leaving the user
+with an unchanged download percentage.
 
 ### The app says there are peers but no runnable model
 
@@ -625,15 +647,19 @@ Infernet is still a prototype.
 
 Important limitations:
 
-- Physical shard v1 duplicates global tensors into every shard.
-- Shard planning is layer-count based, not hardware-aware.
+- Infernet Chat initially uses one complete compatibility package; physical
+  split planning remains disabled until its Gemma architecture support and
+  storage behavior are verified.
+- The launch catalog contains only official curated packages. Arbitrary model
+  import is intentionally outside the product scope.
+- Package planning is not yet hardware-aware.
 - The scheduler does not yet optimize for RAM, VRAM, latency, or bandwidth.
 - WAN connectivity still needs relay/hole-punching for difficult NAT cases.
 - Downloads are chunked and verified, but not resumable.
 - Multi-source downloads are not implemented.
 - Automatic replication and self-healing are not implemented.
-- GGUF split execution is experimental and currently focused on contiguous
-  layer ranges.
+- Distributed split execution is experimental and currently focused on
+  contiguous layer ranges for explicitly supported official models.
 - The bridge is intended to prove a prompt pass plus a sampled token; persistent
   distributed KV-cache streaming for long chat responses is future work.
 - There is no cryptographic proof that a peer executed a layer correctly.
@@ -645,5 +671,6 @@ Important limitations:
 Read these for deeper architecture notes:
 
 - [docs/infernet-technical-design.md](docs/infernet-technical-design.md)
+- [docs/infernet-chat-v1.md](docs/infernet-chat-v1.md)
 - [docs/gguf-split-inference-design.md](docs/gguf-split-inference-design.md)
 - [docs/model-distribution-design.md](docs/model-distribution-design.md)

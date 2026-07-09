@@ -1,47 +1,32 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   Box,
   CheckCircle2,
   ChevronDown,
-  Cloud,
   Download,
-  FilePlus2,
   HardDrive,
-  KeyRound,
+  Laptop2,
   MessageSquare,
   Network,
+  PanelRightClose,
   RefreshCw,
   Send,
   Settings,
-  SlidersHorizontal,
-  Search,
-  UploadCloud,
-  Wifi,
 } from "lucide-react";
 import {
   addManualPeer,
-  addHuggingFaceModel,
-  addLocalGgufModel,
-  chooseLocalModelFile,
-  clearHuggingFaceToken,
   clearManualPeers,
   emptySnapshot,
   getGridSnapshot,
-  getHuggingFaceSettings,
   getLocalIdentity,
   getManualPeers,
-  inspectHuggingFaceRepo,
   listenForProgress,
   listenForModelImportProgress,
   runDistributedInference,
-  saveHuggingFaceToken,
 } from "./api";
 import type {
-  AddModelResponse,
   GridSnapshot,
-  HuggingFaceFileView,
-  HuggingFaceSettings,
   HopProgress,
   LocalIdentity,
   ModelImportProgress,
@@ -60,38 +45,35 @@ type TransferActivity = ModelImportProgress & {
 };
 
 const DEFAULT_PROMPT = "";
-const INITIAL_MESSAGES: Message[] = [
-  {
-    id: "welcome",
-    role: "assistant",
-    text: "Ask Infernet anything. It will find the right model and start thinking.",
-  },
-];
+const INFERNET_CHAT_MODEL_ID = "infernet-chat-v1";
 
 export default function App() {
   const [page, setPage] = useState<Page>("chat");
   const [developerMode, setDeveloperMode] = useState(false);
-  const [showNetwork, setShowNetwork] = useState(false);
+  const [activityOpen, setActivityOpen] = useState(false);
   const [identity, setIdentity] = useState<LocalIdentity | null>(null);
   const [snapshot, setSnapshot] = useState<GridSnapshot>(emptySnapshot);
   const [selectedModel, setSelectedModel] = useState("");
   const [prompt, setPrompt] = useState(DEFAULT_PROMPT);
-  const [messages, setMessages] = useState<Message[]>(INITIAL_MESSAGES);
+  const [messages, setMessages] = useState<Message[]>([]);
   const [status, setStatus] = useState("Starting");
   const [isRunning, setIsRunning] = useState(false);
+  const [runStartedAt, setRunStartedAt] = useState<number | null>(null);
+  const [lastRunDurationMs, setLastRunDurationMs] = useState<number | null>(null);
   const [hops, setHops] = useState<HopProgress[]>([]);
   const [route, setRoute] = useState<RouteHopView[]>([]);
   const [lastError, setLastError] = useState<string | null>(null);
   const [transferActivities, setTransferActivities] = useState<TransferActivity[]>([]);
 
-  const selectedModelView = useMemo(
-    () => snapshot.availableModels.find((model) => model.modelId === selectedModel),
-    [snapshot.availableModels, selectedModel],
+  const officialModels = useMemo(
+    () => snapshot.availableModels.filter(isOfficialInfernetModel),
+    [snapshot.availableModels],
   );
-  const activeRoute = route.length > 0 ? route : snapshot.route;
-  const peerCount = uniquePeerCount(activeRoute);
-  const remotePeerCount = snapshot.networkPeerCount;
-  const completedHops = hops.filter((hop) => hop.status === "complete").length;
+  const selectedModelView = useMemo(
+    () => officialModels.find((model) => model.modelId === selectedModel),
+    [officialModels, selectedModel],
+  );
+  const activeRoute = selectedModelView ? (route.length > 0 ? route : snapshot.route) : [];
   const activeTransfers = transferActivities.filter((activity) => activity.status === "active").length;
 
   const applyProgressEvent = useCallback((event: ProgressEvent) => {
@@ -108,25 +90,25 @@ export default function App() {
           status: "pending",
         })),
       );
-      setStatus("Route ready");
+      setStatus("Finding available compute");
       setLastError(null);
       return;
     }
 
     if (event.type === "hopStarted") {
       setHops((current) => upsertHop(current, event, "running"));
-      setStatus("Thinking");
+      setStatus("Running model");
       return;
     }
 
     if (event.type === "hopCompleted") {
       setHops((current) => upsertHop(current, event, "complete"));
-      setStatus("Generating");
+      setStatus("Finishing response");
       return;
     }
 
     if (event.type === "finalOutput") {
-      setStatus("Connected");
+      setStatus("Ready");
       setIsRunning(false);
       return;
     }
@@ -142,18 +124,20 @@ export default function App() {
     setStatus("Connecting");
     try {
       const nextSnapshot = await getGridSnapshot(4000, modelId);
-      const modelStillExists =
-        modelId && nextSnapshot.availableModels.some((model) => model.modelId === modelId);
+      const nextOfficialModels = nextSnapshot.availableModels.filter(isOfficialInfernetModel);
+      const modelStillExists = modelId && nextOfficialModels.some((model) => model.modelId === modelId);
       const nextSelectedModel = modelStillExists
         ? modelId
-        : nextSnapshot.selectedModel || nextSnapshot.availableModels[0]?.modelId || "";
-      const nextModel = nextSnapshot.availableModels.find((model) => model.modelId === nextSelectedModel);
+        : nextOfficialModels.find((model) => model.modelId === nextSnapshot.selectedModel)?.modelId
+          || nextOfficialModels[0]?.modelId
+          || "";
+      const nextModel = nextOfficialModels.find((model) => model.modelId === nextSelectedModel);
       setSnapshot(nextSnapshot);
-      setRoute(nextSnapshot.route);
-      setLastError(nextSnapshot.missingRanges ?? null);
+      setRoute(nextSelectedModel ? nextSnapshot.route : []);
+      setLastError(nextSelectedModel ? nextSnapshot.missingRanges ?? null : null);
       setSelectedModel(nextSelectedModel);
       setStatus(
-        nextSnapshot.availableModels.length === 0
+        nextOfficialModels.length === 0
           ? "No models"
           : nextModel?.runnable
             ? "Ready"
@@ -174,25 +158,40 @@ export default function App() {
   }, [refreshSnapshot, selectedModel]);
 
   useEffect(() => {
+    let disposed = false;
     let unlisten: (() => void) | undefined;
     listenForProgress(applyProgressEvent).then((dispose) => {
-      unlisten = dispose;
+      if (disposed) {
+        dispose();
+      } else {
+        unlisten = dispose;
+      }
     });
 
     return () => {
+      disposed = true;
       unlisten?.();
     };
   }, [applyProgressEvent]);
 
   useEffect(() => {
+    let disposed = false;
     let unlisten: (() => void) | undefined;
     listenForModelImportProgress((event) => {
+      if (!isOfficialModelId(event.modelId)) {
+        return;
+      }
       setTransferActivities((current) => upsertTransferActivity(current, event));
     }).then((dispose) => {
-      unlisten = dispose;
+      if (disposed) {
+        dispose();
+      } else {
+        unlisten = dispose;
+      }
     });
 
     return () => {
+      disposed = true;
       unlisten?.();
     };
   }, []);
@@ -206,19 +205,19 @@ export default function App() {
     setStatus("Connecting");
   }
 
-  async function handleModelImported(modelId: string) {
-    setSelectedModel(modelId);
-    await refreshSnapshot(modelId);
-  }
-
   async function runInference() {
     const userPrompt = prompt.trim();
     if (!userPrompt || isRunning) {
       return;
     }
     if (!selectedModelView) {
-      setLastError("Add a model before sending a message.");
+      setLastError("Install Infernet Chat before sending a message.");
       setStatus("No models");
+      return;
+    }
+    if (!selectedModelView.runnable && selectedModelView.installed) {
+      setLastError(selectedModelView.status);
+      setStatus("Model not ready");
       return;
     }
     setMessages((current) => [
@@ -227,9 +226,10 @@ export default function App() {
     ]);
     setPrompt("");
     setIsRunning(true);
-    setShowNetwork(false);
+    const startedAt = Date.now();
+    setRunStartedAt(startedAt);
     setLastError(null);
-    setStatus("Thinking");
+    setStatus("Finding available compute");
     setHops([]);
 
     try {
@@ -239,22 +239,20 @@ export default function App() {
         ...current,
         { id: `assistant-${Date.now()}`, role: "assistant", text: output },
       ]);
-      setStatus("Connected");
+      setStatus("Ready");
     } catch (error) {
       const message = String(error);
       setLastError(message);
-      setMessages((current) => [
-        ...current,
-        { id: `assistant-error-${Date.now()}`, role: "assistant", text: message },
-      ]);
       setStatus("Needs attention");
     } finally {
+      setLastRunDurationMs(Date.now() - startedAt);
+      setRunStartedAt(null);
       setIsRunning(false);
     }
   }
 
   return (
-    <div className="app-shell">
+    <div className={activityOpen ? "app-shell activity-open" : "app-shell"}>
       <Sidebar
         page={page}
         setPage={setPage}
@@ -264,10 +262,12 @@ export default function App() {
 
       <main className="app-main">
         <AppHeader
+          page={page}
           model={selectedModelView}
-          status={status}
-          peerCount={remotePeerCount}
           onRefresh={() => refreshSnapshot(selectedModel)}
+          activityOpen={activityOpen}
+          hasActiveWork={isRunning || activeTransfers > 0}
+          onToggleActivity={() => setActivityOpen((open) => !open)}
         />
 
         {page === "chat" ? (
@@ -278,17 +278,7 @@ export default function App() {
             runInference={runInference}
             isRunning={isRunning}
             model={selectedModelView}
-            route={activeRoute}
-            hops={hops}
-            snapshot={snapshot}
-            transferActivities={transferActivities}
-            activeTransfers={activeTransfers}
-            peerCount={peerCount}
-            completedHops={completedHops}
             lastError={lastError}
-            showNetwork={showNetwork}
-            setShowNetwork={setShowNetwork}
-            developerMode={developerMode}
             onOpenModels={() => setPage("models")}
           />
         ) : null}
@@ -298,7 +288,6 @@ export default function App() {
             snapshot={snapshot}
             selectedModel={selectedModel}
             onModelChange={handleModelChange}
-            onModelImported={handleModelImported}
           />
         ) : null}
 
@@ -319,6 +308,24 @@ export default function App() {
           />
         ) : null}
       </main>
+
+      {activityOpen ? (
+        <ActivitySidebar
+          snapshot={snapshot}
+          model={selectedModelView}
+          route={activeRoute}
+          hops={hops}
+          transferActivities={transferActivities}
+          status={status}
+          isRunning={isRunning}
+          runStartedAt={runStartedAt}
+          lastRunDurationMs={lastRunDurationMs}
+          lastError={lastError}
+          developerMode={developerMode}
+          identity={identity}
+          onClose={() => setActivityOpen(false)}
+        />
+      ) : null}
     </div>
   );
 }
@@ -385,33 +392,41 @@ function NavButton({
 }
 
 function AppHeader({
+  page,
   model,
-  status,
-  peerCount,
   onRefresh,
+  activityOpen,
+  hasActiveWork,
+  onToggleActivity,
 }: {
+  page: Page;
   model?: ModelView;
-  status: string;
-  peerCount: number;
   onRefresh: () => void;
+  activityOpen: boolean;
+  hasActiveWork: boolean;
+  onToggleActivity: () => void;
 }) {
   return (
     <header className="app-header">
       <div>
-        <h1>Infernet</h1>
+        <h1>{pageTitle(page)}</h1>
         <div className="header-meta">
-          <span>Model: {model?.displayName ?? "Select a model"}</span>
-          <span>Connected to AI Grid</span>
+          <span>{model ? curatedModelName(model) : "No model selected"}</span>
         </div>
       </div>
 
       <div className="header-actions">
-        <span className="connection-pill">
-          <Wifi size={15} />
-          {peerCount === 0 ? "No remote peers" : peerCount === 1 ? "1 remote peer" : `${peerCount} remote peers`}
-        </span>
-        <span className="status-pill">{status}</span>
-        <button className="icon-button" aria-label="Refresh network" onClick={onRefresh}>
+        <button
+          className={activityOpen ? "activity-toggle active" : "activity-toggle"}
+          aria-expanded={activityOpen}
+          aria-controls="activity-sidebar"
+          onClick={onToggleActivity}
+        >
+          <Activity size={16} />
+          <span>Activity</span>
+          {hasActiveWork ? <i aria-label="Active work" /> : null}
+        </button>
+        <button className="icon-button" aria-label="Refresh app status" onClick={onRefresh}>
           <RefreshCw size={16} />
         </button>
       </div>
@@ -426,17 +441,7 @@ function ChatPage({
   runInference,
   isRunning,
   model,
-  route,
-  hops,
-  snapshot,
-  transferActivities,
-  activeTransfers,
-  peerCount,
-  completedHops,
   lastError,
-  showNetwork,
-  setShowNetwork,
-  developerMode,
   onOpenModels,
 }: {
   messages: Message[];
@@ -445,353 +450,300 @@ function ChatPage({
   runInference: () => void;
   isRunning: boolean;
   model?: ModelView;
-  route: RouteHopView[];
-  hops: HopProgress[];
-  snapshot: GridSnapshot;
-  transferActivities: TransferActivity[];
-  activeTransfers: number;
-  peerCount: number;
-  completedHops: number;
   lastError: string | null;
-  showNetwork: boolean;
-  setShowNetwork: (show: boolean) => void;
-  developerMode: boolean;
   onOpenModels: () => void;
 }) {
-  const networkVisible = showNetwork || developerMode;
-  const canSend = Boolean(model);
-  const shouldShowNetworkSummary = Boolean(model) && !(isRunning || hops.length > 0 || lastError);
+  const conversationRef = useRef<HTMLDivElement>(null);
+  const canSend = Boolean(model?.runnable);
+  const isEmpty = messages.length === 0;
+
+  useEffect(() => {
+    const conversation = conversationRef.current;
+    if (conversation) {
+      conversation.scrollTop = conversation.scrollHeight;
+    }
+  }, [messages, isRunning, lastError]);
 
   return (
     <section className="chat-screen">
-      <div className="conversation">
-        {messages.map((message) => (
-          <div key={message.id} className={`message-row ${message.role}`}>
-            <div className="message-bubble">{message.text}</div>
-          </div>
-        ))}
+      <div className={isEmpty ? "conversation empty" : "conversation"} ref={conversationRef}>
+        <div className="conversation-inner">
+          {isEmpty ? (
+            <div className="empty-chat-hero">
+              <span>Infernet</span>
+              <h2>{timeGreeting()}</h2>
+            </div>
+          ) : null}
 
-        {!model ? (
-          <div className="empty-chat-card">
-            <strong>Add a model to start chatting</strong>
-            <span>This machine does not have any Infernet models installed yet.</span>
-            <button className="secondary-button" onClick={onOpenModels}>
-              <FilePlus2 size={16} />
-              <span>Open Models</span>
-            </button>
-          </div>
-        ) : !model.runnable ? (
-          <div className="empty-chat-card warning">
-            <strong>{model.displayName} is available</strong>
-            <span>{model.status}</span>
-            <button className="secondary-button" onClick={onOpenModels}>
-              <Box size={16} />
-              <span>Manage Models</span>
-            </button>
-          </div>
-        ) : null}
+          {messages.map((message) => (
+            <div key={message.id} className={`message-row ${message.role}`}>
+              <div className="message-bubble">{message.text}</div>
+            </div>
+          ))}
 
-        {(isRunning || hops.length > 0 || lastError) ? (
-          <RunStatusCard
-            isRunning={isRunning}
-            peerCount={peerCount}
-            activeTransfers={activeTransfers}
-            completedHops={completedHops}
-            totalHops={route.length}
-            lastError={lastError}
-            showNetwork={networkVisible}
-            setShowNetwork={setShowNetwork}
-          />
-        ) : null}
+          {!model ? (
+            <div className="empty-chat-card">
+              <strong>Get Infernet Chat to start</strong>
+              <span>The official Infernet model is not on this Mac yet.</span>
+              <button className="secondary-button" onClick={onOpenModels}>
+                <Download size={16} />
+                <span>View Infernet Chat</span>
+              </button>
+            </div>
+          ) : !model.runnable ? (
+            <div className="empty-chat-card warning">
+              <strong>{curatedModelName(model)} is not ready yet</strong>
+              <span>{model.status}</span>
+              <button className="secondary-button" onClick={onOpenModels}>
+                <Box size={16} />
+                <span>Manage Model</span>
+              </button>
+            </div>
+          ) : null}
 
-        {shouldShowNetworkSummary ? (
-          <NetworkSummaryCard
-            snapshot={snapshot}
-            route={route}
-            activeTransfers={activeTransfers}
-            showNetwork={networkVisible}
-            setShowNetwork={setShowNetwork}
-          />
-        ) : null}
+          {isRunning ? <ThinkingIndicator /> : null}
 
-        {networkVisible ? (
-          <NetworkActivity
-            route={route}
-            hops={hops}
-            snapshot={snapshot}
-            transferActivities={transferActivities}
-            model={model}
-            developerMode={developerMode}
-          />
-        ) : null}
+          {lastError && messages.length > 0 && !isRunning ? (
+            <div className="chat-error" role="alert">
+              <strong>Infernet couldn’t finish that response.</strong>
+              <span>{friendlyActivityError(lastError)}</span>
+            </div>
+          ) : null}
+        </div>
       </div>
 
-      <div className="composer">
-        <div className="composer-model">
-          <Box size={15} />
-          <span>{model?.displayName ?? "No model selected"}</span>
-          <ChevronDown size={15} />
+      <div className="composer-dock">
+        <div className="composer">
+          <div className="composer-model">
+            <Box size={15} />
+            <span>{model ? curatedModelName(model) : "No model selected"}</span>
+            <ChevronDown size={15} />
+          </div>
+          <textarea
+            value={prompt}
+            onChange={(event) => setPrompt(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && !event.shiftKey) {
+                event.preventDefault();
+                runInference();
+              }
+            }}
+            placeholder={canSend ? "Message Infernet" : model ? "Model is not ready" : "Install Infernet Chat first"}
+            disabled={!canSend}
+            aria-label="Message Infernet"
+          />
+          <button className="send-button" onClick={runInference} disabled={isRunning || !prompt.trim() || !canSend}>
+            {isRunning ? <Activity size={18} /> : <Send size={18} />}
+            <span>Send</span>
+          </button>
         </div>
-        <textarea
-          value={prompt}
-          onChange={(event) => setPrompt(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" && !event.shiftKey) {
-              event.preventDefault();
-              runInference();
-            }
-          }}
-          placeholder={canSend ? "Message Infernet" : "Add a model first"}
-          disabled={!canSend}
-        />
-        <button className="send-button" onClick={runInference} disabled={isRunning || !prompt.trim() || !canSend}>
-          {isRunning ? <Activity size={18} /> : <Send size={18} />}
-          <span>Send</span>
-        </button>
       </div>
     </section>
   );
 }
 
-function RunStatusCard({
-  isRunning,
-  peerCount,
-  activeTransfers,
-  completedHops,
-  totalHops,
-  lastError,
-  showNetwork,
-  setShowNetwork,
-}: {
-  isRunning: boolean;
-  peerCount: number;
-  activeTransfers: number;
-  completedHops: number;
-  totalHops: number;
-  lastError: string | null;
-  showNetwork: boolean;
-  setShowNetwork: (show: boolean) => void;
-}) {
-  const label = lastError
-    ? "Needs attention"
-    : isRunning
-      ? "Thinking..."
-      : "Response ready";
-  const detail = peerCount > 1
-    ? `Connected to ${peerCount} peers`
-    : activeTransfers > 0
-      ? `${activeTransfers} shard transfer${activeTransfers === 1 ? "" : "s"} active`
-    : "Running on Community Compute";
-  const phase = lastError
-    ? lastError
-    : isRunning
-      ? phaseLabel(completedHops, totalHops)
-      : "Done";
-
+function ThinkingIndicator() {
   return (
-    <div className={lastError ? "run-card error" : "run-card"}>
-      <div className="run-card-main">
-        <span className="run-spinner" />
-        <div>
-          <strong>{label}</strong>
-          <span>{detail}</span>
-        </div>
+    <div className="message-row assistant thinking-row" role="status" aria-live="polite">
+      <div className="thinking-indicator">
+        <span className="sr-only">Infernet is thinking</span>
+        <i aria-hidden="true" />
+        <i aria-hidden="true" />
+        <i aria-hidden="true" />
       </div>
-      <div className="run-card-phase">{phase}</div>
-      <button className="text-button" onClick={() => setShowNetwork(!showNetwork)}>
-        {showNetwork ? "Hide network activity" : "Show network activity"}
-      </button>
     </div>
   );
 }
 
-function NetworkSummaryCard({
+function ActivitySidebar({
   snapshot,
-  route,
-  activeTransfers,
-  showNetwork,
-  setShowNetwork,
-}: {
-  snapshot: GridSnapshot;
-  route: RouteHopView[];
-  activeTransfers: number;
-  showNetwork: boolean;
-  setShowNetwork: (show: boolean) => void;
-}) {
-  const routeLabel = route.length > 0
-    ? `${route.length} shard group${route.length === 1 ? "" : "s"} routed`
-    : snapshot.missingRanges
-      ? "Route incomplete"
-      : "Finding route";
-  const transferLabel = activeTransfers > 0
-    ? `${activeTransfers} download${activeTransfers === 1 ? "" : "s"} active`
-    : "No active downloads";
-
-  return (
-    <div className="network-summary-card">
-      <div>
-        <strong>AI Grid activity</strong>
-        <span>{routeLabel} - {transferLabel} - {snapshot.networkPeerCount} remote peer{snapshot.networkPeerCount === 1 ? "" : "s"}</span>
-      </div>
-      <button className="text-button" onClick={() => setShowNetwork(!showNetwork)}>
-        {showNetwork ? "Hide network activity" : "Show network activity"}
-      </button>
-    </div>
-  );
-}
-
-function NetworkActivity({
+  model,
   route,
   hops,
-  snapshot,
   transferActivities,
-  model,
+  status,
+  isRunning,
+  runStartedAt,
+  lastRunDurationMs,
+  lastError,
   developerMode,
+  identity,
+  onClose,
 }: {
+  snapshot: GridSnapshot;
+  model?: ModelView;
   route: RouteHopView[];
   hops: HopProgress[];
-  snapshot: GridSnapshot;
   transferActivities: TransferActivity[];
-  model?: ModelView;
+  status: string;
+  isRunning: boolean;
+  runStartedAt: number | null;
+  lastRunDurationMs: number | null;
+  lastError: string | null;
+  developerMode: boolean;
+  identity: LocalIdentity | null;
+  onClose: () => void;
+}) {
+  const elapsedMs = useElapsedTime(runStartedAt);
+  const peerIds = [...new Set(route.map((hop) => hop.peerId))];
+  const ranLocally = peerIds.length > 0 && peerIds.every((peerId) => peerId === snapshot.localPeerId);
+  const computeMs = hops.reduce((total, hop) => total + (hop.timingMs ?? 0), 0);
+  const activeTransfers = transferActivities.filter((activity) => activity.status === "active");
+  const recentTransfer = transferActivities.find((activity) => activity.status !== "active");
+  const location = peerIds.length === 0
+    ? isRunning ? "Choosing a computer" : "Not used yet"
+    : ranLocally
+      ? "This Mac"
+      : `${peerIds.length} network computer${peerIds.length === 1 ? "" : "s"}`;
+  const currentStatus = lastError ? "Needs attention" : status;
+
+  return (
+    <aside className="activity-sidebar" id="activity-sidebar" aria-label="Activity">
+      <div className="activity-sidebar-header">
+        <div>
+          <span>Activity</span>
+          <h2>What Infernet is doing</h2>
+        </div>
+        <button className="icon-button" aria-label="Close activity" onClick={onClose}>
+          <PanelRightClose size={18} />
+        </button>
+      </div>
+
+      <div className="activity-sidebar-scroll">
+        <section className="activity-primary" aria-live="polite">
+          <div className="activity-status-line">
+            <span className={isRunning ? "activity-pulse active" : "activity-pulse"} />
+            <div>
+              <strong>{currentStatus}</strong>
+              <span>{isRunning ? "Working on your response" : "Ready when you are"}</span>
+            </div>
+          </div>
+
+          <dl className="activity-data-list">
+            <ActivityDataRow label="Model" value={model ? curatedModelName(model) : "None selected"} />
+            <ActivityDataRow label={isRunning ? "Running on" : "Available on"} value={location} />
+            <ActivityDataRow
+              label={isRunning ? "Elapsed" : "Last response"}
+              value={formatDuration(isRunning ? elapsedMs : lastRunDurationMs)}
+            />
+            <ActivityDataRow label="Compute time" value={computeMs > 0 ? formatDuration(computeMs) : "—"} />
+            <ActivityDataRow
+              label="Other computers online"
+              value={String(snapshot.networkPeerCount)}
+            />
+          </dl>
+        </section>
+
+        {lastError ? (
+          <section className="activity-alert" role="alert">
+            <strong>What happened</strong>
+            <span>{friendlyActivityError(lastError)}</span>
+          </section>
+        ) : null}
+
+        {activeTransfers.length > 0 ? (
+          <section className="activity-sidebar-section">
+            <div className="sidebar-section-heading">
+              <strong>Preparing models</strong>
+              <span>{activeTransfers.length} active</span>
+            </div>
+            <div className="transfer-list">
+              {activeTransfers.slice(0, 3).map((activity) => (
+                <TransferActivityRow
+                  activity={activity}
+                  modelName={modelDisplayName(snapshot, activity.modelId)}
+                  developerMode={developerMode}
+                  key={activity.id}
+                />
+              ))}
+            </div>
+          </section>
+        ) : recentTransfer ? (
+          <section className="activity-sidebar-section">
+            <div className="sidebar-section-heading">
+              <strong>Latest model activity</strong>
+              <span>{formatRelativeTime(recentTransfer.updatedAt)}</span>
+            </div>
+            <TransferActivityRow
+              activity={recentTransfer}
+              modelName={modelDisplayName(snapshot, recentTransfer.modelId)}
+              developerMode={developerMode}
+            />
+          </section>
+        ) : (
+          <div className="activity-quiet">
+            <Laptop2 size={18} />
+            <span>Model preparation and response activity will appear here.</span>
+          </div>
+        )}
+
+        {developerMode ? (
+          <details className="technical-details">
+            <summary>Technical details</summary>
+            <div className="technical-detail-list">
+              <code>Local peer: {identity?.peerId ?? snapshot.localPeerId ?? "starting"}</code>
+              {route.length === 0 ? <span>No execution route selected.</span> : route.map((hop) => {
+                const progress = hops.find((item) => item.key === hopKey(hop.peerId, hop.layerStart, hop.layerEnd));
+                return (
+                  <code key={`${hop.peerId}-${hop.layerStart}-${hop.layerEnd}`}>
+                    {hop.shortPeerId} · layers {hop.layerStart}:{hop.layerEnd}
+                    {progress?.activationSizeBytes ? ` · ${formatBytes(progress.activationSizeBytes)}` : ""}
+                    {progress?.timingMs ? ` · ${progress.timingMs} ms` : ""}
+                  </code>
+                );
+              })}
+            </div>
+          </details>
+        ) : null}
+      </div>
+    </aside>
+  );
+}
+
+function ActivityDataRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="activity-data-row">
+      <dt>{label}</dt>
+      <dd>{value}</dd>
+    </div>
+  );
+}
+
+function TransferActivityRow({
+  activity,
+  modelName,
+  developerMode,
+}: {
+  activity: TransferActivity;
+  modelName: string;
   developerMode: boolean;
 }) {
-  const coveredLayers = snapshot.coverage.filter((segment) => segment.covered).length;
-  const totalLayers = snapshot.layerCount || model?.layerCount || 0;
-  const coveragePercent = totalLayers > 0 ? Math.round((coveredLayers / totalLayers) * 100) : 0;
-  const activeTransfers = transferActivities.filter((activity) => activity.status === "active");
-  const recentTransfers = transferActivities.slice(0, 6);
-
-  return (
-    <div className="network-activity">
-      <div className="activity-header">
-        <div>
-          <span>Network Activity</span>
-          <strong>{model?.displayName ?? "Selected model"}</strong>
-        </div>
-        <SlidersHorizontal size={17} />
-      </div>
-
-      <div className="activity-grid">
-        <ActivityStat label="Remote peers" value={String(snapshot.networkPeerCount)} />
-        <ActivityStat label="Route coverage" value={totalLayers > 0 ? `${coveragePercent}%` : "Unknown"} />
-        <ActivityStat label="Route groups" value={String(route.length)} />
-        <ActivityStat label="Active transfers" value={String(activeTransfers.length)} />
-      </div>
-
-      {snapshot.missingRanges ? (
-        <div className="activity-warning">
-          <strong>Route missing</strong>
-          <span>{snapshot.missingRanges}</span>
-        </div>
-      ) : null}
-
-      <div className="activity-section">
-        <div className="activity-section-title">
-          <strong>Shard Transfers</strong>
-          <span>{activeTransfers.length > 0 ? "Downloading and verifying model bytes" : "No active transfer right now"}</span>
-        </div>
-        {recentTransfers.length === 0 ? (
-          <div className="empty-state compact">No shard download events have arrived yet.</div>
-        ) : (
-          <div className="transfer-list">
-            {recentTransfers.map((activity) => (
-              <TransferActivityRow activity={activity} key={activity.id} />
-            ))}
-          </div>
-        )}
-      </div>
-
-      <div className="activity-section">
-        <div className="activity-section-title">
-          <strong>Inference Route</strong>
-          <span>{route.length > 0 ? "Layer groups selected for execution" : "Waiting for complete executable shard coverage"}</span>
-        </div>
-        <div className="activity-timeline">
-          {route.length === 0 ? (
-            <div className="empty-state compact">No route is available for this model yet.</div>
-          ) : (
-            route.map((hop, index) => {
-              const progress = hops.find((item) => item.key === hopKey(hop.peerId, hop.layerStart, hop.layerEnd));
-              return (
-                <div className="activity-hop" key={`${hop.peerId}-${hop.layerStart}`}>
-                  <span>{index + 1}</span>
-                  <div>
-                    <strong>{progress?.status === "complete" ? "Completed" : progress?.status === "running" ? "Running" : "Ready"}</strong>
-                    <small>
-                      Layers {hop.layerStart}:{hop.layerEnd} - peer {hop.shortPeerId}
-                      {progress?.activationSizeBytes ? ` - ${formatBytes(progress.activationSizeBytes)} activation` : ""}
-                      {progress?.timingMs ? ` - ${progress.timingMs} ms` : ""}
-                    </small>
-                    {developerMode ? <code>{hop.address || hop.peerId}</code> : null}
-                  </div>
-                </div>
-              );
-            })
-          )}
-        </div>
-      </div>
-
-      <div className="activity-section">
-        <div className="activity-section-title">
-          <strong>Discovered Executable Peers</strong>
-          <span>{snapshot.peers.length > 0 ? "Peers advertising verified Infernet shards" : "No executable shard peers visible yet"}</span>
-        </div>
-        {snapshot.peers.length === 0 ? (
-          <div className="empty-state compact">Connected peers have not advertised executable shards for this model.</div>
-        ) : (
-          <div className="peer-inventory">
-            {snapshot.peers.map((peer) => (
-              <div className="peer-inventory-row" key={peer.peerId}>
-                <div>
-                  <strong>{peer.shortPeerId}</strong>
-                  <span>{peer.shards.length} shard group{peer.shards.length === 1 ? "" : "s"} - protocol v{peer.protocolVersion}</span>
-                </div>
-                <div className="shard-chip-row">
-                  {peer.shards.map((shard) => (
-                    <span className="shard-chip" key={`${peer.peerId}-${shard.modelId}-${shard.layerStart}-${shard.layerEnd}`}>
-                      {shard.layerStart}:{shard.layerEnd}
-                    </span>
-                  ))}
-                </div>
-                {developerMode ? <code>{peer.addresses[0] ?? peer.peerId}</code> : null}
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function ActivityStat({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="activity-stat">
-      <span>{label}</span>
-      <strong>{value}</strong>
-    </div>
-  );
-}
-
-function TransferActivityRow({ activity }: { activity: TransferActivity }) {
   const percent = activity.totalBytes
     ? Math.min(100, Math.round((activity.downloadedBytes / activity.totalBytes) * 100))
     : null;
+  const stage = humanTransferStage(activity.stage);
+
   return (
     <div className={`transfer-row ${activity.status}`}>
-      <div>
-        <strong>{activity.stage}</strong>
-        <span>{activity.detail}</span>
+      <div className="transfer-row-heading">
+        <div>
+          <strong>{modelName}</strong>
+          <span>{stage}</span>
+        </div>
+        <small>{formatRelativeTime(activity.updatedAt)}</small>
       </div>
-      <div className="transfer-progress">
-        <ProgressBar progress={percent ?? (activity.status === "active" ? 22 : 100)} />
-        <small>
-          {percent !== null
-            ? `${percent}% - ${formatBytes(activity.downloadedBytes)} / ${formatBytes(activity.totalBytes ?? 0)}`
-            : activity.status === "error"
-              ? "Failed"
-              : "Waiting for size"}
-        </small>
-      </div>
+      <p>{transferStageDescription(activity.stage, activity.status)}</p>
+      {activity.status === "active" || percent !== null ? (
+        <div className="transfer-progress">
+          <ProgressBar progress={percent ?? 0} indeterminate={percent === null && activity.status === "active"} />
+          <small>
+            {percent !== null
+              ? `${percent}% · ${formatBytes(activity.downloadedBytes)} of ${formatBytes(activity.totalBytes ?? 0)}`
+              : activity.status === "active" ? "Working" : stage}
+          </small>
+        </div>
+      ) : null}
+      {developerMode ? <code>{activity.detail}</code> : null}
     </div>
   );
 }
@@ -800,335 +752,72 @@ function ModelsPage({
   snapshot,
   selectedModel,
   onModelChange,
-  onModelImported,
 }: {
   snapshot: GridSnapshot;
   selectedModel: string;
   onModelChange: (modelId: string) => void;
-  onModelImported: (modelId: string) => Promise<void>;
 }) {
-  const [showImporter, setShowImporter] = useState(false);
-  const [source, setSource] = useState<"local" | "huggingface">("local");
-  const [showTokenInput, setShowTokenInput] = useState(false);
-  const [localPath, setLocalPath] = useState("");
-  const [hfRepo, setHfRepo] = useState("bartowski/Llama-3.2-1B-Instruct-GGUF");
-  const [hfToken, setHfToken] = useState("");
-  const [hfFiles, setHfFiles] = useState<HuggingFaceFileView[]>([]);
-  const [selectedHfFile, setSelectedHfFile] = useState("");
-  const [isInspecting, setIsInspecting] = useState(false);
-  const [isAdding, setIsAdding] = useState(false);
-  const [importProgress, setImportProgress] = useState<ModelImportProgress | null>(null);
-  const [result, setResult] = useState<AddModelResponse | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    listenForModelImportProgress((event) => {
-      setImportProgress(event);
-    }).then((dispose) => {
-      unlisten = dispose;
-    });
-
-    return () => {
-      unlisten?.();
-    };
-  }, []);
-
-  function openImporter() {
-    setResult(null);
-    setError(null);
-    setImportProgress(null);
-    setShowImporter(true);
-  }
-
-  async function inspectRepo() {
-    setIsInspecting(true);
-    setError(null);
-    try {
-      const files = await inspectHuggingFaceRepo(hfRepo, hfToken);
-      setHfFiles(files);
-      setSelectedHfFile(files[0]?.filename ?? "");
-      if (files.length === 0) {
-        setError("No GGUF files were found in that repository.");
-      }
-    } catch (inspectError) {
-      setError(String(inspectError));
-    } finally {
-      setIsInspecting(false);
-    }
-  }
-
-  async function chooseFile(): Promise<string | null> {
-    setError(null);
-    try {
-      const selected = await chooseLocalModelFile();
-      if (selected) {
-        setLocalPath(selected);
-      }
-      return selected;
-    } catch (chooseError) {
-      setError(String(chooseError));
-      return null;
-    }
-  }
-
-  async function addModel(pathOverride?: string) {
-    setIsAdding(true);
-    setError(null);
-    setResult(null);
-    setImportProgress({
-      modelId: "importing",
-      stage: source === "huggingface" ? "Starting download" : "Starting import",
-      detail: source === "huggingface" ? hfRepo : pathOverride ?? localPath,
-      downloadedBytes: 0,
-      totalBytes: null,
-    });
-    try {
-      const response = source === "local"
-        ? await addLocalGgufModel(pathOverride ?? localPath)
-        : await addHuggingFaceModel(hfRepo, selectedHfFile, hfToken);
-      setResult(response);
-      setLocalPath("");
-      setImportProgress({
-        modelId: response.modelId,
-        stage: "Ready",
-        detail: "Infernet is sharing this model",
-        downloadedBytes: response.sourceSizeBytes,
-        totalBytes: response.sourceSizeBytes,
-      });
-      await onModelImported(response.modelId);
-    } catch (addError) {
-      setError(String(addError));
-    } finally {
-      setIsAdding(false);
-    }
-  }
-
-  async function runPrimaryImportAction() {
-    if (source === "local" && !localPath.trim()) {
-      const selected = await chooseFile();
-      if (selected) {
-        await addModel(selected);
-      }
-      return;
-    }
-
-    if (source === "huggingface" && !selectedHfFile) {
-      await inspectRepo();
-      return;
-    }
-
-    await addModel();
-  }
-
-  const canRunPrimary = source === "local"
-    ? !isAdding
-    : hfRepo.trim().length > 0 && !isAdding && !isInspecting;
-  const primaryLabel = source === "local" && !localPath.trim()
-    ? "Choose File"
-    : source === "huggingface" && !selectedHfFile
-      ? isInspecting ? "Finding" : "Find Models"
-      : isAdding ? "Adding" : "Add Model";
-  const selectedFileParts = localPath.split(/[\\/]/).filter(Boolean);
-  const selectedFileName = localPath
-    ? selectedFileParts[selectedFileParts.length - 1] ?? localPath
-    : null;
+  const officialModels = snapshot.availableModels.filter(isOfficialInfernetModel);
 
   return (
     <section className="library-screen">
       <div className="models-topbar">
         <div className="section-heading">
-          <h2>Models</h2>
-          <p>Choose what you want to use. Infernet handles the network.</p>
+          <span className="section-eyebrow">Official catalog</span>
+          <h2>Infernet models</h2>
+          <p>A small collection built, tested, and distributed specifically for Infernet.</p>
         </div>
-        <button className="secondary-button add-model-button" onClick={() => openImporter()}>
-          <FilePlus2 size={16} />
-          <span>Add Model</span>
-        </button>
+      </div>
+
+      <div className="official-model-note">
+        <CheckCircle2 size={18} />
+        <div>
+          <strong>Curated from end to end</strong>
+          <span>Infernet chooses the model, package layout, and runtime so every release works across the network.</span>
+        </div>
       </div>
 
       <div className="model-library">
-        {snapshot.availableModels.length === 0 ? (
-          <div className="empty-state library-empty">
-            No models are installed on this computer yet. Add a GGUF model to seed it into the network.
+        {officialModels.length === 0 ? (
+          <div className="library-card flagship-card" aria-label="Infernet Chat flagship model">
+            <div>
+              <span className="model-edition">Flagship · Infernet edition</span>
+              <strong>Infernet Chat</strong>
+              <span>Powered by Gemma 4 26B A4B</span>
+            </div>
+            <div className="library-status">
+              <span>Official package</span>
+              <ProgressBar progress={0} />
+              <small>Preparing the first network release</small>
+            </div>
           </div>
         ) : (
-          snapshot.availableModels.map((model) => {
+          officialModels.map((model) => {
             const installed = model.installed || snapshot.distribution.installedModels.includes(model.modelId);
-            const downloading = !installed && isAdding;
-            const status = downloading ? "Adding" : model.status;
             return (
-            <button
-              className={selectedModel === model.modelId ? "library-card active" : "library-card"}
-              key={model.modelId}
-              onClick={() => onModelChange(model.modelId)}
-            >
-              <div>
-                <strong>{model.displayName}</strong>
-                <span>{(model.quantization ?? model.activationDtype).toUpperCase()} - {runtimeLabel(model.runtimeKind)}</span>
-              </div>
-              <div className="library-status">
-                <span>{installed ? "Installed" : downloading ? "Preparing" : "Available"}</span>
-                <ProgressBar progress={installed ? 100 : downloading ? 56 : 0} />
-                <small>{status}</small>
-              </div>
-            </button>
+              <button
+                className={selectedModel === model.modelId ? "library-card active" : "library-card"}
+                key={model.modelId}
+                onClick={() => onModelChange(model.modelId)}
+              >
+                <div>
+                  <span className="model-edition">Infernet edition</span>
+                  <strong>{curatedModelName(model)}</strong>
+                  <span>{curatedModelBasis(model)}</span>
+                </div>
+                <div className="library-status">
+                  <span>{installed ? "On this Mac" : "Available"}</span>
+                  <ProgressBar progress={installed ? 100 : 0} />
+                  <small>{model.runnable ? "Ready to chat" : "Preparing for this network"}</small>
+                </div>
+              </button>
             );
           })
         )}
       </div>
-
-      {showImporter ? (
-        <div className="modal-backdrop" role="presentation">
-          <div className="import-sheet" role="dialog" aria-modal="true" aria-labelledby="add-model-title">
-            <div className="import-sheet-header">
-              <div>
-                <h3 id="add-model-title">Add a model</h3>
-                <p>Bring in a model file. Infernet prepares it and starts sharing it.</p>
-              </div>
-              <button className="text-button" onClick={() => setShowImporter(false)}>Close</button>
-            </div>
-
-            <div className="source-choice" aria-label="Choose model source">
-              <button className={source === "huggingface" ? "source-card active" : "source-card"} onClick={() => setSource("huggingface")}>
-                <Cloud size={20} />
-                <strong>Hugging Face</strong>
-                <span>Download from a model repo.</span>
-              </button>
-              <button className={source === "local" ? "source-card active" : "source-card"} onClick={() => setSource("local")}>
-                <UploadCloud size={20} />
-                <strong>Local file</strong>
-                <span>Use a model already on this computer.</span>
-              </button>
-            </div>
-
-            {source === "huggingface" ? (
-              <div className="import-flow">
-                <div className="hf-search-row">
-                  <label className="field">
-                  <span>Repository</span>
-                    <input
-                      value={hfRepo}
-                      onChange={(event) => setHfRepo(event.target.value)}
-                      placeholder="bartowski/Llama-3.2-1B-Instruct-GGUF"
-                    />
-                  </label>
-                  <button className="secondary-button" onClick={inspectRepo} disabled={isInspecting || !hfRepo.trim()}>
-                    <Search size={16} />
-                    <span>{isInspecting ? "Searching" : "Find models"}</span>
-                  </button>
-                </div>
-
-                <button className="text-button" onClick={() => setShowTokenInput(!showTokenInput)}>
-                  {showTokenInput ? "Hide access token" : "Use access token"}
-                </button>
-
-                {showTokenInput ? (
-                  <label className="field compact-field">
-                    <span>Access token</span>
-                    <input
-                      value={hfToken}
-                      onChange={(event) => setHfToken(event.target.value)}
-                      placeholder="Only needed for gated or private models"
-                      type="password"
-                    />
-                  </label>
-                ) : null}
-
-                {hfFiles.length > 0 ? (
-                  <div className="file-list" aria-label="GGUF files">
-                    {hfFiles.map((file) => (
-                      <button
-                        className={selectedHfFile === file.filename ? "file-option active" : "file-option"}
-                        onClick={() => setSelectedHfFile(file.filename)}
-                        key={file.filename}
-                      >
-                        <strong>{file.filename}</strong>
-                        <span>{file.sizeBytes ? formatBytes(file.sizeBytes) : "GGUF file"}</span>
-                      </button>
-                    ))}
-                  </div>
-                ) : (
-                  <div className="import-hint">Paste a Hugging Face repo, then find available model files.</div>
-                )}
-              </div>
-            ) : (
-              <div className="import-flow">
-                <div className={selectedFileName ? "local-file-picker selected" : "local-file-picker"}>
-                  <div>
-                    <strong>{selectedFileName ?? "Choose a model file"}</strong>
-                    <span>{selectedFileName ? localPath : "Select a .gguf file from this computer."}</span>
-                  </div>
-                  <button className="secondary-button" onClick={chooseFile}>
-                    <UploadCloud size={16} />
-                    <span>{selectedFileName ? "Change" : "Choose File"}</span>
-                  </button>
-                </div>
-              </div>
-            )}
-
-            {(isAdding || importProgress) && !result ? (
-              <ImportProgressCard progress={importProgress} />
-            ) : null}
-
-            {result ? (
-              <div className="import-result">
-                <CheckCircle2 size={18} />
-                <div>
-                  <strong>{result.displayName} added</strong>
-                  <span>Infernet built executable .infershard packages and is sharing them with the network.</span>
-                </div>
-              </div>
-            ) : null}
-
-            {error ? (
-              <div className="import-result error">
-                <Activity size={18} />
-                <div>
-                  <strong>Could not add model</strong>
-                  <span>{friendlyImportError(error)}</span>
-                </div>
-              </div>
-            ) : null}
-
-            <div className="import-actions">
-              <button className="send-button" onClick={runPrimaryImportAction} disabled={!canRunPrimary}>
-                {source === "huggingface" ? <Cloud size={17} /> : <UploadCloud size={17} />}
-                <span>{primaryLabel}</span>
-              </button>
-              <span>Infernet prepares the model and shares it automatically.</span>
-            </div>
-          </div>
-        </div>
-      ) : null}
     </section>
   );
 }
-
-function ImportProgressCard({ progress }: { progress: ModelImportProgress | null }) {
-  const percent = progress?.totalBytes
-    ? Math.min(100, Math.round((progress.downloadedBytes / progress.totalBytes) * 100))
-    : null;
-
-  return (
-    <div className="import-progress-card">
-      <div className="run-spinner" />
-      <div>
-        <strong>{progress?.stage ?? "Working"}</strong>
-        <span>{progress?.detail ?? "Preparing the model"}</span>
-      </div>
-      <div className="import-progress-meter">
-        <ProgressBar progress={percent ?? 18} />
-        <small>
-          {percent !== null
-            ? `${percent}% - ${formatBytes(progress?.downloadedBytes ?? 0)} of ${formatBytes(progress?.totalBytes ?? 0)}`
-            : "This can take a while for large models."}
-        </small>
-      </div>
-    </div>
-  );
-}
-
 function DownloadsPage({
   snapshot,
   transferActivities,
@@ -1140,96 +829,116 @@ function DownloadsPage({
 }) {
   const distribution = snapshot.distribution;
   const activeTransfers = transferActivities.filter((activity) => activity.status === "active");
-  const recentTransfers = transferActivities.slice(0, 10);
+  const recentTransfers = transferActivities.filter((activity) => activity.status !== "active").slice(0, 8);
+  const localModels = groupLocalModels(snapshot);
+  const storagePercent = distribution.maxStorageBytes > 0
+    ? Math.min(100, Math.round((distribution.storageUsedBytes / distribution.maxStorageBytes) * 100))
+    : 0;
 
   return (
     <section className="downloads-screen">
       <div className="section-heading">
-        <h2>Downloads</h2>
-        <p>Shard transfer, storage, and contribution activity for this node.</p>
+        <h2>Storage &amp; sharing</h2>
+        <p>Models stored and shared by this Mac.</p>
       </div>
 
-      <div className="download-metrics">
-        <DownloadMetric icon={<HardDrive size={20} />} label="Storage used" value={formatBytes(distribution.storageUsedBytes)} />
-        <DownloadMetric icon={<Download size={20} />} label="Active downloads" value={String(activeTransfers.length)} />
-        <DownloadMetric icon={<UploadCloud size={20} />} label="Hosted shards" value={String(distribution.installedShards.length)} />
-        <DownloadMetric icon={<CheckCircle2 size={20} />} label="Network models" value={String(snapshot.availableModels.length)} />
-      </div>
-
-      <div className="download-panel">
-        <div className="activity-section-title">
-          <strong>Live Transfers</strong>
-          <span>{activeTransfers.length > 0 ? "Downloading model shards from peers" : "No active shard downloads"}</span>
-        </div>
-        {recentTransfers.length === 0 ? (
-          <div className="empty-state compact">No transfer events have been seen in this session.</div>
-        ) : (
+      {activeTransfers.length > 0 ? (
+        <div className="download-panel active-work-panel">
+          <div className="download-panel-heading">
+            <div>
+              <strong>In progress</strong>
+              <span>Current model preparation</span>
+            </div>
+            <span className="work-count">{activeTransfers.length}</span>
+          </div>
           <div className="transfer-list">
-            {recentTransfers.map((activity) => (
-              <TransferActivityRow activity={activity} key={activity.id} />
+            {activeTransfers.map((activity) => (
+              <TransferActivityRow
+                activity={activity}
+                modelName={modelDisplayName(snapshot, activity.modelId)}
+                developerMode={developerMode}
+                key={activity.id}
+              />
             ))}
           </div>
-        )}
+        </div>
+      ) : null}
+
+      <div className="storage-overview">
+        <div className="storage-overview-heading">
+          <div className="storage-icon"><HardDrive size={20} /></div>
+          <div>
+            <strong>Model storage</strong>
+            <span>{localModels.length} model{localModels.length === 1 ? "" : "s"} on this Mac</span>
+          </div>
+          <b>{formatBytes(distribution.storageUsedBytes)}</b>
+        </div>
+        <ProgressBar progress={storagePercent} />
+        <small>
+          {distribution.maxStorageBytes > 0
+            ? `${formatBytes(distribution.storageUsedBytes)} used of ${formatBytes(distribution.maxStorageBytes)}`
+            : `${formatBytes(distribution.storageUsedBytes)} used`}
+        </small>
       </div>
 
-      <div className="download-panel">
-        <div className="activity-section-title">
-          <strong>Installed Shards</strong>
-          <span>{distribution.installedShards.length} verified Infernet shard{distribution.installedShards.length === 1 ? "" : "s"} stored locally</span>
+      <div className="download-panel local-models-panel">
+        <div className="download-panel-heading">
+          <div>
+            <strong>Models on this Mac</strong>
+            <span>Ready for local use and sharing</span>
+          </div>
         </div>
-        <div className="download-list">
-          {distribution.installedShards.length === 0 ? (
-            <div className="empty-state compact">No local model shards installed.</div>
+        <div className="local-model-list">
+          {localModels.length === 0 ? (
+            <div className="empty-state compact">Official models downloaded to this Mac will appear here.</div>
           ) : (
-            distribution.installedShards.map((shard) => (
-              <div className="download-row" key={`${shard.modelId}-${shard.layerStart}-${shard.layerEnd}-${shard.checksum}`}>
-                <div>
-                  <strong>{shard.modelId}</strong>
-                  <span>Layers {shard.layerStart}:{shard.layerEnd} - {formatBytes(shard.sizeBytes)} - {shard.version}</span>
+            localModels.map((item) => (
+              <div className="local-model-row" key={item.modelId}>
+                <div className="local-model-icon"><Box size={18} /></div>
+                <div className="local-model-copy">
+                  <strong>{item.displayName}</strong>
+                  <span>{item.quantization ? item.quantization.toUpperCase() : "Infernet model"} · Stored locally</span>
+                  {developerMode ? (
+                    <details className="model-technical-details">
+                      <summary>Technical details</summary>
+                      <code>
+                        {item.packageCount} package{item.packageCount === 1 ? "" : "s"} · layers {item.layerStart}:{item.layerEnd} · {item.version}
+                      </code>
+                      {item.checksums.map((checksum) => <code key={checksum}>{checksum}</code>)}
+                    </details>
+                  ) : null}
                 </div>
-                <span>Hosted</span>
-                <small>{developerMode ? shard.checksum : shortHash(shard.checksum)}</small>
+                <div className="local-model-meta">
+                  <strong>{formatBytes(item.sizeBytes)}</strong>
+                  <span>{item.replicas <= 1 ? "Only on this Mac" : `Available from ${item.replicas} computers`}</span>
+                </div>
               </div>
             ))
           )}
         </div>
       </div>
 
-      <div className="download-panel">
-        <div className="activity-section-title">
-          <strong>Replication Health</strong>
-          <span>How many peers are advertising each shard group</span>
-        </div>
-        {distribution.replicationHealth.length === 0 ? (
-          <div className="empty-state compact">No replicated shard groups are visible yet.</div>
-        ) : (
-          <div className="replication-list">
-            {distribution.replicationHealth.map((item) => (
-              <div className="replication-row" key={`${item.modelId}-${item.layerStart}-${item.layerEnd}`}>
-                <div>
-                  <strong>{item.modelId}</strong>
-                  <span>Layers {item.layerStart}:{item.layerEnd}</span>
-                </div>
-                <div className="replication-meter">
-                  <ProgressBar progress={Math.min(100, Math.round((item.replicas / item.targetReplicas) * 100))} />
-                  <small>{item.replicas} / {item.targetReplicas} replicas</small>
-                </div>
-              </div>
+      {recentTransfers.length > 0 ? (
+        <div className="download-panel recent-activity-panel">
+          <div className="download-panel-heading">
+            <div>
+              <strong>Recent activity</strong>
+              <span>Completed during this app session</span>
+            </div>
+          </div>
+          <div className="transfer-list">
+            {recentTransfers.map((activity) => (
+              <TransferActivityRow
+                activity={activity}
+                modelName={modelDisplayName(snapshot, activity.modelId)}
+                developerMode={developerMode}
+                key={activity.id}
+              />
             ))}
           </div>
-        )}
-      </div>
+        </div>
+      ) : null}
     </section>
-  );
-}
-
-function DownloadMetric({ icon, label, value }: { icon: React.ReactNode; label: string; value: string }) {
-  return (
-    <div className="download-metric">
-      {icon}
-      <span>{label}</span>
-      <strong>{value}</strong>
-    </div>
   );
 }
 
@@ -1244,42 +953,15 @@ function SettingsPage({
   setDeveloperMode: (enabled: boolean) => void;
   onNetworkChanged: () => void;
 }) {
-  const [hfSettings, setHfSettings] = useState<HuggingFaceSettings>({ hasToken: false });
-  const [token, setToken] = useState("");
-  const [tokenStatus, setTokenStatus] = useState<string | null>(null);
   const [manualPeer, setManualPeer] = useState("");
   const [manualPeers, setManualPeers] = useState<string[]>([]);
   const [manualPeerStatus, setManualPeerStatus] = useState<string | null>(null);
 
   useEffect(() => {
-    getHuggingFaceSettings()
-      .then(setHfSettings)
-      .catch((error) => setTokenStatus(String(error)));
     getManualPeers()
       .then(setManualPeers)
       .catch((error) => setManualPeerStatus(String(error)));
   }, []);
-
-  async function saveToken() {
-    try {
-      const next = await saveHuggingFaceToken(token);
-      setHfSettings(next);
-      setToken("");
-      setTokenStatus("Saved for this app session.");
-    } catch (error) {
-      setTokenStatus(String(error));
-    }
-  }
-
-  async function clearToken() {
-    try {
-      const next = await clearHuggingFaceToken();
-      setHfSettings(next);
-      setTokenStatus("Token cleared.");
-    } catch (error) {
-      setTokenStatus(String(error));
-    }
-  }
 
   async function connectPeer() {
     try {
@@ -1358,40 +1040,20 @@ function SettingsPage({
             </button>
           </div>
         </div>
-        <div className="settings-row huggingface-settings">
-          <div>
-            <strong>Hugging Face</strong>
-            <span>
-              {hfSettings.hasToken
-                ? `Token active: ${hfSettings.tokenPreview ?? "saved"}`
-                : "Optional for gated or private model downloads."}
-            </span>
-          </div>
-          <div className="token-controls">
-            <KeyRound size={17} />
-            <input
-              value={token}
-              type="password"
-              onChange={(event) => setToken(event.target.value)}
-              placeholder="hf_..."
-            />
-            <button className="secondary-button" onClick={saveToken} disabled={!token.trim()}>
-              Save
-            </button>
-            <button className="text-button" onClick={clearToken} disabled={!hfSettings.hasToken}>
-              Clear
-            </button>
-          </div>
-        </div>
-        {tokenStatus ? <div className="settings-note">{tokenStatus}</div> : null}
       </div>
     </section>
   );
 }
 
-function ProgressBar({ progress }: { progress: number }) {
+function ProgressBar({ progress, indeterminate = false }: { progress: number; indeterminate?: boolean }) {
   return (
-    <div className="progress-bar">
+    <div
+      className={indeterminate ? "progress-bar indeterminate" : "progress-bar"}
+      role="progressbar"
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-valuenow={indeterminate ? undefined : Math.max(0, Math.min(100, progress))}
+    >
       <span style={{ width: `${progress}%` }} />
     </div>
   );
@@ -1420,20 +1082,51 @@ function upsertHop(
     : [...current, nextHop];
 }
 
-function uniquePeerCount(route: RouteHopView[]): number {
-  return new Set(route.map((hop) => hop.peerId)).size;
-}
-
 function upsertTransferActivity(
   current: TransferActivity[],
   event: ModelImportProgress,
 ): TransferActivity[] {
+  const status = transferStatus(event.stage);
+  const updatedAt = Date.now();
+  if (status === "error") {
+    const modelActivityId = `${event.modelId}:model`;
+    const isPeerDownloadFailure = event.stage.toLowerCase() === "download failed";
+    let settledActiveActivity = false;
+    const settled = current.map((item) => {
+      const matchesFailedOperation = isPeerDownloadFailure
+        ? item.id !== modelActivityId
+        : item.id === modelActivityId;
+      if (item.modelId !== event.modelId || item.status !== "active" || !matchesFailedOperation) {
+        return item;
+      }
+      settledActiveActivity = true;
+      return {
+        ...item,
+        stage: event.stage,
+        detail: event.detail,
+        downloadedBytes: event.downloadedBytes,
+        totalBytes: event.totalBytes ?? item.totalBytes,
+        status,
+        updatedAt,
+      };
+    });
+    if (settledActiveActivity) {
+      return settled
+        .sort((left, right) => right.updatedAt - left.updatedAt)
+        .slice(0, 24);
+    }
+  }
+
   const activity: TransferActivity = {
     ...event,
     id: transferActivityId(event),
-    status: transferStatus(event.stage),
-    updatedAt: Date.now(),
+    status,
+    updatedAt,
   };
+  const existing = current.find((item) => item.id === activity.id);
+  if (activity.status === "active" && existing && existing.status !== "active" && activity.id.endsWith(":model")) {
+    return current;
+  }
   const next = current.some((item) => item.id === activity.id)
     ? current.map((item) => (item.id === activity.id ? activity : item))
     : [activity, ...current];
@@ -1445,7 +1138,8 @@ function upsertTransferActivity(
 
 function transferActivityId(event: ModelImportProgress): string {
   const layerMatch = event.detail.match(/layers\s+\d+:\d+/i);
-  const scope = layerMatch?.[0] ?? event.stage;
+  const isPeerShardTransfer = ["downloading shard", "shard ready"].includes(event.stage.toLowerCase());
+  const scope = isPeerShardTransfer && layerMatch ? layerMatch[0].toLowerCase() : "model";
   return `${event.modelId}:${scope}`;
 }
 
@@ -1460,46 +1154,172 @@ function transferStatus(stage: string): TransferStatus {
   return "active";
 }
 
-function phaseLabel(completedHops: number, totalHops: number): string {
-  if (totalHops === 0) {
-    return "Finding compute";
-  }
-  if (completedHops === 0) {
-    return "Peer discovered";
-  }
-  if (completedHops < totalHops) {
-    return "Forwarding";
-  }
-  return "Receiving response";
-}
-
 function hopKey(peerId: string, layerStart: number, layerEnd: number): string {
   return `${peerId}:${layerStart}:${layerEnd}`;
 }
 
-function runtimeLabel(runtimeKind: string): string {
-  return runtimeKind === "llama_cpp" ? "GGUF" : "Ready";
+function pageTitle(page: Page): string {
+  if (page === "chat") return "Chat";
+  if (page === "models") return "Models";
+  if (page === "downloads") return "Downloads";
+  return "Settings";
 }
 
-function friendlyImportError(error: string): string {
-  if (error.includes("must be a .gguf file")) {
-    return "Choose a GGUF model file.";
-  }
-  if (error.includes("Hugging Face returned 401") || error.includes("Hugging Face returned 403")) {
-    return "That model needs access. Add a Hugging Face token and try again.";
-  }
-  if (error.includes("No GGUF files")) {
-    return "No GGUF files were found in that repository.";
-  }
-
-  return error;
+function timeGreeting(date = new Date()): string {
+  const hour = date.getHours();
+  if (hour < 12) return "Good morning";
+  if (hour < 18) return "Good afternoon";
+  return "Good evening";
 }
 
-function shortHash(value: string): string {
-  if (value.length <= 14) {
-    return value;
+function useElapsedTime(startedAt: number | null): number {
+  const [elapsedMs, setElapsedMs] = useState(0);
+
+  useEffect(() => {
+    if (startedAt === null) {
+      setElapsedMs(0);
+      return;
+    }
+
+    const updateElapsed = () => setElapsedMs(Date.now() - startedAt);
+    updateElapsed();
+    const interval = window.setInterval(updateElapsed, 1000);
+    return () => window.clearInterval(interval);
+  }, [startedAt]);
+
+  return elapsedMs;
+}
+
+function formatDuration(durationMs: number | null): string {
+  if (durationMs === null || durationMs <= 0) return "—";
+  if (durationMs < 1000) return `${Math.round(durationMs)} ms`;
+  const seconds = durationMs / 1000;
+  if (seconds < 60) return `${seconds < 10 ? seconds.toFixed(1) : Math.round(seconds)} sec`;
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = Math.round(seconds % 60);
+  return `${minutes} min ${remainingSeconds} sec`;
+}
+
+function formatRelativeTime(timestamp: number): string {
+  const seconds = Math.max(0, Math.round((Date.now() - timestamp) / 1000));
+  if (seconds < 5) return "Just now";
+  if (seconds < 60) return `${seconds} sec ago`;
+  const minutes = Math.round(seconds / 60);
+  return minutes === 1 ? "1 min ago" : `${minutes} min ago`;
+}
+
+function friendlyActivityError(error: string): string {
+  const normalized = error.toLowerCase();
+  if (normalized.includes("timed out") || normalized.includes("timeout")) {
+    return "The model took too long to respond. Try again in a moment.";
   }
-  return `${value.slice(0, 8)}...${value.slice(-6)}`;
+  if (normalized.includes("missing") || normalized.includes("no route")) {
+    return "The full model is not available on the network yet.";
+  }
+  if (normalized.includes("offline") || normalized.includes("connect")) {
+    return "Infernet could not reach the computer running this part of the model.";
+  }
+  return "The model stopped unexpectedly. The technical error is available in Developer Mode.";
+}
+
+function humanTransferStage(stage: string): string {
+  const normalized = stage.toLowerCase();
+  if (normalized.includes("failed") || normalized.includes("error")) return "Couldn’t finish";
+  if (normalized.includes("checking file") || normalized.includes("verifying model")) return "Checking model";
+  if (normalized.includes("connecting")) return "Connecting to source";
+  if (normalized.includes("downloading shard")) return "Downloading part of model";
+  if (normalized.includes("downloading") || normalized.includes("starting download")) return "Downloading model";
+  if (normalized.includes("preparing")) return "Preparing for Infernet";
+  if (normalized.includes("sharing")) return "Making model available";
+  if (normalized.includes("ready")) return "Ready";
+  return "Preparing model";
+}
+
+function transferStageDescription(stage: string, status: TransferStatus): string {
+  if (status === "error") return "Infernet couldn’t complete this model task.";
+  if (status === "complete") return "This model is ready to use.";
+  const normalized = stage.toLowerCase();
+  if (normalized.includes("verifying") || normalized.includes("checking")) {
+    return "Confirming the model is complete and trusted.";
+  }
+  if (normalized.includes("sharing")) return "Getting the model ready for other computers.";
+  if (normalized.includes("preparing")) return "Optimizing the official package for this computer.";
+  return "Receiving the official model package.";
+}
+
+function modelDisplayName(snapshot: GridSnapshot, modelId: string): string {
+  const model = snapshot.availableModels.find(
+    (item) => item.modelId === modelId && isOfficialInfernetModel(item),
+  );
+  return model ? curatedModelName(model) : "Infernet Chat";
+}
+
+function isOfficialModelId(modelId: string): boolean {
+  return modelId === INFERNET_CHAT_MODEL_ID;
+}
+
+function isOfficialInfernetModel(model: ModelView): boolean {
+  return isOfficialModelId(model.modelId);
+}
+
+function curatedModelName(_model: ModelView): string {
+  return "Infernet Chat";
+}
+
+function curatedModelBasis(model: ModelView): string {
+  return isOfficialInfernetModel(model) ? "Powered by Gemma 4 26B A4B" : "Unofficial package";
+}
+
+type LocalModelSummary = {
+  modelId: string;
+  displayName: string;
+  quantization?: string | null;
+  sizeBytes: number;
+  packageCount: number;
+  layerStart: number;
+  layerEnd: number;
+  version: string;
+  checksums: string[];
+  replicas: number;
+};
+
+function groupLocalModels(snapshot: GridSnapshot): LocalModelSummary[] {
+  const summaries = new Map<string, LocalModelSummary>();
+
+  for (const shard of snapshot.distribution.installedShards) {
+    if (!isOfficialModelId(shard.modelId)) continue;
+    const model = snapshot.availableModels.find((item) => item.modelId === shard.modelId);
+    const replicaCounts = snapshot.distribution.replicationHealth
+      .filter((item) => item.modelId === shard.modelId)
+      .map((item) => item.replicas);
+    const replicas = replicaCounts.length > 0 ? Math.min(...replicaCounts) : 1;
+    const existing = summaries.get(shard.modelId);
+
+    if (existing) {
+      existing.sizeBytes += shard.sizeBytes;
+      existing.packageCount += 1;
+      existing.layerStart = Math.min(existing.layerStart, shard.layerStart);
+      existing.layerEnd = Math.max(existing.layerEnd, shard.layerEnd);
+      existing.replicas = Math.min(existing.replicas, replicas);
+      if (!existing.checksums.includes(shard.checksum)) existing.checksums.push(shard.checksum);
+      continue;
+    }
+
+    summaries.set(shard.modelId, {
+      modelId: shard.modelId,
+      displayName: model ? curatedModelName(model) : "Infernet Chat",
+      quantization: model?.quantization,
+      sizeBytes: shard.sizeBytes,
+      packageCount: 1,
+      layerStart: shard.layerStart,
+      layerEnd: shard.layerEnd,
+      version: shard.version,
+      checksums: [shard.checksum],
+      replicas,
+    });
+  }
+
+  return [...summaries.values()].sort((left, right) => left.displayName.localeCompare(right.displayName));
 }
 
 function formatBytes(bytes: number): string {

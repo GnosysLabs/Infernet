@@ -94,28 +94,6 @@ export interface RunDemoResponse {
   snapshot: GridSnapshot;
 }
 
-export interface AddModelResponse {
-  modelId: string;
-  displayName: string;
-  source: string;
-  sourceChecksum: string;
-  sourceSizeBytes: number;
-  plannedShards: number;
-  metadataOnly: boolean;
-  installedShards: InstalledShardView[];
-  message: string;
-}
-
-export interface HuggingFaceSettings {
-  hasToken: boolean;
-  tokenPreview?: string | null;
-}
-
-export interface HuggingFaceFileView {
-  filename: string;
-  sizeBytes?: number | null;
-}
-
 export interface ModelImportProgress {
   modelId: string;
   stage: string;

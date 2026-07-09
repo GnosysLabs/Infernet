@@ -27,31 +27,73 @@ const bridgeSidecarBase = resolve(sidecarDir, "infernet-llama-bridge");
 const sidecarPath = `${cliSidecarBase}-${targetTriple}${executableSuffix}`;
 const bridgeSidecarPath = `${bridgeSidecarBase}-${targetTriple}${executableSuffix}`;
 const runtimeStampPath = resolve(sidecarDir, `.infernet-llama-runtime-${targetTriple}.stamp`);
-const runtimePatchVersion = "physical-gguf-shards-v1";
+const runtimeLockPath = resolve(sidecarDir, `.infernet-llama-runtime-${targetTriple}.lock`);
+const runtimePatchVersion = "infernet-chat-generation-v3";
 const buildRoot = resolve(repoRoot, "target", "llama.cpp-runtime");
 const sourceDir = join(buildRoot, "llama.cpp");
 const buildDir = join(buildRoot, `build-${targetTriple}`);
 const downloadDir = join(buildRoot, "downloads");
 const prebuiltDir = join(buildRoot, `prebuilt-${targetTriple}`);
-const llamaRef = process.env.LLAMA_CPP_REF || "master";
+const llamaRef = process.env.LLAMA_CPP_REF || "049326a00025d00b08cc188ed716b681e984a3f8";
+const runtimeStamp = `${runtimePatchVersion}:${llamaRef}`;
 
-main();
+withRuntimeLock(main);
+
+function withRuntimeLock(task) {
+  acquireRuntimeLock();
+  try {
+    task();
+  } finally {
+    rmSync(runtimeLockPath, { recursive: true, force: true });
+  }
+}
+
+function acquireRuntimeLock() {
+  const waitBuffer = new Int32Array(new SharedArrayBuffer(4));
+  while (true) {
+    try {
+      mkdirSync(runtimeLockPath);
+      writeFileSync(join(runtimeLockPath, "pid"), `${process.pid}\n`);
+      return;
+    } catch (error) {
+      if (error?.code !== "EEXIST") {
+        throw error;
+      }
+    }
+
+    let ownerAlive = false;
+    try {
+      const ownerPid = Number.parseInt(readFileSync(join(runtimeLockPath, "pid"), "utf8"), 10);
+      if (Number.isInteger(ownerPid) && ownerPid > 0) {
+        process.kill(ownerPid, 0);
+        ownerAlive = true;
+      }
+    } catch {
+      ownerAlive = false;
+    }
+    if (!ownerAlive) {
+      rmSync(runtimeLockPath, { recursive: true, force: true });
+      continue;
+    }
+    Atomics.wait(waitBuffer, 0, 0, 250);
+  }
+}
 
 function main() {
   mkdirSync(sidecarDir, { recursive: true });
   if (fileExists(sidecarPath) && fileExists(bridgeSidecarPath)) {
     const validation = validateRuntime(sidecarPath);
     const bridgeValidation = validateRuntime(bridgeSidecarPath);
-    const stampMatches = readStamp() === runtimePatchVersion;
+    const stampMatches = readStamp() === runtimeStamp;
     if (validation.ok && bridgeValidation.ok && stampMatches) {
       log(`bundled llama.cpp runtime already exists: ${relative(sidecarPath)}`);
       log(`bundled Infernet llama.cpp bridge already exists: ${relative(bridgeSidecarPath)}`);
       return;
     }
     log(`rebuilding bundled llama.cpp runtime: ${stampMatches ? (validation.ok ? bridgeValidation.reason : validation.reason) : "runtime patch stamp is stale"}`);
-    safeUnlink(sidecarPath);
-    safeUnlink(bridgeSidecarPath);
-    safeUnlink(runtimeStampPath);
+    // Keep the last known-good sidecars in place until replacements have been
+    // built and validated. This avoids breaking a running dev app if a rebuild
+    // is interrupted.
   }
 
   const configuredCli = process.env.INFERNET_LLAMA_CLI?.trim();
@@ -624,7 +666,7 @@ function readStamp() {
 }
 
 function writeStamp() {
-  writeFileSync(runtimeStampPath, runtimePatchVersion + "\n");
+  writeFileSync(runtimeStampPath, runtimeStamp + "\n");
 }
 
 function invalidMacosDependency(line, runtimeDir) {

@@ -2,30 +2,25 @@ use std::time::Duration;
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
-    fs::File,
-    io::Write,
     net::{IpAddr, UdpSocket},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 
-use futures::StreamExt;
-use infernet_model::{
-    LayerRange, ModelManifest, RuntimeKind, SeedShardManifest, ShardDescriptor,
-    gguf::parse_gguf_info,
-};
+use futures::channel::oneshot;
+use infernet_model::{LayerRange, ModelManifest, RuntimeKind, SeedShardManifest, ShardDescriptor};
 use infernet_node::{
-    DiscoveryConfig, PAYLOAD_KIND_GGUF_SHARD, PAYLOAD_KIND_INFERNET_SHARD, SeedShardBuildProgress,
-    SeededModelSummary, ShardCache, ShardCacheConfig, discover_for, empty_advertisement,
-    fetch_model_shard_over_libp2p, import_seed_model_from_file_with_build_progress,
-    infer_over_libp2p, is_executable_shard_record, run_model_distribution_node,
+    DiscoveryConfig, PAYLOAD_KIND_FULL_MODEL, PAYLOAD_KIND_GGUF_SHARD, PAYLOAD_KIND_INFERNET_SHARD,
+    ShardCache, ShardCacheConfig, discover_for, empty_advertisement,
+    fetch_model_shard_over_libp2p, infer_over_libp2p, is_executable_shard_record,
+    run_model_distribution_node_with_readiness, seed_manifest_for_network,
 };
 use infernet_protocol::{
     ModelShardInfo, NodeAdvertisement, PROTOCOL_VERSION, RouteHop, TraceEvent,
 };
 use infernet_router::ShardRegistry;
 use libp2p::{Multiaddr, PeerId, identity};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 const DEFAULT_TOPIC: &str = "infernet/grid-demo/1";
@@ -38,11 +33,16 @@ const DEFAULT_BOOTSTRAP_PEERS: &[&str] = &[
     "12D3KooWRJrnpHPQTWdThpDGZMwRCHhEBL4JCAxFMwYMfFavxa2h@/dns4/infernet.gnosyslabs.xyz/tcp/9777/p2p/12D3KooWRJrnpHPQTWdThpDGZMwRCHhEBL4JCAxFMwYMfFavxa2h",
 ];
 
+enum ModelDistributionServiceState {
+    Stopped,
+    Starting(Vec<oneshot::Sender<Result<(), String>>>),
+    Running,
+}
+
 struct UiState {
     keypair: Mutex<identity::Keypair>,
     topic: String,
-    huggingface_token: Mutex<Option<String>>,
-    model_distribution_started: Mutex<bool>,
+    model_distribution_service: Arc<Mutex<ModelDistributionServiceState>>,
     active_model_acquisitions: Arc<Mutex<BTreeSet<String>>>,
     manual_peers: Mutex<Vec<NodeAdvertisement>>,
     last_registry: Mutex<Option<ShardRegistry>>,
@@ -53,8 +53,9 @@ impl Default for UiState {
         Self {
             keypair: Mutex::new(identity::Keypair::generate_ed25519()),
             topic: DEFAULT_TOPIC.to_owned(),
-            huggingface_token: Mutex::new(None),
-            model_distribution_started: Mutex::new(false),
+            model_distribution_service: Arc::new(Mutex::new(
+                ModelDistributionServiceState::Stopped,
+            )),
             active_model_acquisitions: Arc::new(Mutex::new(BTreeSet::new())),
             manual_peers: Mutex::new(Vec::new()),
             last_registry: Mutex::new(None),
@@ -182,34 +183,6 @@ struct RunDemoResponse {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct AddModelResponse {
-    model_id: String,
-    display_name: String,
-    source: String,
-    source_checksum: String,
-    source_size_bytes: u64,
-    planned_shards: usize,
-    metadata_only: bool,
-    installed_shards: Vec<InstalledShardView>,
-    message: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct HuggingFaceSettings {
-    has_token: bool,
-    token_preview: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct HuggingFaceFileView {
-    filename: String,
-    size_bytes: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct ModelImportProgress {
     model_id: String,
     stage: String,
@@ -221,17 +194,6 @@ struct ModelImportProgress {
 #[derive(Debug, Clone)]
 struct AdvertisedModelRecord {
     info: ModelShardInfo,
-}
-
-#[derive(Debug, Deserialize)]
-struct HuggingFaceModelInfo {
-    siblings: Option<Vec<HuggingFaceSibling>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct HuggingFaceSibling {
-    rfilename: String,
-    size: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -317,7 +279,7 @@ async fn get_grid_snapshot(
     model_id: Option<String>,
 ) -> Result<GridSnapshot, String> {
     let cache_config = cache_config_for_app(&app);
-    ensure_model_distribution_service(&state, cache_config.clone())?;
+    ensure_model_distribution_service(&state, cache_config.clone()).await?;
 
     collect_snapshot(
         &app,
@@ -336,7 +298,7 @@ async fn run_demo_inference(
     model_id: Option<String>,
 ) -> Result<RunDemoResponse, String> {
     let cache_config = cache_config_for_app(&app);
-    ensure_model_distribution_service(&state, cache_config.clone())?;
+    ensure_model_distribution_service(&state, cache_config.clone()).await?;
     let (registry, _, _) =
         discover_registry(&app, &state, &cache_config, DEFAULT_DISCOVERY_TIMEOUT_MS).await?;
     let manifest = manifest_for_model(model_id.as_deref(), &cache_config, Some(&registry))
@@ -429,306 +391,6 @@ async fn run_demo_inference(
     })
 }
 
-#[tauri::command]
-async fn add_local_gguf_model(
-    app: AppHandle,
-    state: State<'_, UiState>,
-    path: String,
-    version: Option<String>,
-) -> Result<AddModelResponse, String> {
-    let cache_config = cache_config_for_app(&app);
-    let cache = ShardCache::new(cache_config.clone()).map_err(|error| error.to_string())?;
-    let source = PathBuf::from(path);
-    let progress_model_id = model_id_from_source_path(&source);
-    emit_model_import_progress(
-        &app,
-        &progress_model_id,
-        "Checking file",
-        source.display().to_string(),
-        0,
-        None,
-    );
-    let manifest = manifest_from_gguf_source(&source).map_err(|error| error.to_string())?;
-    let source_size_bytes = std::fs::metadata(&source)
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
-    let mut last_shard_progress_emit = 0_u64;
-    let summary = import_seed_model_from_file_with_build_progress(
-        &cache,
-        &source,
-        &manifest,
-        version.unwrap_or_else(|| "v1".to_owned()),
-        |downloaded_bytes, total_bytes| {
-            emit_model_import_progress(
-                &app,
-                &manifest.model_id,
-                "Verifying model",
-                "Reading and verifying the selected file",
-                downloaded_bytes,
-                Some(total_bytes),
-            );
-        },
-        |progress| {
-            let estimated_bytes = estimated_shard_build_progress_bytes(progress, source_size_bytes);
-            if !should_emit_shard_build_progress(
-                progress,
-                estimated_bytes,
-                &mut last_shard_progress_emit,
-            ) {
-                return;
-            }
-            emit_model_import_progress(
-                &app,
-                &manifest.model_id,
-                "Building Infernet shards",
-                format!(
-                    "Writing .infershard {} of {} for layer {}:{}",
-                    progress.shard_index,
-                    progress.shard_count,
-                    progress.layers.start,
-                    progress.layers.end
-                ),
-                estimated_bytes,
-                (source_size_bytes > 0).then_some(source_size_bytes),
-            );
-        },
-    )
-    .map_err(|error| error.to_string())?;
-    emit_model_import_progress(
-        &app,
-        &manifest.model_id,
-        "Starting sharing",
-        "Publishing the model to the network",
-        summary.source_size_bytes,
-        Some(summary.source_size_bytes),
-    );
-    ensure_model_distribution_service(&state, cache_config)?;
-    emit_model_import_progress(
-        &app,
-        &manifest.model_id,
-        "Ready",
-        "Infernet is sharing this model",
-        summary.source_size_bytes,
-        Some(summary.source_size_bytes),
-    );
-
-    Ok(add_model_response_from_summary(summary))
-}
-
-#[tauri::command]
-async fn get_huggingface_settings(
-    state: State<'_, UiState>,
-) -> Result<HuggingFaceSettings, String> {
-    let token = state
-        .huggingface_token
-        .lock()
-        .map_err(|_| "failed to lock Hugging Face settings".to_owned())?
-        .clone();
-
-    Ok(huggingface_settings_from_token(token.as_deref()))
-}
-
-#[tauri::command]
-async fn save_huggingface_token(
-    state: State<'_, UiState>,
-    token: String,
-) -> Result<HuggingFaceSettings, String> {
-    let token = token.trim().to_owned();
-    let mut stored = state
-        .huggingface_token
-        .lock()
-        .map_err(|_| "failed to lock Hugging Face settings".to_owned())?;
-    *stored = (!token.is_empty()).then_some(token);
-
-    Ok(huggingface_settings_from_token(stored.as_deref()))
-}
-
-#[tauri::command]
-async fn clear_huggingface_token(state: State<'_, UiState>) -> Result<HuggingFaceSettings, String> {
-    let mut stored = state
-        .huggingface_token
-        .lock()
-        .map_err(|_| "failed to lock Hugging Face settings".to_owned())?;
-    *stored = None;
-
-    Ok(huggingface_settings_from_token(None))
-}
-
-#[tauri::command]
-async fn inspect_huggingface_repo(
-    state: State<'_, UiState>,
-    repo_id: String,
-    token: Option<String>,
-) -> Result<Vec<HuggingFaceFileView>, String> {
-    let repo_id = repo_id.trim();
-    if repo_id.is_empty() {
-        return Err("enter a Hugging Face repository id".to_owned());
-    }
-
-    let client = reqwest::Client::new();
-    let url = format!("https://huggingface.co/api/models/{repo_id}");
-    let response = apply_huggingface_auth(client.get(url), &state, token.as_deref())?
-        .send()
-        .await
-        .map_err(|error| error.to_string())?;
-
-    if !response.status().is_success() {
-        return Err(format!(
-            "Hugging Face returned {} while reading {repo_id}",
-            response.status()
-        ));
-    }
-
-    let info = response
-        .json::<HuggingFaceModelInfo>()
-        .await
-        .map_err(|error| error.to_string())?;
-    let mut files = info
-        .siblings
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|file| file.rfilename.to_ascii_lowercase().ends_with(".gguf"))
-        .map(|file| HuggingFaceFileView {
-            filename: file.rfilename,
-            size_bytes: file.size,
-        })
-        .collect::<Vec<_>>();
-    files.sort_by(|left, right| left.filename.cmp(&right.filename));
-
-    Ok(files)
-}
-
-#[tauri::command]
-async fn add_huggingface_model(
-    app: AppHandle,
-    state: State<'_, UiState>,
-    repo_id: String,
-    filename: String,
-    token: Option<String>,
-    revision: Option<String>,
-    version: Option<String>,
-) -> Result<AddModelResponse, String> {
-    let repo_id = repo_id.trim();
-    let filename = filename.trim();
-    if repo_id.is_empty() || filename.is_empty() {
-        return Err("choose a Hugging Face repo and GGUF file".to_owned());
-    }
-
-    let revision = revision.unwrap_or_else(|| "main".to_owned());
-    let target = huggingface_download_path(&app, repo_id, filename)?;
-    let progress_model_id = model_id_from_source_path(Path::new(filename));
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
-    emit_model_import_progress(
-        &app,
-        &progress_model_id,
-        "Connecting",
-        format!("Opening {repo_id}"),
-        0,
-        None,
-    );
-
-    let client = reqwest::Client::new();
-    let url = format!("https://huggingface.co/{repo_id}/resolve/{revision}/{filename}");
-    let response = apply_huggingface_auth(client.get(url), &state, token.as_deref())?
-        .send()
-        .await
-        .map_err(|error| error.to_string())?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "Hugging Face returned {} while downloading {repo_id}/{filename}",
-            response.status()
-        ));
-    }
-
-    let total_bytes = response.content_length();
-    let mut file = File::create(&target).map_err(|error| error.to_string())?;
-    let mut stream = response.bytes_stream();
-    let mut downloaded_bytes = 0_u64;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| error.to_string())?;
-        file.write_all(&chunk).map_err(|error| error.to_string())?;
-        downloaded_bytes = downloaded_bytes.saturating_add(chunk.len() as u64);
-        emit_model_import_progress(
-            &app,
-            &progress_model_id,
-            "Downloading",
-            filename.to_owned(),
-            downloaded_bytes,
-            total_bytes,
-        );
-    }
-
-    let manifest = manifest_from_gguf_source(&target).map_err(|error| error.to_string())?;
-    let cache_config = cache_config_for_app(&app);
-    let cache = ShardCache::new(cache_config.clone()).map_err(|error| error.to_string())?;
-    let source_size_bytes = std::fs::metadata(&target)
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
-    let mut last_shard_progress_emit = 0_u64;
-    let summary = import_seed_model_from_file_with_build_progress(
-        &cache,
-        &target,
-        &manifest,
-        version.unwrap_or_else(|| "v1".to_owned()),
-        |verified_bytes, total_bytes| {
-            emit_model_import_progress(
-                &app,
-                &manifest.model_id,
-                "Verifying model",
-                "Reading and verifying the downloaded file",
-                verified_bytes,
-                Some(total_bytes),
-            );
-        },
-        |progress| {
-            let estimated_bytes = estimated_shard_build_progress_bytes(progress, source_size_bytes);
-            if !should_emit_shard_build_progress(
-                progress,
-                estimated_bytes,
-                &mut last_shard_progress_emit,
-            ) {
-                return;
-            }
-            emit_model_import_progress(
-                &app,
-                &manifest.model_id,
-                "Building Infernet shards",
-                format!(
-                    "Writing .infershard {} of {} for layer {}:{}",
-                    progress.shard_index,
-                    progress.shard_count,
-                    progress.layers.start,
-                    progress.layers.end
-                ),
-                estimated_bytes,
-                (source_size_bytes > 0).then_some(source_size_bytes),
-            );
-        },
-    )
-    .map_err(|error| error.to_string())?;
-    emit_model_import_progress(
-        &app,
-        &manifest.model_id,
-        "Starting sharing",
-        "Publishing the model to the network",
-        summary.source_size_bytes,
-        Some(summary.source_size_bytes),
-    );
-    ensure_model_distribution_service(&state, cache_config)?;
-    emit_model_import_progress(
-        &app,
-        &manifest.model_id,
-        "Ready",
-        "Infernet is sharing this model",
-        summary.source_size_bytes,
-        Some(summary.source_size_bytes),
-    );
-
-    Ok(add_model_response_from_summary(summary))
-}
-
 async fn collect_snapshot(
     app: &AppHandle,
     state: &State<'_, UiState>,
@@ -814,7 +476,6 @@ async fn acquire_advertised_model_records(
     if plan.is_empty() {
         return Ok(());
     }
-
     let missing_ranges = missing_ranges_from_layer_ranges(
         manifest.layer_count,
         plan.iter().map(|record| record.info.layers),
@@ -913,6 +574,15 @@ fn spawn_background_model_record_acquisition(
     let cache = ShardCache::new(cache_config.clone()).map_err(|error| error.to_string())?;
     let plan = advertised_model_record_plan(registry, &manifest.model_id);
     if plan.is_empty() {
+        return Ok(());
+    }
+    if plan.len() == 1
+        && plan[0].info.layers.start == 0
+        && plan[0].info.layers.end == manifest.layer_count
+    {
+        // A compatibility package is the entire model, not a small shard.
+        // Never start a multi-gigabyte download merely because a snapshot was
+        // viewed; foreground inference remains the explicit acquisition path.
         return Ok(());
     }
 
@@ -1129,52 +799,6 @@ fn model_shard_fetch_timeout_ms(size_bytes: u64) -> u64 {
     DEFAULT_MODEL_FETCH_TIMEOUT_MS.max(one_megabyte_per_second)
 }
 
-fn estimated_shard_build_progress_bytes(
-    progress: SeedShardBuildProgress,
-    source_size_bytes: u64,
-) -> u64 {
-    if source_size_bytes == 0 || progress.shard_count == 0 {
-        return progress.written_bytes;
-    }
-    if progress.shard_index >= progress.shard_count
-        && progress.written_bytes >= progress.total_bytes
-    {
-        return source_size_bytes;
-    }
-
-    let shard_count = progress.shard_count as u64;
-    let completed_shards = progress.shard_index.saturating_sub(1) as u64;
-    let shard_span = source_size_bytes / shard_count;
-    let in_shard = if progress.total_bytes > 0 {
-        shard_span
-            .saturating_mul(progress.written_bytes.min(progress.total_bytes))
-            .saturating_div(progress.total_bytes)
-    } else {
-        0
-    };
-
-    source_size_bytes.min(
-        shard_span
-            .saturating_mul(completed_shards)
-            .saturating_add(in_shard),
-    )
-}
-
-fn should_emit_shard_build_progress(
-    progress: SeedShardBuildProgress,
-    estimated_bytes: u64,
-    last_emit: &mut u64,
-) -> bool {
-    const MIN_PROGRESS_DELTA_BYTES: u64 = 32 * 1024 * 1024;
-    let should_emit = progress.written_bytes == 0
-        || progress.written_bytes >= progress.total_bytes
-        || estimated_bytes.saturating_sub(*last_emit) >= MIN_PROGRESS_DELTA_BYTES;
-    if should_emit {
-        *last_emit = estimated_bytes;
-    }
-    should_emit
-}
-
 fn snapshot_from_registry(
     local_peer_id: String,
     topic: String,
@@ -1245,7 +869,7 @@ fn model_view_from_manifest(
     let runnable = manifest.runtime_kind == RuntimeKind::Demo
         || (manifest.runtime_kind == RuntimeKind::LlamaCpp
             && installed
-            && local_source_path_for_model(cache_config, &manifest.model_id).is_some());
+            && local_model_has_complete_coverage(cache_config, manifest));
     ModelView {
         model_id: manifest.model_id.clone(),
         display_name: manifest.display_name.clone(),
@@ -1475,11 +1099,12 @@ fn model_status(
         return "Available on the network".to_owned();
     }
 
-    if local_source_path_for_model(cache_config, &manifest.model_id).is_none() {
-        return "Model records installed. Infernet will download executable layer shards from peers before chat.".to_owned();
+    if !local_model_has_complete_coverage(cache_config, manifest) {
+        return "Model import is incomplete. Re-add the model to install a complete executable package."
+            .to_owned();
     }
 
-    "Installed locally. Ready for distributed inference.".to_owned()
+    "Installed locally. Ready for inference and seeding.".to_owned()
 }
 
 fn normalize_quantization_label(value: &str) -> String {
@@ -1783,7 +1408,7 @@ fn local_cache_advertisement(
         };
         if is_executable_shard_record(&record) && seed_record_is_executable(cache_config, &manifest)
         {
-            let seed_manifest = Box::new(manifest.clone());
+            let seed_manifest = Box::new(seed_manifest_for_network(&manifest));
             hosted_shards.push(ShardDescriptor {
                 model_id: manifest.model_id.clone(),
                 layers: manifest.layers,
@@ -1821,28 +1446,44 @@ fn seed_record_is_executable(config: &ShardCacheConfig, manifest: &SeedShardMani
 }
 
 fn seed_manifest_has_executable_payload(manifest: &SeedShardManifest) -> bool {
-    matches!(
-        manifest.payload_kind.as_str(),
-        PAYLOAD_KIND_GGUF_SHARD | PAYLOAD_KIND_INFERNET_SHARD
-    )
-}
-
-fn local_source_path_for_model(cache_config: &ShardCacheConfig, model_id: &str) -> Option<PathBuf> {
-    let cache = ShardCache::new(cache_config.clone()).ok()?;
-    let records = cache.list().ok()?;
-
-    for record in records {
-        let Some(manifest) = record.manifest.as_ref() else {
-            continue;
-        };
-        if manifest.model_id == model_id {
-            if is_executable_shard_record(&record) {
-                return Some(record.path);
-            }
+    match manifest.runtime_kind {
+        RuntimeKind::Demo => matches!(
+            manifest.payload_kind.as_str(),
+            PAYLOAD_KIND_GGUF_SHARD | PAYLOAD_KIND_INFERNET_SHARD
+        ),
+        RuntimeKind::LlamaCpp => {
+            manifest.payload_kind == PAYLOAD_KIND_FULL_MODEL
+                && manifest.layers.start == 0
+                && manifest.layers.end == manifest.layer_count
         }
     }
+}
 
-    None
+fn local_model_has_complete_coverage(
+    cache_config: &ShardCacheConfig,
+    model: &ModelManifest,
+) -> bool {
+    let Ok(cache) = ShardCache::new(cache_config.clone()) else {
+        return false;
+    };
+    let Ok(records) = cache.list() else {
+        return false;
+    };
+    records.into_iter().any(|record| {
+        let Some(manifest) = record.manifest.as_ref() else {
+            return false;
+        };
+        is_executable_shard_record(&record)
+            && record.info.model_id == model.model_id
+            && record.info.layers.start == 0
+            && record.info.layers.end == model.layer_count
+            && manifest.model_id == model.model_id
+            && manifest.layers == record.info.layers
+            && manifest.layer_count == model.layer_count
+            && manifest.hidden_size == model.hidden_size
+            && manifest.architecture == model.architecture
+            && manifest.runtime_kind == model.runtime_kind
+    })
 }
 
 #[cfg(test)]
@@ -1853,124 +1494,6 @@ fn unix_ms() -> u128 {
         .unwrap_or(0)
 }
 
-fn add_model_response_from_summary(summary: SeededModelSummary) -> AddModelResponse {
-    let display_name = display_name_from_source_path(&summary.source_path)
-        .filter(|name| !name.is_empty())
-        .unwrap_or(summary.display_name);
-
-    AddModelResponse {
-        model_id: summary.model_id,
-        display_name,
-        source: summary.source_path.display().to_string(),
-        source_checksum: summary.source_checksum,
-        source_size_bytes: summary.source_size_bytes,
-        planned_shards: summary.shard_count,
-        metadata_only: summary.metadata_only,
-        installed_shards: summary
-            .records
-            .into_iter()
-            .map(|record| InstalledShardView {
-                model_id: record.info.model_id,
-                layer_start: record.info.layers.start,
-                layer_end: record.info.layers.end,
-                checksum: record.info.checksum,
-                size_bytes: record.info.size_bytes,
-                version: record.info.version,
-            })
-            .collect(),
-        message: if summary.metadata_only {
-            "This import did not create executable Infernet shards and will not be advertised for inference.".to_owned()
-        } else {
-            "Infernet shards are installed and seeding to the network.".to_owned()
-        },
-    }
-}
-
-fn display_name_from_source_path(path: &Path) -> Option<String> {
-    let file_name = path.file_name()?.to_str()?;
-    let without_ext = file_name
-        .strip_suffix(".gguf")
-        .or_else(|| file_name.strip_suffix(".GGUF"))
-        .unwrap_or(file_name);
-    let name = without_ext
-        .replace(['_', '-', '.'], " ")
-        .split_whitespace()
-        .map(format_model_name_part)
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    (!name.is_empty()).then_some(name)
-}
-
-fn model_id_from_source_path(path: &Path) -> String {
-    let name = path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .or_else(|| path.file_name().and_then(|value| value.to_str()))
-        .unwrap_or("gguf-model");
-    model_id_from_name(name)
-}
-
-fn model_id_from_name(name: &str) -> String {
-    let mut output = String::new();
-    let mut last_was_separator = false;
-
-    for ch in name.chars().flat_map(|ch| ch.to_lowercase()) {
-        if ch.is_ascii_alphanumeric() || ch == '.' {
-            output.push(ch);
-            last_was_separator = false;
-        } else if !last_was_separator && !output.is_empty() {
-            output.push('-');
-            last_was_separator = true;
-        }
-    }
-
-    while output.ends_with('-') {
-        output.pop();
-    }
-
-    if output.is_empty() {
-        "gguf-model".to_owned()
-    } else {
-        output
-    }
-}
-
-fn manifest_from_gguf_source(source: &Path) -> anyhow::Result<ModelManifest> {
-    let info = parse_gguf_info(source)?;
-    let display_name =
-        display_name_from_source_path(source).unwrap_or_else(|| "Imported GGUF Model".to_owned());
-    let model_id = model_id_from_source_path(source);
-    Ok(ModelManifest::from_gguf_info(
-        model_id,
-        display_name,
-        &info,
-    )?)
-}
-
-fn format_model_name_part(part: &str) -> String {
-    let lower = part.to_ascii_lowercase();
-    match lower.as_str() {
-        "gguf" => "GGUF".to_owned(),
-        "llama" => "Llama".to_owned(),
-        "gemma" => "Gemma".to_owned(),
-        "qwen" => "Qwen".to_owned(),
-        "mistral" => "Mistral".to_owned(),
-        "instruct" => "Instruct".to_owned(),
-        "it" => "IT".to_owned(),
-        "q4" | "q5" | "q6" | "q8" | "k" | "m" | "s" => lower.to_ascii_uppercase(),
-        value
-            if value.ends_with('b')
-                && value[..value.len() - 1]
-                    .chars()
-                    .all(|ch| ch.is_ascii_digit()) =>
-        {
-            value.to_ascii_uppercase()
-        }
-        _ => part.to_owned(),
-    }
-}
-
 fn app_data_dir(app: &AppHandle) -> PathBuf {
     app.path()
         .app_data_dir()
@@ -1978,17 +1501,13 @@ fn app_data_dir(app: &AppHandle) -> PathBuf {
 }
 
 fn cache_config_for_app(app: &AppHandle) -> ShardCacheConfig {
-    let config = ShardCacheConfig::new(app_data_dir(app).join("shards"));
-    if let Err(error) = migrate_legacy_caches(&config) {
-        eprintln!("failed to migrate legacy Infernet cache: {error}");
-    }
-    config
+    // The launch app reads only official release packages. The former `shards`
+    // cache is intentionally left untouched so changing product direction
+    // never deletes a user's files without consent.
+    ShardCacheConfig::new(app_data_dir(app).join("official-models").join("v1"))
 }
 
-fn migrate_legacy_caches(target_config: &ShardCacheConfig) -> anyhow::Result<usize> {
-    migrate_legacy_cache_roots(target_config, legacy_cache_roots())
-}
-
+#[cfg(test)]
 fn migrate_legacy_cache_roots(
     target_config: &ShardCacheConfig,
     legacy_roots: impl IntoIterator<Item = PathBuf>,
@@ -2025,22 +1544,7 @@ fn migrate_legacy_cache_roots(
     Ok(migrated)
 }
 
-fn legacy_cache_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    roots.push(PathBuf::from(".infernet/shards"));
-    if let Ok(current_dir) = env::current_dir() {
-        roots.push(current_dir.join(".infernet/shards"));
-    }
-
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    roots.push(manifest_dir.join(".infernet/shards"));
-    roots.push(manifest_dir.join("../../.infernet/shards"));
-
-    roots.sort();
-    roots.dedup();
-    roots
-}
-
+#[cfg(test)]
 fn same_path(left: &Path, right: &Path) -> bool {
     match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
         (Ok(left), Ok(right)) => left == right,
@@ -2048,18 +1552,10 @@ fn same_path(left: &Path, right: &Path) -> bool {
     }
 }
 
-fn ensure_model_distribution_service(
+async fn ensure_model_distribution_service(
     state: &State<'_, UiState>,
     cache_config: ShardCacheConfig,
 ) -> Result<(), String> {
-    let mut started = state
-        .model_distribution_started
-        .lock()
-        .map_err(|_| "failed to lock model distribution service state".to_owned())?;
-    if *started {
-        return Ok(());
-    }
-
     let keypair = state
         .keypair
         .lock()
@@ -2069,15 +1565,137 @@ fn ensure_model_distribution_service(
     discovery.keypair = keypair;
     discovery.p2p_listen = format!("/ip4/0.0.0.0/tcp/{UI_LISTEN_PORT}");
     discovery.static_peers = configured_static_peers(state)?;
-    *started = true;
 
+    let (waiter_sender, waiter_receiver) = oneshot::channel();
+    let should_start = {
+        let mut service = state
+            .model_distribution_service
+            .lock()
+            .map_err(|_| "failed to lock model distribution service state".to_owned())?;
+        match &mut *service {
+            ModelDistributionServiceState::Running => return Ok(()),
+            ModelDistributionServiceState::Starting(waiters) => {
+                waiters.push(waiter_sender);
+                false
+            }
+            ModelDistributionServiceState::Stopped => {
+                *service = ModelDistributionServiceState::Starting(vec![waiter_sender]);
+                true
+            }
+        }
+    };
+
+    if should_start {
+        spawn_model_distribution_service(
+            Arc::clone(&state.model_distribution_service),
+            discovery,
+            cache_config,
+        );
+    }
+
+    waiter_receiver.await.map_err(|_| {
+        "model distribution startup coordinator stopped before reporting readiness".to_owned()
+    })?
+}
+
+fn spawn_model_distribution_service(
+    service_state: Arc<Mutex<ModelDistributionServiceState>>,
+    discovery: DiscoveryConfig,
+    cache_config: ShardCacheConfig,
+) {
     tauri::async_runtime::spawn(async move {
-        if let Err(error) = run_model_distribution_node(discovery, cache_config).await {
-            eprintln!("model distribution node stopped: {error}");
+        let (readiness_sender, readiness_receiver) = oneshot::channel();
+        let mut service_task = Some(tauri::async_runtime::spawn(
+            run_model_distribution_node_with_readiness(discovery, cache_config, readiness_sender),
+        ));
+
+        let startup_result = match tokio::time::timeout(Duration::from_secs(10), readiness_receiver)
+            .await
+        {
+            Ok(Ok(Ok(_address))) => Ok(()),
+            Ok(Ok(Err(error))) => Err(error),
+            Ok(Err(_)) => {
+                let task = service_task
+                    .take()
+                    .expect("model distribution service task should exist");
+                match task.await {
+                    Ok(Ok(())) => Err(
+                        "model distribution service stopped before its listener became ready"
+                            .to_owned(),
+                    ),
+                    Ok(Err(error)) => Err(format!("{error:#}")),
+                    Err(error) => Err(format!(
+                        "model distribution service failed before its listener became ready: {error}"
+                    )),
+                }
+            }
+            Err(_) => {
+                if let Some(task) = service_task.as_ref() {
+                    task.abort();
+                }
+                Err("timed out waiting for the model distribution listener to start".to_owned())
+            }
+        };
+
+        if startup_result.is_err() {
+            if let Some(task) = service_task.take() {
+                let _ = task.await;
+            }
+        }
+
+        let waiters = complete_model_distribution_startup(&service_state, &startup_result);
+        for waiter in waiters {
+            let _ = waiter.send(startup_result.clone());
+        }
+
+        if startup_result.is_ok() {
+            if let Some(task) = service_task.take() {
+                match task.await {
+                    Ok(Ok(())) => {
+                        eprintln!("model distribution node stopped unexpectedly");
+                    }
+                    Ok(Err(error)) => {
+                        eprintln!("model distribution node stopped: {error:#}");
+                    }
+                    Err(error) => {
+                        eprintln!("model distribution node task failed: {error}");
+                    }
+                }
+            }
+            reset_model_distribution_service(&service_state);
         }
     });
+}
 
-    Ok(())
+fn complete_model_distribution_startup(
+    service_state: &Arc<Mutex<ModelDistributionServiceState>>,
+    startup_result: &Result<(), String>,
+) -> Vec<oneshot::Sender<Result<(), String>>> {
+    let mut service = service_state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let waiters = match std::mem::replace(&mut *service, ModelDistributionServiceState::Stopped) {
+        ModelDistributionServiceState::Starting(waiters) => waiters,
+        current => {
+            *service = current;
+            return Vec::new();
+        }
+    };
+
+    if startup_result.is_ok() {
+        *service = ModelDistributionServiceState::Running;
+    }
+
+    waiters
+}
+
+fn reset_model_distribution_service(service_state: &Arc<Mutex<ModelDistributionServiceState>>) {
+    let mut service = service_state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if matches!(*service, ModelDistributionServiceState::Running) {
+        *service = ModelDistributionServiceState::Stopped;
+    }
 }
 
 fn parse_manual_peer(input: &str) -> Result<NodeAdvertisement, String> {
@@ -2240,73 +1858,6 @@ fn ip_protocol(ip: IpAddr) -> &'static str {
     }
 }
 
-fn huggingface_settings_from_token(token: Option<&str>) -> HuggingFaceSettings {
-    HuggingFaceSettings {
-        has_token: token.is_some_and(|token| !token.is_empty()),
-        token_preview: token.map(mask_token),
-    }
-}
-
-fn mask_token(token: &str) -> String {
-    if token.len() <= 8 {
-        return "saved".to_owned();
-    }
-
-    format!("{}...{}", &token[..4], &token[token.len() - 4..])
-}
-
-fn apply_huggingface_auth(
-    request: reqwest::RequestBuilder,
-    state: &State<'_, UiState>,
-    token_override: Option<&str>,
-) -> Result<reqwest::RequestBuilder, String> {
-    let token = match token_override
-        .map(str::trim)
-        .filter(|token| !token.is_empty())
-    {
-        Some(token) => Some(token.to_owned()),
-        None => state
-            .huggingface_token
-            .lock()
-            .map_err(|_| "failed to lock Hugging Face settings".to_owned())?
-            .clone(),
-    };
-
-    Ok(match token {
-        Some(token) => request.bearer_auth(token),
-        None => request,
-    })
-}
-
-fn huggingface_download_path(
-    app: &AppHandle,
-    repo_id: &str,
-    filename: &str,
-) -> Result<PathBuf, String> {
-    let file_name = Path::new(filename)
-        .file_name()
-        .and_then(|value| value.to_str())
-        .ok_or_else(|| "Hugging Face filename is invalid".to_owned())?;
-
-    Ok(app_data_dir(app)
-        .join("imports")
-        .join(sanitize_path_segment(repo_id))
-        .join(sanitize_path_segment(file_name)))
-}
-
-fn sanitize_path_segment(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
 fn manifest_for_model(
     model_id: Option<&str>,
     cache_config: &ShardCacheConfig,
@@ -2373,8 +1924,6 @@ async fn replay_trace_progress(app: &AppHandle, trace_id: &str, trace: &[TraceEv
                 activation_size_bytes: event.activation_size_bytes,
             },
         );
-
-        tokio::time::sleep(Duration::from_millis(140)).await;
 
         emit_progress(
             app,
@@ -2456,13 +2005,16 @@ fn short_peer_id(peer_id: &str) -> String {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_dialog::init())
         .manage(UiState::default())
         .setup(|app| {
-            let state = app.state::<UiState>();
+            let app_handle = app.handle().clone();
             let cache_config = cache_config_for_app(app.handle());
-            ensure_model_distribution_service(&state, cache_config)
-                .map_err(|error| Box::<dyn std::error::Error>::from(error))?;
+            tauri::async_runtime::spawn(async move {
+                let state = app_handle.state::<UiState>();
+                if let Err(error) = ensure_model_distribution_service(&state, cache_config).await {
+                    eprintln!("failed to start model distribution service: {error}");
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -2471,13 +2023,7 @@ pub fn run() {
             add_manual_peer,
             clear_manual_peers,
             get_grid_snapshot,
-            run_demo_inference,
-            add_local_gguf_model,
-            get_huggingface_settings,
-            save_huggingface_token,
-            clear_huggingface_token,
-            inspect_huggingface_repo,
-            add_huggingface_model
+            run_demo_inference
         ])
         .run(tauri::generate_context!())
         .expect("error while running Infernet UI");
@@ -2559,7 +2105,7 @@ mod tests {
                     file_size_bytes: 8,
                 },
                 shard_hash: "hash".to_owned(),
-                payload_kind: PAYLOAD_KIND_INFERNET_SHARD.to_owned(),
+                payload_kind: PAYLOAD_KIND_FULL_MODEL.to_owned(),
             })),
         });
 
@@ -2669,7 +2215,7 @@ mod tests {
                 file_size_bytes: 123,
             },
             shard_hash: "hash".to_owned(),
-            payload_kind: PAYLOAD_KIND_INFERNET_SHARD.to_owned(),
+            payload_kind: PAYLOAD_KIND_FULL_MODEL.to_owned(),
         };
         cache
             .import_physical_shard_file(
@@ -2684,6 +2230,16 @@ mod tests {
         let advertisement =
             local_cache_advertisement(&cache_config, "local-peer".to_owned()).unwrap();
         assert_eq!(advertisement.hosted_shards.len(), 1);
+        assert_eq!(
+            advertisement.hosted_shards[0]
+                .seed_manifest
+                .as_deref()
+                .unwrap()
+                .source
+                .path,
+            "",
+            "network advertisements must not leak the importing user's path"
+        );
         assert_eq!(advertisement.hosted_shards[0].layers, layers);
 
         let mut registry = ShardRegistry::new();
@@ -2703,6 +2259,7 @@ mod tests {
             .find(|model| model.model_id == "gemma-4-12b-it-iq4-xs")
             .unwrap();
         assert_eq!(view.quantization.as_deref(), Some("IQ4_XS"));
+        assert!(view.runnable);
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2771,15 +2328,15 @@ mod tests {
     }
 
     #[test]
-    fn local_contribution_planner_downloads_missing_records_after_partial_install() {
+    fn local_contribution_planner_replaces_legacy_partial_with_complete_package() {
         let root = std::env::temp_dir().join(format!("infernet-ui-partial-{}", unix_ms()));
         let cache_config = ShardCacheConfig::new(root.join("shards"));
-        let cache = ShardCache::new(cache_config).unwrap();
+        let cache = ShardCache::new(cache_config.clone()).unwrap();
         std::fs::create_dir_all(&root).unwrap();
         let shard_file = root.join("local-shard.gguf");
         std::fs::write(&shard_file, b"local physical gguf shard placeholder").unwrap();
         let installed_layers = LayerRange::new(0, 8).unwrap();
-        let missing_layers = LayerRange::new(8, 16).unwrap();
+        let complete_layers = LayerRange::new(0, 16).unwrap();
         let seed_manifest = SeedShardManifest {
             model_id: "gemma".to_owned(),
             display_name: "Gemma".to_owned(),
@@ -2816,11 +2373,11 @@ mod tests {
                 seed_manifest,
             )
             .unwrap();
-        let missing = ModelShardInfo {
+        let complete = ModelShardInfo {
             model_id: "gemma".to_owned(),
-            layers: missing_layers,
-            checksum: "missing-checksum".to_owned(),
-            size_bytes: 8,
+            layers: complete_layers,
+            checksum: "complete-checksum".to_owned(),
+            size_bytes: 16,
             version: "v1".to_owned(),
             protocol_version: PROTOCOL_VERSION,
         };
@@ -2828,17 +2385,19 @@ mod tests {
             &cache,
             "gemma",
             "local-peer",
-            vec![
-                AdvertisedModelRecord {
-                    info: installed.info,
-                },
-                AdvertisedModelRecord { info: missing },
-            ],
+            vec![AdvertisedModelRecord { info: complete }],
         )
         .unwrap();
 
         assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].info.layers, missing_layers);
+        assert_eq!(selected[0].info.layers, complete_layers);
+        assert!(!is_executable_shard_record(&installed));
+        assert!(
+            available_model_views(&cache_config, None)
+                .into_iter()
+                .all(|model| model.model_id != "gemma"),
+            "unsupported legacy partials must not appear runnable or advertised"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }

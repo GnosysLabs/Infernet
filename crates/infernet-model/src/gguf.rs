@@ -153,6 +153,38 @@ pub fn parse_gguf_info(path: &Path) -> Result<GgufInfo> {
     })
 }
 
+/// Validates the structural parts of a GGUF that Infernet depends on before it
+/// is advertised as executable. This deliberately walks tensor descriptors and
+/// bounds-checks their offsets without reading multi-gigabyte tensor payloads.
+pub fn validate_gguf_file(path: &Path) -> Result<()> {
+    let parsed = parse_gguf_layout(path)?;
+    if !matches!(parsed.version, 2 | 3) {
+        bail!(
+            "unsupported GGUF version {} in {}",
+            parsed.version,
+            path.display()
+        );
+    }
+    if parsed.tensors.is_empty() {
+        bail!("{} contains no GGUF tensors", path.display());
+    }
+
+    let data_bytes = parsed.file_size.saturating_sub(parsed.data_start);
+    for tensor in &parsed.tensors {
+        if tensor.offset >= data_bytes {
+            bail!(
+                "GGUF tensor {} starts past EOF in {}; offset={}, data bytes={}",
+                tensor.name,
+                path.display(),
+                tensor.offset,
+                data_bytes
+            );
+        }
+    }
+
+    Ok(())
+}
+
 pub fn write_layer_shard(
     source: &Path,
     destination: &Path,
