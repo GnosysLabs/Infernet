@@ -44,6 +44,7 @@ struct UiState {
     huggingface_token: Mutex<Option<String>>,
     model_distribution_started: Mutex<bool>,
     manual_peers: Mutex<Vec<NodeAdvertisement>>,
+    last_registry: Mutex<Option<ShardRegistry>>,
 }
 
 impl Default for UiState {
@@ -54,6 +55,7 @@ impl Default for UiState {
             huggingface_token: Mutex::new(None),
             model_distribution_started: Mutex::new(false),
             manual_peers: Mutex::new(Vec::new()),
+            last_registry: Mutex::new(None),
         }
     }
 }
@@ -217,7 +219,6 @@ struct ModelImportProgress {
 #[derive(Debug, Clone)]
 struct AdvertisedModelRecord {
     info: ModelShardInfo,
-    seed_manifest: Option<SeedShardManifest>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -718,9 +719,23 @@ async fn discover_registry(
     {
         config.advertisement = Some(local_advertisement);
     }
-    let registry = discover_for(config, Duration::from_millis(discovery_timeout_ms))
+    let mut registry = discover_for(config, Duration::from_millis(discovery_timeout_ms))
         .await
         .map_err(|error| error.to_string())?;
+    if let Ok(last_registry) = state.last_registry.lock() {
+        if let Some(last_registry) = last_registry.as_ref() {
+            registry.extend(last_registry.advertisements());
+        }
+    }
+    if let Ok(mut last_registry) = state.last_registry.lock() {
+        if registry
+            .advertisements()
+            .iter()
+            .any(advertisement_has_capacity)
+        {
+            *last_registry = Some(registry.clone());
+        }
+    }
 
     Ok((registry, local_peer_id, topic))
 }
@@ -1001,6 +1016,9 @@ fn installed_model_manifests(cache_config: &ShardCacheConfig) -> Vec<ModelManife
     let mut manifests = records
         .into_iter()
         .filter_map(|record| {
+            if !is_executable_shard_record(&record) {
+                return None;
+            }
             let manifest = record.manifest?;
             Some(ModelManifest {
                 model_id: manifest.model_id,
@@ -1041,72 +1059,30 @@ fn discovered_model_manifests(registry: &ShardRegistry) -> Vec<ModelManifest> {
         .flat_map(|advertisement| advertisement.hosted_shards.iter())
         .filter(|shard| shard.runtime_kind != RuntimeKind::Demo)
     {
-        if let Some(seed_manifest) = shard.seed_manifest.as_deref() {
-            by_model
-                .entry(shard.model_id.clone())
-                .and_modify(|manifest| {
-                    manifest.layer_count = manifest.layer_count.max(seed_manifest.layer_count);
-                    manifest.hidden_size = manifest.hidden_size.max(seed_manifest.hidden_size);
-                    if manifest.quantization.is_none() {
-                        manifest.quantization = seed_manifest.metadata.quantization.clone();
-                    }
-                })
-                .or_insert_with(|| ModelManifest {
-                    model_id: seed_manifest.model_id.clone(),
-                    display_name: seed_manifest.display_name.clone(),
-                    architecture: seed_manifest.architecture.clone(),
-                    layer_count: seed_manifest.layer_count,
-                    hidden_size: seed_manifest.hidden_size,
-                    activation_dtype: seed_manifest.activation_dtype.clone(),
-                    quantization: seed_manifest.metadata.quantization.clone(),
-                    runtime_kind: seed_manifest.runtime_kind.clone(),
-                });
+        let Some(seed_manifest) = shard.seed_manifest.as_deref() else {
+            continue;
+        };
+        if seed_manifest.payload_kind != PAYLOAD_KIND_GGUF_SHARD {
             continue;
         }
         by_model
             .entry(shard.model_id.clone())
             .and_modify(|manifest| {
-                manifest.layer_count = manifest.layer_count.max(shard.layers.end);
+                manifest.layer_count = manifest.layer_count.max(seed_manifest.layer_count);
+                manifest.hidden_size = manifest.hidden_size.max(seed_manifest.hidden_size);
+                if manifest.quantization.is_none() {
+                    manifest.quantization = seed_manifest.metadata.quantization.clone();
+                }
             })
             .or_insert_with(|| ModelManifest {
-                model_id: shard.model_id.clone(),
-                display_name: display_name_from_model_id(&shard.model_id),
-                architecture: shard
-                    .metadata
-                    .as_ref()
-                    .map(|metadata| metadata.architecture.clone())
-                    .unwrap_or_else(|| "unknown".to_owned()),
-                layer_count: shard.layers.end,
-                hidden_size: 0,
-                activation_dtype: "f16".to_owned(),
-                quantization: shard
-                    .metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.quantization.as_deref())
-                    .map(normalize_quantization_label),
-                runtime_kind: shard.runtime_kind.clone(),
-            });
-    }
-    for shard in registry
-        .advertisements()
-        .iter()
-        .flat_map(|advertisement| advertisement.model_shards.iter())
-        .filter(|shard| shard.model_id != ModelManifest::demo().model_id)
-    {
-        by_model
-            .entry(shard.model_id.clone())
-            .and_modify(|manifest| {
-                manifest.layer_count = manifest.layer_count.max(shard.layers.end);
-            })
-            .or_insert_with(|| ModelManifest {
-                model_id: shard.model_id.clone(),
-                display_name: display_name_from_model_id(&shard.model_id),
-                architecture: "unknown".to_owned(),
-                layer_count: shard.layers.end,
-                hidden_size: 0,
-                activation_dtype: "f16".to_owned(),
-                quantization: None,
-                runtime_kind: RuntimeKind::LlamaCpp,
+                model_id: seed_manifest.model_id.clone(),
+                display_name: seed_manifest.display_name.clone(),
+                architecture: seed_manifest.architecture.clone(),
+                layer_count: seed_manifest.layer_count,
+                hidden_size: seed_manifest.hidden_size,
+                activation_dtype: seed_manifest.activation_dtype.clone(),
+                quantization: seed_manifest.metadata.quantization.clone(),
+                runtime_kind: seed_manifest.runtime_kind.clone(),
             });
     }
 
@@ -1122,10 +1098,19 @@ fn ui_visible_advertisements(
         .filter_map(|mut advertisement| {
             advertisement.hosted_shards.retain(|shard| {
                 shard.runtime_kind != RuntimeKind::Demo
+                    && executable_seed_manifest_for_descriptor(shard).is_some()
                     && model_id.is_none_or(|model_id| shard.model_id == model_id)
             });
+            let executable_keys = advertisement
+                .hosted_shards
+                .iter()
+                .map(|shard| (shard.model_id.clone(), shard.layers))
+                .collect::<Vec<_>>();
             advertisement.model_shards.retain(|shard| {
                 shard.model_id != ModelManifest::demo().model_id
+                    && executable_keys.iter().any(|(model_id, layers)| {
+                        model_id == &shard.model_id && *layers == shard.layers
+                    })
                     && model_id.is_none_or(|model_id| shard.model_id == model_id)
             });
 
@@ -1149,7 +1134,36 @@ fn remote_network_peer_count(local_peer_id: &str, advertisements: &[NodeAdvertis
 }
 
 fn advertisement_has_capacity(advertisement: &NodeAdvertisement) -> bool {
-    !advertisement.hosted_shards.is_empty() || !advertisement.model_shards.is_empty()
+    advertisement
+        .hosted_shards
+        .iter()
+        .any(|shard| executable_seed_manifest_for_descriptor(shard).is_some())
+        || advertisement
+            .model_shards
+            .iter()
+            .any(|shard| executable_seed_manifest_for_model_shard(advertisement, shard).is_some())
+}
+
+fn executable_seed_manifest_for_descriptor(
+    descriptor: &ShardDescriptor,
+) -> Option<&SeedShardManifest> {
+    descriptor
+        .seed_manifest
+        .as_deref()
+        .filter(|manifest| manifest.payload_kind == PAYLOAD_KIND_GGUF_SHARD)
+}
+
+fn executable_seed_manifest_for_model_shard<'a>(
+    advertisement: &'a NodeAdvertisement,
+    shard: &ModelShardInfo,
+) -> Option<&'a SeedShardManifest> {
+    advertisement
+        .hosted_shards
+        .iter()
+        .find(|descriptor| {
+            descriptor.model_id == shard.model_id && descriptor.layers == shard.layers
+        })
+        .and_then(executable_seed_manifest_for_descriptor)
 }
 
 fn default_bootstrap_peer_ids() -> Vec<String> {
@@ -1274,36 +1288,23 @@ fn advertised_model_record_plan(
             .iter()
             .filter(|shard| shard.model_id == model_id)
         {
-            let seed_manifest = advertisement
-                .hosted_shards
-                .iter()
-                .find(|descriptor| {
-                    descriptor.model_id == info.model_id && descriptor.layers == info.layers
-                })
-                .and_then(|descriptor| descriptor.seed_manifest.as_deref())
-                .cloned();
-            let record = AdvertisedModelRecord {
-                info: info.clone(),
-                seed_manifest,
-            };
+            if executable_seed_manifest_for_model_shard(&advertisement, info).is_none() {
+                continue;
+            }
+            let record = AdvertisedModelRecord { info: info.clone() };
 
             by_range
                 .entry((info.layers.start, info.layers.end))
                 .and_modify(|existing| {
-                    if existing.seed_manifest.is_none() && record.seed_manifest.is_some() {
-                        *existing = record.clone();
-                    } else if existing.seed_manifest.is_none()
-                        && record.seed_manifest.is_none()
-                        && (
-                            record.info.version.clone(),
-                            record.info.size_bytes,
-                            record.info.checksum.clone(),
-                        ) < (
-                            existing.info.version.clone(),
-                            existing.info.size_bytes,
-                            existing.info.checksum.clone(),
-                        )
-                    {
+                    if (
+                        record.info.version.clone(),
+                        record.info.size_bytes,
+                        record.info.checksum.clone(),
+                    ) < (
+                        existing.info.version.clone(),
+                        existing.info.size_bytes,
+                        existing.info.checksum.clone(),
+                    ) {
                         *existing = record.clone();
                     }
                 })
@@ -1609,21 +1610,6 @@ fn display_name_from_source_path(path: &Path) -> Option<String> {
         .join(" ");
 
     (!name.is_empty()).then_some(name)
-}
-
-fn display_name_from_model_id(model_id: &str) -> String {
-    let name = model_id
-        .replace(['_', '-', '.'], " ")
-        .split_whitespace()
-        .map(format_model_name_part)
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    if name.is_empty() {
-        "Imported GGUF Model".to_owned()
-    } else {
-        name
-    }
 }
 
 fn model_id_from_source_path(path: &Path) -> String {
@@ -2237,8 +2223,82 @@ mod tests {
 
         assert_eq!(
             remote_network_peer_count("local-peer", &[connection_only, capacity]),
+            0
+        );
+
+        let connection_only = empty_advertisement("remote-connection".to_owned(), String::new());
+        let mut capacity = empty_advertisement("remote-capacity".to_owned(), String::new());
+        let layers = LayerRange::new(0, 8).unwrap();
+        capacity.model_shards.push(ModelShardInfo {
+            model_id: "gemma".to_owned(),
+            layers,
+            checksum: "checksum".to_owned(),
+            size_bytes: 8,
+            version: "v1".to_owned(),
+            protocol_version: PROTOCOL_VERSION,
+        });
+        capacity.hosted_shards.push(ShardDescriptor {
+            model_id: "gemma".to_owned(),
+            layers,
+            runtime_kind: RuntimeKind::LlamaCpp,
+            tokenizer: None,
+            metadata: None,
+            shard_hash: None,
+            seed_manifest: Some(Box::new(SeedShardManifest {
+                model_id: "gemma".to_owned(),
+                display_name: "Gemma".to_owned(),
+                architecture: "gemma3".to_owned(),
+                layer_count: 8,
+                hidden_size: 16,
+                activation_dtype: "f16".to_owned(),
+                runtime_kind: RuntimeKind::LlamaCpp,
+                layers,
+                tokenizer: infernet_model::TokenizerCompatibility {
+                    family: "gemma3".to_owned(),
+                    checksum: None,
+                },
+                metadata: infernet_model::ShardMetadata {
+                    architecture: "gemma3".to_owned(),
+                    quantization: Some("IQ4_XS".to_owned()),
+                    source_checksum: Some("source".to_owned()),
+                    protocol_version: PROTOCOL_VERSION,
+                },
+                source: infernet_model::SeedSourceMetadata {
+                    path: "/tmp/gemma.gguf".to_owned(),
+                    checksum_sha256: "source".to_owned(),
+                    file_size_bytes: 8,
+                },
+                shard_hash: "hash".to_owned(),
+                payload_kind: PAYLOAD_KIND_GGUF_SHARD.to_owned(),
+            })),
+        });
+
+        assert_eq!(
+            remote_network_peer_count("local-peer", &[connection_only, capacity]),
             1
         );
+    }
+
+    #[test]
+    fn available_models_ignore_orphan_model_shards() {
+        let root = std::env::temp_dir().join(format!("infernet-ui-orphan-{}", unix_ms()));
+        let cache_config = ShardCacheConfig::new(root.clone());
+        let mut registry = ShardRegistry::new();
+        let mut orphan = empty_advertisement("remote-orphan".to_owned(), String::new());
+        orphan.model_shards.push(ModelShardInfo {
+            model_id: "gemma".to_owned(),
+            layers: LayerRange::new(0, 8).unwrap(),
+            checksum: "checksum".to_owned(),
+            size_bytes: 8,
+            version: "v1".to_owned(),
+            protocol_version: PROTOCOL_VERSION,
+        });
+        registry.upsert(orphan);
+
+        assert!(available_model_views(&cache_config, Some(&registry)).is_empty());
+        assert!(manifest_for_model(Some("gemma"), &cache_config, Some(&registry)).is_err());
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
