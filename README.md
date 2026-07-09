@@ -28,13 +28,14 @@ The current implementation includes:
   bootstrap node.
 - A Tauri desktop app with a chat-first UI, model library, downloads view, and
   optional network activity details.
-- Physical GGUF layer shard creation from a local or Hugging Face GGUF file.
+- Infernet-native `.infershard` package creation from a local or Hugging Face
+  GGUF file.
 - A local shard cache with verified checksums and executable-shard metadata.
 - P2P model shard transfer over `/infernet/model-blob/1`.
 - P2P activation forwarding over `/infernet/activation/1`.
 - Route construction from live peer advertisements.
 - A patched llama.cpp bridge that can load and evaluate a contiguous layer range
-  from an Infernet physical shard.
+  from an Infernet shard package.
 
 The current GGUF runtime is correctness-first. It is not fast and it is not a
 finished product. The first bridge is intended to prove that a real GGUF model
@@ -53,7 +54,8 @@ Infernet is trying to prove that a model does not have to live on one computer.
 In the target architecture:
 
 - One node can introduce a model to the network.
-- Infernet automatically splits the model into executable layer shards.
+- Infernet automatically converts the source model into executable layer shard
+  packages.
 - Other nodes can discover those shards.
 - Nodes can download only the shards they should host.
 - Downloaders immediately become seeders.
@@ -64,11 +66,11 @@ In the target architecture:
 Today, the prototype has the first version of that loop:
 
 - A user can add a GGUF model.
-- Infernet builds real physical GGUF layer shard files.
-- Those shards are cached locally and advertised to peers.
+- Infernet builds real `.infershard` layer packages.
+- Those shard packages are cached locally and advertised to peers.
 - Other peers can fetch shard files peer-to-peer and start serving them.
 - The app only treats a peer as inference-capable when it advertises executable
-  physical shards, not loose metadata.
+  Infernet shards, not loose metadata.
 
 ## Architecture
 
@@ -114,7 +116,7 @@ The model protocols are:
 
 `/infernet/model/1` exists for model metadata and legacy record exchange.
 
-`/infernet/model-blob/1` transfers physical shard bytes in verified chunks. A
+`/infernet/model-blob/1` transfers shard payload bytes in verified chunks. A
 peer asks for a specific model id, layer range, checksum, version, offset, and
 chunk size. The receiver responds with bytes from the matching local shard file.
 
@@ -158,17 +160,29 @@ Trace events include:
 
 There is no direct TCP activation path in the default inference flow.
 
-## Physical GGUF Shards
+## Infernet Shards
 
 This is the most important current subsystem.
 
-When a user adds a `.gguf` model, Infernet does not merely store a JSON record
-or a pointer to the full file. It creates physical layer shard `.gguf` files in
-the local shard cache.
+When a user adds a `.gguf` model, Infernet treats GGUF as the source/import
+format. It does not merely store a JSON record or a pointer to the full file.
+It creates executable `.infershard` packages in the local shard cache.
 
 ### What A Shard Contains
 
-A physical Infernet GGUF shard is still a GGUF file. It contains:
+An `.infershard` is a directory package. The current package layout is:
+
+```text
+<model>-<layer-range>-<hash>.infershard/
+  manifest.json
+  tensors.gguf
+```
+
+`manifest.json` records the Infernet shard format version, runtime ABI, model
+id, layer range, checksum, source checksum, tokenizer compatibility, and payload
+metadata.
+
+`tensors.gguf` is the executable tensor payload. Today it contains:
 
 - the original GGUF metadata section
 - tokenizer-compatible metadata
@@ -178,8 +192,8 @@ A physical Infernet GGUF shard is still a GGUF file. It contains:
 - rewritten tensor offsets
 - shard checksum, size, version, and protocol metadata
 
-For a layer range `16:24`, the shard includes block tensors for layers
-`16 <= N < 24`. It excludes block tensors outside that range.
+For a layer range `16:17`, the shard includes block tensors for layer `16` and
+excludes block tensors outside that range.
 
 ### What Is Duplicated
 
@@ -191,7 +205,7 @@ This is not storage-optimal. It is a correctness-first design. Duplicating
 global tensors lets the patched llama.cpp loader initialize a partial model
 without inventing a new GGUF container format.
 
-Future shard formats should reduce this duplication.
+Future `.infershard` versions should reduce this duplication.
 
 ### What Is Not A Shard
 
@@ -209,15 +223,17 @@ construction and they should not produce model cards in the app.
 
 Users do not choose a shard size.
 
-Infernet plans contiguous layer ranges automatically from GGUF metadata. The
-current planner is simple:
+Infernet plans layer ranges automatically from GGUF metadata. The current
+planner is intentionally small-grained:
 
 - demo models use small fixed ranges
-- llama.cpp/GGUF models use contiguous layer groups
-- larger models use larger groups
+- llama.cpp/GGUF imports create one executable `.infershard` package per
+  transformer layer
 
-This is not yet hardware-aware. The future scheduler should account for RAM,
-VRAM, disk budget, bandwidth, latency, and network replication health.
+One physical layer per package gives the scheduler maximum freedom to group work
+later. The scheduler is not yet hardware-aware. The future scheduler should
+account for RAM, VRAM, disk budget, bandwidth, latency, and network replication
+health, then assign one or more physical layer shards to each capable node.
 
 ## What Happens When You Add A Model
 
@@ -232,10 +248,10 @@ From the desktop app:
    - tokenizer metadata
 3. Infernet hashes the source file.
 4. Infernet automatically plans layer ranges.
-5. Infernet writes physical shard `.gguf` files into the shard cache.
+5. Infernet writes `.infershard` packages into the shard cache.
 6. Each shard is checksummed and recorded with metadata.
 7. The node starts or refreshes the model distribution service.
-8. The node advertises only executable physical shards.
+8. The node advertises only executable Infernet shards.
 9. Other nodes can discover and download those shards.
 
 The UI shows progress for:
@@ -436,7 +452,7 @@ sharding, and inference commands.
 
 ## CLI Commands
 
-Add a local GGUF model and build physical shards:
+Add a local GGUF model and build Infernet shards:
 
 ```sh
 cargo run -p infernet-worker -- model add-local \
@@ -482,7 +498,8 @@ cargo run -p infernet-worker -- model list \
 ```
 
 `model import` is a legacy/debug path for arbitrary cache payloads. It does not
-create executable GGUF shards and should not be used for real inference.
+create executable `.infershard` packages and should not be used for real
+inference.
 
 ## Toy Split-Inference Demo
 
@@ -567,21 +584,23 @@ Current WAN limitations:
 
 ### A model appears and then says "unknown model"
 
-That means the UI saw a stale or incomplete advertisement. Current builds only
-trust executable `gguf-shard` manifests. Pull latest on every machine and re-add
-the model on the seed node so it builds physical shards.
+That means the UI saw a stale or incomplete advertisement. Current builds trust
+executable `infernet-shard` manifests, with legacy `gguf-shard` records accepted
+only for compatibility. Pull latest on every machine and re-add the model on the
+seed node so it builds `.infershard` packages.
 
 ### A route is missing `0:N`
 
 No peer is advertising executable shard coverage for those layers. Adding a
-model name is not enough. At least one peer must have physical verified shard
-files for the required layer ranges.
+model name is not enough. At least one peer must have verified `.infershard`
+packages for the required layer ranges.
 
 ### The model import reaches 100% and keeps working
 
-Hash verification is done, but shard building is still writing physical GGUF
-shard files. Current builds show `Building shards` and `Writing shard X of Y`.
-Large models can still take time because this is real disk I/O.
+Hash verification is done, but shard building is still writing `.infershard`
+packages. Current builds show `Building Infernet shards` and `Writing
+.infershard X of Y`. Large models can still take time because this is real disk
+I/O.
 
 ### The app says there are peers but no runnable model
 

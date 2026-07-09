@@ -76,8 +76,8 @@ Reusable for Infernet:
   compatibility, quantization/file type, and tensor names.
 - Tensor names make layer-range ownership computable without parsing model code
   for every architecture.
-- A shard builder can emit a sidecar manifest first, then later materialize a
-  physical shard file containing only the tensors required for a layer range.
+- A shard builder can emit an `.infershard` package containing a manifest and
+  only the tensor payload required for a layer range.
 
 Limitations:
 
@@ -230,9 +230,10 @@ Stage 1 output contains:
 - `runtime_kind = llama_cpp`;
 - `protocol_version`.
 
-Stage 2 physical shards:
+Stage 2 Infernet shard packages:
 
-- materialize a shard artifact that excludes tensors outside the layer range;
+- materialize an `.infershard` artifact that excludes tensors outside the layer
+  range;
 - include tokenizer metadata only when needed;
 - preserve enough GGUF metadata for the partial llama.cpp loader;
 - compute a shard checksum independent of the source file checksum.
@@ -372,4 +373,5 @@ The UI should visualize:
 6. Remove UI execution modes and present models as the primary navigation.
 7. Package the llama.cpp bridge as a Tauri sidecar.
 8. Add binary activation frames and session/KV metadata.
-9. Materialize physical shards and enforce workers load only their shard file.
+9. Materialize `.infershard` packages and enforce workers load only their shard
+   payload file.

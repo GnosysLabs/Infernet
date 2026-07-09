@@ -184,8 +184,7 @@ impl ModelManifest {
     pub fn automatic_layer_plan(&self) -> Result<Vec<LayerRange>, ModelError> {
         let target_layers = match self.runtime_kind {
             RuntimeKind::Demo => 3,
-            RuntimeKind::LlamaCpp if self.layer_count <= 32 => 4,
-            RuntimeKind::LlamaCpp => 8,
+            RuntimeKind::LlamaCpp => 1,
         };
 
         plan_layer_ranges(self.layer_count, target_layers)
@@ -361,15 +360,10 @@ mod tests {
         let manifest = ModelManifest::llama32_1b();
         let ranges = manifest.automatic_layer_plan().unwrap();
 
-        assert_eq!(
-            ranges,
-            vec![
-                LayerRange::new(0, 4).unwrap(),
-                LayerRange::new(4, 8).unwrap(),
-                LayerRange::new(8, 12).unwrap(),
-                LayerRange::new(12, 16).unwrap(),
-            ]
-        );
+        assert_eq!(ranges.len(), 16);
+        assert!(ranges.iter().all(|range| range.len() == 1));
+        assert_eq!(ranges[0], LayerRange::new(0, 1).unwrap());
+        assert_eq!(ranges[15], LayerRange::new(15, 16).unwrap());
         assert_eq!(
             validate_contiguous_coverage(manifest.layer_count, ranges),
             Ok(())

@@ -80,6 +80,28 @@ pub struct ShardCache {
 
 pub const PAYLOAD_KIND_METADATA_ONLY: &str = "metadata-only";
 pub const PAYLOAD_KIND_GGUF_SHARD: &str = "gguf-shard";
+pub const PAYLOAD_KIND_INFERNET_SHARD: &str = "infernet-shard";
+pub const INFERNET_SHARD_FORMAT_VERSION: &str = "infernet-shard-v1";
+pub const INFERNET_SHARD_RUNTIME_ABI: &str = "infernet-llama-layer-v1";
+pub const INFERNET_SHARD_MANIFEST_FILE: &str = "manifest.json";
+pub const INFERNET_SHARD_TENSOR_FILE: &str = "tensors.gguf";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InfernetShardPackageManifest {
+    pub format_version: String,
+    pub runtime_abi: String,
+    pub component: String,
+    pub seed_manifest: SeedShardManifest,
+    pub payload: InfernetShardPayloadManifest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InfernetShardPayloadManifest {
+    pub kind: String,
+    pub file: String,
+    pub checksum_sha256: String,
+    pub size_bytes: u64,
+}
 
 impl ShardCache {
     pub fn new(config: ShardCacheConfig) -> Result<Self> {
@@ -351,7 +373,7 @@ impl ShardCache {
                 continue;
             }
 
-            let _ = fs::remove_file(&record.path);
+            let _ = remove_cached_payload_path(&record.path);
             let _ = fs::remove_file(self.meta_path(&record.info));
             used = used.saturating_sub(record.info.size_bytes);
             evicted.push(record);
@@ -370,8 +392,10 @@ impl ShardCache {
         fs::create_dir_all(self.config.root.join("meta"))?;
 
         let data_path = self.data_path(&info, manifest.as_ref());
+        prepare_data_path(&data_path)?;
         fs::write(&data_path, payload)
             .with_context(|| format!("failed to write {}", data_path.display()))?;
+        write_infernet_shard_package_manifest(&info, &data_path, manifest.as_ref())?;
 
         let record = CachedShardRecord {
             pinned: self.config.pinned_models.contains(&info.model_id),
@@ -394,10 +418,7 @@ impl ShardCache {
         fs::create_dir_all(self.config.root.join("meta"))?;
 
         let data_path = self.data_path(&info, manifest.as_ref());
-        if data_path.exists() {
-            fs::remove_file(&data_path)
-                .with_context(|| format!("failed to replace {}", data_path.display()))?;
-        }
+        prepare_data_path(&data_path)?;
         if remove_source_after_copy {
             match fs::rename(source, &data_path) {
                 Ok(()) => {}
@@ -421,6 +442,7 @@ impl ShardCache {
                 )
             })?;
         }
+        write_infernet_shard_package_manifest(&info, &data_path, manifest.as_ref())?;
 
         let record = CachedShardRecord {
             pinned: self.config.pinned_models.contains(&info.model_id),
@@ -453,20 +475,23 @@ impl ShardCache {
     }
 
     fn data_path(&self, info: &ModelShardInfo, manifest: Option<&SeedShardManifest>) -> PathBuf {
-        let extension =
-            if manifest.is_some_and(|manifest| manifest.payload_kind == PAYLOAD_KIND_GGUF_SHARD) {
-                "gguf"
-            } else {
-                "shard"
-            };
-        self.config.root.join("data").join(format!(
+        let basename = format!(
             "{}-{}-{}-{}.{}",
             sanitize(&info.model_id),
             info.layers.start,
             info.layers.end,
             &info.checksum[..16.min(info.checksum.len())],
-            extension
-        ))
+            data_extension(manifest)
+        );
+        if manifest.is_some_and(|manifest| manifest.payload_kind == PAYLOAD_KIND_INFERNET_SHARD) {
+            self.config
+                .root
+                .join("data")
+                .join(basename)
+                .join(INFERNET_SHARD_TENSOR_FILE)
+        } else {
+            self.config.root.join("data").join(basename)
+        }
     }
 
     fn meta_path(&self, info: &ModelShardInfo) -> PathBuf {
@@ -478,6 +503,86 @@ impl ShardCache {
             &info.checksum[..16.min(info.checksum.len())]
         ))
     }
+}
+
+fn data_extension(manifest: Option<&SeedShardManifest>) -> &'static str {
+    match manifest.map(|manifest| manifest.payload_kind.as_str()) {
+        Some(PAYLOAD_KIND_INFERNET_SHARD) => "infershard",
+        Some(PAYLOAD_KIND_GGUF_SHARD) => "gguf",
+        _ => "shard",
+    }
+}
+
+fn prepare_data_path(path: &Path) -> Result<()> {
+    if let Some(package_dir) = infernet_shard_package_dir(path) {
+        if package_dir.exists() {
+            fs::remove_dir_all(package_dir)
+                .with_context(|| format!("failed to replace {}", package_dir.display()))?;
+        }
+        fs::create_dir_all(package_dir)
+            .with_context(|| format!("failed to create {}", package_dir.display()))?;
+        return Ok(());
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    if path.exists() {
+        fs::remove_file(path).with_context(|| format!("failed to replace {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn remove_cached_payload_path(path: &Path) -> Result<()> {
+    if let Some(package_dir) = infernet_shard_package_dir(path) {
+        if package_dir.exists() {
+            fs::remove_dir_all(package_dir)
+                .with_context(|| format!("failed to remove {}", package_dir.display()))?;
+        }
+        return Ok(());
+    }
+
+    if path.exists() {
+        fs::remove_file(path).with_context(|| format!("failed to remove {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn infernet_shard_package_dir(path: &Path) -> Option<&Path> {
+    let parent = path.parent()?;
+    (parent.extension().and_then(|value| value.to_str()) == Some("infershard")).then_some(parent)
+}
+
+fn write_infernet_shard_package_manifest(
+    info: &ModelShardInfo,
+    payload_path: &Path,
+    manifest: Option<&SeedShardManifest>,
+) -> Result<()> {
+    let Some(manifest) =
+        manifest.filter(|manifest| manifest.payload_kind == PAYLOAD_KIND_INFERNET_SHARD)
+    else {
+        return Ok(());
+    };
+    let Some(package_dir) = infernet_shard_package_dir(payload_path) else {
+        return Ok(());
+    };
+
+    let package_manifest = InfernetShardPackageManifest {
+        format_version: INFERNET_SHARD_FORMAT_VERSION.to_owned(),
+        runtime_abi: INFERNET_SHARD_RUNTIME_ABI.to_owned(),
+        component: "transformer_layer".to_owned(),
+        seed_manifest: manifest.clone(),
+        payload: InfernetShardPayloadManifest {
+            kind: "gguf_tensor_payload".to_owned(),
+            file: INFERNET_SHARD_TENSOR_FILE.to_owned(),
+            checksum_sha256: info.checksum.clone(),
+            size_bytes: info.size_bytes,
+        },
+    };
+    let path = package_dir.join(INFERNET_SHARD_MANIFEST_FILE);
+    fs::write(&path, serde_json::to_vec_pretty(&package_manifest)?)
+        .with_context(|| format!("failed to write {}", path.display()))
 }
 
 pub fn source_cache_root(config: &ShardCacheConfig) -> PathBuf {
@@ -516,7 +621,10 @@ pub fn executable_source_path_for_manifest(
 
 pub fn is_executable_shard_record(record: &CachedShardRecord) -> bool {
     record.manifest.as_ref().is_some_and(|manifest| {
-        manifest.payload_kind == PAYLOAD_KIND_GGUF_SHARD && record.path.is_file()
+        matches!(
+            manifest.payload_kind.as_str(),
+            PAYLOAD_KIND_GGUF_SHARD | PAYLOAD_KIND_INFERNET_SHARD
+        ) && record.path.is_file()
     })
 }
 
@@ -644,7 +752,7 @@ pub fn import_seed_model_from_file_with_build_progress(
             },
             source: source_metadata.clone(),
             shard_hash: seed_shard_hash(&manifest.model_id, layers, &source_checksum),
-            payload_kind: PAYLOAD_KIND_GGUF_SHARD.to_owned(),
+            payload_kind: PAYLOAD_KIND_INFERNET_SHARD.to_owned(),
         };
         let record = cache.import_physical_shard_file(
             &shard_summary.path,
@@ -847,6 +955,79 @@ mod tests {
             executable_source_path_for_manifest(&config, &manifest),
             Some(cached_source)
         );
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn infernet_shards_are_stored_as_packages() {
+        let temp =
+            std::env::temp_dir().join(format!("infernet-package-test-{}", uuid::Uuid::new_v4()));
+        let source = temp.join("layer.gguf");
+        fs::create_dir_all(&temp).unwrap();
+        fs::write(&source, b"layer tensor payload").unwrap();
+        let cache = ShardCache::new(ShardCacheConfig::new(temp.join("cache"))).unwrap();
+        let layers = LayerRange::new(3, 4).unwrap();
+        let manifest = SeedShardManifest {
+            model_id: "gemma".to_owned(),
+            display_name: "Gemma".to_owned(),
+            architecture: "gemma".to_owned(),
+            layer_count: 48,
+            hidden_size: 3840,
+            activation_dtype: "f16".to_owned(),
+            runtime_kind: infernet_model::RuntimeKind::LlamaCpp,
+            layers,
+            tokenizer: TokenizerCompatibility {
+                family: "gemma".to_owned(),
+                checksum: None,
+            },
+            metadata: ShardMetadata {
+                architecture: "gemma".to_owned(),
+                quantization: Some("IQ4_XS".to_owned()),
+                source_checksum: Some("source".to_owned()),
+                protocol_version: PROTOCOL_VERSION,
+            },
+            source: SeedSourceMetadata {
+                path: "/models/gemma.gguf".to_owned(),
+                checksum_sha256: "source".to_owned(),
+                file_size_bytes: 128,
+            },
+            shard_hash: "hash".to_owned(),
+            payload_kind: PAYLOAD_KIND_INFERNET_SHARD.to_owned(),
+        };
+
+        let record = cache
+            .import_physical_shard_file(&source, "gemma", layers, "v1", manifest.clone())
+            .unwrap();
+
+        assert_eq!(
+            record.path.file_name().and_then(|value| value.to_str()),
+            Some(INFERNET_SHARD_TENSOR_FILE)
+        );
+        let package_dir = record.path.parent().unwrap();
+        assert_eq!(
+            package_dir.extension().and_then(|value| value.to_str()),
+            Some("infershard")
+        );
+        let package_manifest_path = package_dir.join(INFERNET_SHARD_MANIFEST_FILE);
+        let package_manifest = serde_json::from_slice::<InfernetShardPackageManifest>(
+            &fs::read(package_manifest_path).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            package_manifest.format_version,
+            INFERNET_SHARD_FORMAT_VERSION
+        );
+        assert_eq!(package_manifest.runtime_abi, INFERNET_SHARD_RUNTIME_ABI);
+        assert_eq!(package_manifest.component, "transformer_layer");
+        assert_eq!(package_manifest.seed_manifest, manifest);
+        assert_eq!(package_manifest.payload.file, INFERNET_SHARD_TENSOR_FILE);
+        assert_eq!(
+            cache.read_payload(&record.info).unwrap(),
+            b"layer tensor payload"
+        );
+        assert!(is_executable_shard_record(&record));
 
         let _ = fs::remove_dir_all(temp);
     }

@@ -32,11 +32,14 @@ use libp2p::{
     tcp, yamux,
 };
 pub use model_distribution::{
-    CachedShardRecord, PAYLOAD_KIND_GGUF_SHARD, PAYLOAD_KIND_METADATA_ONLY, SeedShardBuildProgress,
-    SeededModelSummary, ShardCache, ShardCacheConfig, ShardCacheStats,
-    executable_source_path_for_manifest, import_seed_model_from_file,
-    import_seed_model_from_file_with_build_progress, import_seed_model_from_file_with_progress,
-    is_executable_shard_record, sha256_bytes, sha256_file, source_cache_path, source_cache_root,
+    CachedShardRecord, INFERNET_SHARD_FORMAT_VERSION, INFERNET_SHARD_MANIFEST_FILE,
+    INFERNET_SHARD_RUNTIME_ABI, INFERNET_SHARD_TENSOR_FILE, InfernetShardPackageManifest,
+    InfernetShardPayloadManifest, PAYLOAD_KIND_GGUF_SHARD, PAYLOAD_KIND_INFERNET_SHARD,
+    PAYLOAD_KIND_METADATA_ONLY, SeedShardBuildProgress, SeededModelSummary, ShardCache,
+    ShardCacheConfig, ShardCacheStats, executable_source_path_for_manifest,
+    import_seed_model_from_file, import_seed_model_from_file_with_build_progress,
+    import_seed_model_from_file_with_progress, is_executable_shard_record, sha256_bytes,
+    sha256_file, source_cache_path, source_cache_root,
 };
 use serde::Deserialize;
 use tokio::time::{Instant, interval, sleep};
@@ -1246,7 +1249,11 @@ fn refresh_advertisement_model_shards(
 fn seed_record_is_executable(config: &ShardCacheConfig, manifest: &SeedShardManifest) -> bool {
     let _ = config;
     manifest.runtime_kind == RuntimeKind::Demo
-        || manifest.payload_kind == model_distribution::PAYLOAD_KIND_GGUF_SHARD
+        || matches!(
+            manifest.payload_kind.as_str(),
+            model_distribution::PAYLOAD_KIND_GGUF_SHARD
+                | model_distribution::PAYLOAD_KIND_INFERNET_SHARD
+        )
 }
 
 pub fn process_activation_step(
@@ -2199,7 +2206,7 @@ fn model_shard_response_from_cache(
         return ModelShardResponse::failure(
             request,
             peer_id.to_owned(),
-            "physical GGUF shards must be fetched with the chunked model blob protocol",
+            "executable Infernet shards must be fetched with the chunked model blob protocol",
         );
     }
 
@@ -2914,7 +2921,11 @@ fn select_model_shard_candidate(
                         })
                         .and_then(|descriptor| descriptor.seed_manifest.as_deref())
                         .filter(|manifest| {
-                            manifest.payload_kind == model_distribution::PAYLOAD_KIND_GGUF_SHARD
+                            matches!(
+                                manifest.payload_kind.as_str(),
+                                model_distribution::PAYLOAD_KIND_GGUF_SHARD
+                                    | model_distribution::PAYLOAD_KIND_INFERNET_SHARD
+                            )
                         })
                         .cloned();
 
@@ -3194,7 +3205,7 @@ mod tests {
                 file_size_bytes: 16,
             },
             shard_hash: "seed-hash".to_owned(),
-            payload_kind: model_distribution::PAYLOAD_KIND_GGUF_SHARD.to_owned(),
+            payload_kind: model_distribution::PAYLOAD_KIND_INFERNET_SHARD.to_owned(),
         };
         cache
             .import_physical_shard_file(&shard_file, "gemma", layers, "v1", manifest)

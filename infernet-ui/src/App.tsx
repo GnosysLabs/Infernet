@@ -734,7 +734,7 @@ function NetworkActivity({
       <div className="activity-section">
         <div className="activity-section-title">
           <strong>Discovered Executable Peers</strong>
-          <span>{snapshot.peers.length > 0 ? "Peers advertising verified physical shards" : "No executable shard peers visible yet"}</span>
+          <span>{snapshot.peers.length > 0 ? "Peers advertising verified Infernet shards" : "No executable shard peers visible yet"}</span>
         </div>
         {snapshot.peers.length === 0 ? (
           <div className="empty-state compact">Connected peers have not advertised executable shards for this model.</div>
@@ -1076,7 +1076,7 @@ function ModelsPage({
                 <CheckCircle2 size={18} />
                 <div>
                   <strong>{result.displayName} added</strong>
-                  <span>Infernet is sharing it with the network. Compute support for GGUF layer execution is still in progress.</span>
+                  <span>Infernet built executable .infershard packages and is sharing them with the network.</span>
                 </div>
               </div>
             ) : null}
@@ -1175,7 +1175,7 @@ function DownloadsPage({
       <div className="download-panel">
         <div className="activity-section-title">
           <strong>Installed Shards</strong>
-          <span>{distribution.installedShards.length} verified physical shard{distribution.installedShards.length === 1 ? "" : "s"} stored locally</span>
+          <span>{distribution.installedShards.length} verified Infernet shard{distribution.installedShards.length === 1 ? "" : "s"} stored locally</span>
         </div>
         <div className="download-list">
           {distribution.installedShards.length === 0 ? (

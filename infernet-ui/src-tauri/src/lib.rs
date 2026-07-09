@@ -15,10 +15,10 @@ use infernet_model::{
     gguf::parse_gguf_info,
 };
 use infernet_node::{
-    DiscoveryConfig, PAYLOAD_KIND_GGUF_SHARD, SeedShardBuildProgress, SeededModelSummary,
-    ShardCache, ShardCacheConfig, discover_for, empty_advertisement, fetch_model_shard_over_libp2p,
-    import_seed_model_from_file_with_build_progress, infer_over_libp2p, is_executable_shard_record,
-    run_model_distribution_node,
+    DiscoveryConfig, PAYLOAD_KIND_GGUF_SHARD, PAYLOAD_KIND_INFERNET_SHARD, SeedShardBuildProgress,
+    SeededModelSummary, ShardCache, ShardCacheConfig, discover_for, empty_advertisement,
+    fetch_model_shard_over_libp2p, import_seed_model_from_file_with_build_progress,
+    infer_over_libp2p, is_executable_shard_record, run_model_distribution_node,
 };
 use infernet_protocol::{
     ModelShardInfo, NodeAdvertisement, PROTOCOL_VERSION, RouteHop, TraceEvent,
@@ -480,9 +480,9 @@ async fn add_local_gguf_model(
             emit_model_import_progress(
                 &app,
                 &manifest.model_id,
-                "Building shards",
+                "Building Infernet shards",
                 format!(
-                    "Writing shard {} of {} for layers {}:{}",
+                    "Writing .infershard {} of {} for layer {}:{}",
                     progress.shard_index,
                     progress.shard_count,
                     progress.layers.start,
@@ -694,9 +694,9 @@ async fn add_huggingface_model(
             emit_model_import_progress(
                 &app,
                 &manifest.model_id,
-                "Building shards",
+                "Building Infernet shards",
                 format!(
-                    "Writing shard {} of {} for layers {}:{}",
+                    "Writing .infershard {} of {} for layer {}:{}",
                     progress.shard_index,
                     progress.shard_count,
                     progress.layers.start,
@@ -1345,7 +1345,7 @@ fn discovered_model_manifests(registry: &ShardRegistry) -> Vec<ModelManifest> {
         let Some(seed_manifest) = shard.seed_manifest.as_deref() else {
             continue;
         };
-        if seed_manifest.payload_kind != PAYLOAD_KIND_GGUF_SHARD {
+        if !seed_manifest_has_executable_payload(seed_manifest) {
             continue;
         }
         by_model
@@ -1433,7 +1433,7 @@ fn executable_seed_manifest_for_descriptor(
     descriptor
         .seed_manifest
         .as_deref()
-        .filter(|manifest| manifest.payload_kind == PAYLOAD_KIND_GGUF_SHARD)
+        .filter(|manifest| seed_manifest_has_executable_payload(manifest))
 }
 
 fn executable_seed_manifest_for_model_shard<'a>(
@@ -1817,7 +1817,14 @@ fn local_cache_advertisement(
 
 fn seed_record_is_executable(config: &ShardCacheConfig, manifest: &SeedShardManifest) -> bool {
     let _ = config;
-    manifest.runtime_kind == RuntimeKind::Demo || manifest.payload_kind == PAYLOAD_KIND_GGUF_SHARD
+    manifest.runtime_kind == RuntimeKind::Demo || seed_manifest_has_executable_payload(manifest)
+}
+
+fn seed_manifest_has_executable_payload(manifest: &SeedShardManifest) -> bool {
+    matches!(
+        manifest.payload_kind.as_str(),
+        PAYLOAD_KIND_GGUF_SHARD | PAYLOAD_KIND_INFERNET_SHARD
+    )
 }
 
 fn local_source_path_for_model(cache_config: &ShardCacheConfig, model_id: &str) -> Option<PathBuf> {
@@ -1872,9 +1879,9 @@ fn add_model_response_from_summary(summary: SeededModelSummary) -> AddModelRespo
             })
             .collect(),
         message: if summary.metadata_only {
-            "This import did not create executable GGUF shards and will not be advertised for inference.".to_owned()
+            "This import did not create executable Infernet shards and will not be advertised for inference.".to_owned()
         } else {
-            "Model shards are installed and seeding to the network.".to_owned()
+            "Infernet shards are installed and seeding to the network.".to_owned()
         },
     }
 }
@@ -2552,7 +2559,7 @@ mod tests {
                     file_size_bytes: 8,
                 },
                 shard_hash: "hash".to_owned(),
-                payload_kind: PAYLOAD_KIND_GGUF_SHARD.to_owned(),
+                payload_kind: PAYLOAD_KIND_INFERNET_SHARD.to_owned(),
             })),
         });
 
@@ -2662,7 +2669,7 @@ mod tests {
                 file_size_bytes: 123,
             },
             shard_hash: "hash".to_owned(),
-            payload_kind: PAYLOAD_KIND_GGUF_SHARD.to_owned(),
+            payload_kind: PAYLOAD_KIND_INFERNET_SHARD.to_owned(),
         };
         cache
             .import_physical_shard_file(
@@ -2707,7 +2714,7 @@ mod tests {
         let cache = ShardCache::new(cache_config.clone()).unwrap();
         std::fs::create_dir_all(&root).unwrap();
         let shard_file = root.join("remote-shard.gguf");
-        let shard_bytes = b"physical shard payload";
+        let shard_bytes = b"infernet shard payload";
         std::fs::write(&shard_file, shard_bytes).unwrap();
         let layers = LayerRange::new(0, 8).unwrap();
         let seed_manifest = SeedShardManifest {
@@ -2735,7 +2742,7 @@ mod tests {
                 file_size_bytes: 12_345,
             },
             shard_hash: "seed-hash".to_owned(),
-            payload_kind: PAYLOAD_KIND_GGUF_SHARD.to_owned(),
+            payload_kind: PAYLOAD_KIND_INFERNET_SHARD.to_owned(),
         };
 
         let record = cache
@@ -2798,7 +2805,7 @@ mod tests {
                 file_size_bytes: 16,
             },
             shard_hash: "hash".to_owned(),
-            payload_kind: PAYLOAD_KIND_GGUF_SHARD.to_owned(),
+            payload_kind: PAYLOAD_KIND_INFERNET_SHARD.to_owned(),
         };
         let installed = cache
             .import_physical_shard_file(
