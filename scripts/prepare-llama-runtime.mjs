@@ -66,11 +66,19 @@ function main() {
     return;
   }
 
-  if (isWindows && prepareWindowsPrebuilt() && fileExists(bridgeSidecarPath)) {
+  const preparedPrebuilt =
+    (isWindows && prepareWindowsPrebuilt()) || (isMacos && prepareMacosPrebuilt());
+  if (preparedPrebuilt && fileExists(bridgeSidecarPath)) {
     return;
   }
-  if (isMacos && prepareMacosPrebuilt() && fileExists(bridgeSidecarPath)) {
-    return;
+  if (preparedPrebuilt) {
+    const missingTools = missingSourceBuildTools();
+    if (missingTools.length > 0) {
+      prepareFallbackBridge(
+        `source bridge build tools missing: ${missingTools.join(", ")}`
+      );
+      return;
+    }
   }
 
   buildFromSource();
@@ -228,6 +236,32 @@ function buildFromSource() {
 
   copyRuntime(built, sidecarPath, "llama.cpp source build");
   copyRuntime(bridgeBuilt, bridgeSidecarPath, "Infernet llama.cpp bridge source build");
+}
+
+function prepareFallbackBridge(reason) {
+  if (process.env.INFERNET_REQUIRE_REAL_LLAMA_BRIDGE === "1") {
+    fail(`${reason}; refusing fallback bridge because INFERNET_REQUIRE_REAL_LLAMA_BRIDGE=1`);
+  }
+
+  log(`${reason}; preparing fallback Infernet bridge so the app can start`);
+  run("cargo", [
+    "build",
+    "--release",
+    "-p",
+    "infernet-llama-bridge-stub",
+    "--bin",
+    "infernet-llama-bridge",
+  ]);
+
+  const built = [
+    resolve(repoRoot, "target", "release", `infernet-llama-bridge${executableSuffix}`),
+    resolve(repoRoot, "target", "release", "infernet-llama-bridge"),
+  ].find(fileExists);
+  if (!built) {
+    fail("fallback Infernet bridge build finished, but the binary was not found");
+  }
+  copyRuntime(built, bridgeSidecarPath, "fallback Infernet llama.cpp bridge");
+  log("fallback bridge is for app startup and whole-model local fallback only; real split-layer GGUF execution still needs the CMake-built bridge");
 }
 
 function prepareInfernetBridgeSource() {
@@ -665,6 +699,15 @@ function ensureCommand(command) {
   if (result.error || result.status !== 0) {
     fail(`required build tool is missing: ${command}`);
   }
+}
+
+function missingSourceBuildTools() {
+  return ["git", "cmake"].filter((command) => !commandAvailable(command));
+}
+
+function commandAvailable(command) {
+  const result = spawnSync(command, ["--version"], { encoding: "utf8" });
+  return !result.error && result.status === 0;
 }
 
 function downloadText(url) {

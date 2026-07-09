@@ -5,6 +5,7 @@ members = [
     "crates/infernet-runtime",
     "crates/infernet-router",
     "crates/infernet-node",
+    "crates/infernet-llama-bridge-stub",
     "crates/infernet-worker",
     "infernet-ui/src-tauri",
 ]

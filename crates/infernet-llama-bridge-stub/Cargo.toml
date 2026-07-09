@@ -1,0 +1,13 @@
+[package]
+name = "infernet-llama-bridge-stub"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "infernet-llama-bridge"
+path = "src/main.rs"
+
+[dependencies]
+serde_json.workspace = true
