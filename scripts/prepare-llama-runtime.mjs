@@ -18,6 +18,7 @@ const repoRoot = resolve(scriptDir, "..");
 const quiet = process.argv.includes("--quiet");
 const targetTriple = process.env.TARGET || rustTargetTriple();
 const isWindows = targetTriple.includes("windows");
+const isMacos = targetTriple.includes("darwin");
 const executableSuffix = isWindows ? ".exe" : "";
 const sidecarBase = resolve(repoRoot, "infernet-ui", "src-tauri", "binaries", "llama-cli");
 const sidecarPath = `${sidecarBase}-${targetTriple}${executableSuffix}`;
@@ -55,6 +56,9 @@ function main() {
   }
 
   if (isWindows && prepareWindowsPrebuilt()) {
+    return;
+  }
+  if (isMacos && prepareMacosPrebuilt()) {
     return;
   }
 
@@ -102,6 +106,47 @@ function prepareWindowsPrebuilt() {
     return true;
   } catch (error) {
     log(`failed to prepare official Windows llama.cpp runtime: ${error.message}`);
+    return false;
+  }
+}
+
+function prepareMacosPrebuilt() {
+  const arch = targetTriple.includes("aarch64") ? "arm64" : "x64";
+  const assetPattern = new RegExp(`^llama-.+-bin-macos-${arch}\\.tar\\.gz$`);
+  const api = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest";
+
+  try {
+    const release = JSON.parse(downloadText(api));
+    const asset = release.assets?.find((asset) => assetPattern.test(asset.name));
+    if (!asset?.browser_download_url) {
+      log(`no official llama.cpp macOS ${arch} prebuilt asset found`);
+      return false;
+    }
+
+    mkdirSync(downloadDir, { recursive: true });
+    rmSync(prebuiltDir, { recursive: true, force: true });
+    mkdirSync(prebuiltDir, { recursive: true });
+
+    const tarPath = join(downloadDir, asset.name);
+    if (!fileExists(tarPath)) {
+      downloadFile(asset.browser_download_url, tarPath);
+    }
+
+    run("tar", ["-xzf", tarPath, "-C", prebuiltDir]);
+
+    const cli = findFileRecursive(prebuiltDir, "llama-cli");
+    if (!cli) {
+      log(`official llama.cpp prebuilt ${asset.name} did not contain llama-cli`);
+      return false;
+    }
+
+    const label = `official llama.cpp ${asset.name}`;
+    copyRuntime(cli, label, { validate: false });
+    copyRuntimeDylibs(dirname(cli));
+    validatePreparedRuntime(label);
+    return true;
+  } catch (error) {
+    log(`failed to prepare official macOS llama.cpp runtime: ${error.message}`);
     return false;
   }
 }
@@ -175,7 +220,7 @@ function cmakeTargets() {
     .filter(Boolean);
 }
 
-function copyRuntime(source, label) {
+function copyRuntime(source, label, options = {}) {
   const absolute = resolve(source);
   if (!fileExists(absolute)) {
     fail(`${label} did not point to an executable file: ${source}`);
@@ -184,6 +229,13 @@ function copyRuntime(source, label) {
   if (!isWindows) {
     run("chmod", ["755", sidecarPath]);
   }
+  if (options.validate === false) {
+    return;
+  }
+  validatePreparedRuntime(label);
+}
+
+function validatePreparedRuntime(label) {
   const validation = validateRuntime(sidecarPath);
   if (!validation.ok) {
     unlinkSync(sidecarPath);
@@ -199,6 +251,13 @@ function copyRuntimeDlls(directory) {
   }
 }
 
+function copyRuntimeDylibs(directory) {
+  const outputDir = dirname(sidecarPath);
+  for (const dylib of findFilesRecursive(directory, (path) => path.toLowerCase().endsWith(".dylib"))) {
+    copyFileSync(dylib, join(outputDir, basename(dylib)));
+  }
+}
+
 function validateRuntime(path) {
   if (process.platform === "darwin") {
     const result = spawnSync("otool", ["-L", path], { encoding: "utf8" });
@@ -208,12 +267,7 @@ function validateRuntime(path) {
     const badDependency = result.stdout
       .split(/\r?\n/)
       .map((line) => line.trim())
-      .find((line) =>
-        line.startsWith("/opt/homebrew/")
-        || line.startsWith("/usr/local/")
-        || line.includes("libggml")
-        || line.includes("libllama")
-      );
+      .find((line) => invalidMacosDependency(line, dirname(path)));
     if (badDependency) {
       return { ok: false, reason: `depends on non-bundled library ${badDependency.split(/\s+/)[0]}` };
     }
@@ -233,6 +287,35 @@ function validateRuntime(path) {
   }
 
   return { ok: true };
+}
+
+function invalidMacosDependency(line, runtimeDir) {
+  const dependency = line.split(/\s+/)[0];
+  if (!dependency || dependency.endsWith(":")) {
+    return false;
+  }
+  if (dependency.startsWith("/opt/homebrew/") || dependency.startsWith("/usr/local/")) {
+    return true;
+  }
+
+  const name = basename(dependency);
+  const isLlamaDependency =
+    name.startsWith("libggml")
+    || name.startsWith("libllama")
+    || name.startsWith("libmtmd");
+  if (!isLlamaDependency) {
+    return false;
+  }
+
+  if (
+    dependency.startsWith("@rpath/")
+    || dependency.startsWith("@loader_path/")
+    || dependency.startsWith("@executable_path/")
+  ) {
+    return !fileExists(join(runtimeDir, name));
+  }
+
+  return true;
 }
 
 function rustTargetTriple() {
@@ -348,7 +431,7 @@ function findFilesRecursive(root, predicate) {
       const path = join(current, entry.name);
       if (entry.isDirectory()) {
         stack.push(path);
-      } else if (entry.isFile() && predicate(path)) {
+      } else if ((entry.isFile() || entry.isSymbolicLink()) && predicate(path)) {
         matches.push(path);
       }
     }
