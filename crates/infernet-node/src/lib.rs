@@ -50,6 +50,7 @@ pub struct DiscoveryConfig {
     pub publish_interval: Duration,
     pub advertise_listen_addresses: bool,
     pub dial_discovered_peers: bool,
+    pub relay_advertisements: bool,
 }
 
 impl DiscoveryConfig {
@@ -63,6 +64,7 @@ impl DiscoveryConfig {
             publish_interval: Duration::from_millis(750),
             advertise_listen_addresses: true,
             dial_discovered_peers: true,
+            relay_advertisements: false,
         }
     }
 
@@ -274,6 +276,14 @@ pub async fn run_model_distribution_node(
                 refresh_advertisement_model_shards(&mut discovery.advertisement, Some(&shard_cache))?;
                 if let Some(advertisement) = &discovery.advertisement {
                     publish_advertisement(&mut swarm, &topic, advertisement)?;
+                }
+                if discovery.relay_advertisements {
+                    publish_known_advertisements(
+                        &mut swarm,
+                        &topic,
+                        &registry,
+                        discovery.peer_id(),
+                    )?;
                 }
             }
             event = swarm.select_next_some() => {
@@ -1113,6 +1123,7 @@ fn handle_grid_event(
         SwarmEvent::ConnectionEstablished {
             peer_id, endpoint, ..
         } => {
+            swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
             println!(
                 "libp2p_connected peer_id={} endpoint={:?}",
                 peer_id, endpoint
@@ -1310,6 +1321,23 @@ fn publish_advertisement(
             gossipsub::PublishError::NoPeersSubscribedToTopic => Ok(()),
             error => Err(anyhow!("failed to publish shard advertisement: {error}")),
         })
+}
+
+fn publish_known_advertisements(
+    swarm: &mut Swarm<GridBehaviour>,
+    topic: &gossipsub::IdentTopic,
+    registry: &ShardRegistry,
+    local_peer_id: PeerId,
+) -> Result<()> {
+    let local_peer_id = local_peer_id.to_string();
+    for advertisement in registry.advertisements() {
+        if advertisement.peer_id == local_peer_id {
+            continue;
+        }
+        publish_advertisement(swarm, topic, &advertisement)?;
+    }
+
+    Ok(())
 }
 
 fn update_listen_address(

@@ -250,6 +250,7 @@ async fn bootstrap(args: BootstrapArgs) -> Result<()> {
     discovery.p2p_listen = args.p2p_listen.clone();
     discovery.advertise_listen_addresses = false;
     discovery.dial_discovered_peers = false;
+    discovery.relay_advertisements = true;
 
     let mut bootstrap_advertisement = empty_advertisement(peer_id.clone(), String::new());
     if let Some(ip) = args.public_ip.as_deref() {
