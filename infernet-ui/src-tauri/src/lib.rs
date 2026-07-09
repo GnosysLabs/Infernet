@@ -1477,7 +1477,22 @@ async fn generate_with_llama_cli(
         ));
     }
 
-    let output = Command::new(&llama_cli)
+    let mut command = Command::new(&llama_cli);
+    if let Some(runtime_dir) = llama_cli.parent() {
+        command.current_dir(runtime_dir);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let mut library_dirs = llama_runtime_library_dirs(Some(app), &llama_cli);
+        if let Some(path) = env::var_os("PATH") {
+            library_dirs.extend(env::split_paths(&path));
+        }
+        if let Ok(path) = env::join_paths(library_dirs) {
+            command.env("PATH", path);
+        }
+    }
+
+    let output = command
         .arg("-m")
         .arg(&model_path)
         .arg("-p")
@@ -1510,6 +1525,31 @@ async fn generate_with_llama_cli(
     }
 
     Ok(stdout)
+}
+
+#[cfg(target_os = "windows")]
+fn llama_runtime_library_dirs(app: Option<&AppHandle>, llama_cli: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    if let Some(parent) = llama_cli.parent() {
+        dirs.push(parent.to_path_buf());
+    }
+    if let Some(app) = app {
+        if let Ok(resource_dir) = app.path().resource_dir() {
+            dirs.push(resource_dir.clone());
+            dirs.push(resource_dir.join("binaries"));
+        }
+    }
+    if let Ok(current_exe) = env::current_exe() {
+        if let Some(parent) = current_exe.parent() {
+            dirs.push(parent.to_path_buf());
+            dirs.push(parent.join("binaries"));
+        }
+    }
+
+    dirs.sort();
+    dirs.dedup();
+    dirs
 }
 
 fn local_source_path_for_model(cache_config: &ShardCacheConfig, model_id: &str) -> Option<PathBuf> {
@@ -2518,9 +2558,12 @@ mod tests {
 
         let mut registry = ShardRegistry::new();
         registry.upsert(advertisement);
-        let manifest =
-            manifest_for_model(Some("gemma-4-12b-it-iq4-xs"), &cache_config, Some(&registry))
-                .unwrap();
+        let manifest = manifest_for_model(
+            Some("gemma-4-12b-it-iq4-xs"),
+            &cache_config,
+            Some(&registry),
+        )
+        .unwrap();
         let route = registry.route_for_model(&manifest).unwrap();
         assert_eq!(route.len(), 1);
         assert_eq!(route[0].layers, layers);

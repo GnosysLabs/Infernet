@@ -28,6 +28,9 @@
     "targets": "all",
     "externalBin": [
       "binaries/llama-cli"
+    ],
+    "resources": [
+      "binaries"
     ]
   }
 }
