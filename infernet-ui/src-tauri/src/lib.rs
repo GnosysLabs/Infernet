@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::path::Path;
 use std::time::Duration;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -8,17 +10,23 @@ use std::{
 };
 
 use futures::channel::oneshot;
-use infernet_model::{LayerRange, ModelManifest, RuntimeKind, SeedShardManifest, ShardDescriptor};
+use infernet_model::{
+    LayerRange, ModelManifest, OfficialComponentKind, OfficialModelRelease, RuntimeKind,
+    SeedShardManifest, ShardDescriptor,
+};
 use infernet_node::{
     DiscoveryConfig, PAYLOAD_KIND_FULL_MODEL, PAYLOAD_KIND_GGUF_SHARD, PAYLOAD_KIND_INFERNET_SHARD,
-    ShardCache, ShardCacheConfig, discover_for, empty_advertisement,
+    ShardCache, ShardCacheConfig, discover_for, empty_advertisement, enrich_local_advertisement,
     fetch_model_shard_over_libp2p, infer_over_libp2p, is_executable_shard_record,
-    run_model_distribution_node_with_readiness, seed_manifest_for_network,
+    local_capability_advertisement, run_model_distribution_node_with_readiness,
+    seed_manifest_for_network,
 };
 use infernet_protocol::{
     ModelShardInfo, NodeAdvertisement, PROTOCOL_VERSION, RouteHop, TraceEvent,
 };
-use infernet_router::ShardRegistry;
+use infernet_router::{
+    CapacityPlanningConfig, FixedModelComponent, ShardRegistry, plan_fixed_components,
+};
 use libp2p::{Multiaddr, PeerId, identity};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -28,6 +36,10 @@ const DEFAULT_DISCOVERY_TIMEOUT_MS: u64 = 4_000;
 const DEFAULT_INFERENCE_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_MODEL_FETCH_TIMEOUT_MS: u64 = 60 * 60 * 1_000;
 const UI_LISTEN_PORT: u16 = 9777;
+const OFFICIAL_CHAT_MODEL_ID: &str = "infernet-chat-v1";
+const LAUNCH_KV_CACHE_BYTES_PER_LAYER: u64 = 32 * 1024 * 1024;
+const RUNTIME_SCRATCH_BYTES_PER_PEER: u64 = 768 * 1024 * 1024;
+const CAPACITY_SAFETY_BYTES: u64 = 1024 * 1024 * 1024;
 const DEFAULT_BOOTSTRAP_PEERS: &[&str] = &[
     "12D3KooWRJrnpHPQTWdThpDGZMwRCHhEBL4JCAxFMwYMfFavxa2h@/ip4/217.77.11.197/tcp/9777/p2p/12D3KooWRJrnpHPQTWdThpDGZMwRCHhEBL4JCAxFMwYMfFavxa2h",
     "12D3KooWRJrnpHPQTWdThpDGZMwRCHhEBL4JCAxFMwYMfFavxa2h@/dns4/infernet.gnosyslabs.xyz/tcp/9777/p2p/12D3KooWRJrnpHPQTWdThpDGZMwRCHhEBL4JCAxFMwYMfFavxa2h",
@@ -82,6 +94,7 @@ struct GridSnapshot {
     layer_count: u32,
     network_peer_count: usize,
     peers: Vec<PeerView>,
+    machines: Vec<MachineView>,
     route: Vec<RouteHopView>,
     missing_ranges: Option<String>,
     coverage: Vec<CoverageSegment>,
@@ -110,6 +123,26 @@ struct PeerView {
     addresses: Vec<String>,
     protocol_version: u32,
     shards: Vec<ShardView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MachineView {
+    peer_id: String,
+    short_peer_id: String,
+    is_local: bool,
+    compute_backend: String,
+    device_name: String,
+    logical_cpu_cores: u32,
+    total_memory_bytes: u64,
+    available_memory_bytes: u64,
+    unified_memory: bool,
+    max_sessions: u32,
+    active_sessions: u32,
+    queue_depth: u32,
+    measured_prefill_tokens_per_second: Option<f32>,
+    measured_decode_tokens_per_second: Option<f32>,
+    hosted_component_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -291,6 +324,35 @@ async fn get_grid_snapshot(
 }
 
 #[tauri::command]
+async fn install_official_model(
+    app: AppHandle,
+    state: State<'_, UiState>,
+    model_id: String,
+) -> Result<GridSnapshot, String> {
+    let cache_config = cache_config_for_app(&app);
+    ensure_model_distribution_service(&state, cache_config.clone()).await?;
+    let (registry, _, _) =
+        discover_registry(&app, &state, &cache_config, DEFAULT_DISCOVERY_TIMEOUT_MS).await?;
+    let manifest = manifest_for_model(Some(&model_id), &cache_config, Some(&registry))
+        .map_err(|error| error.to_string())?;
+    if advertised_model_record_plan(&registry, &manifest.model_id).is_empty() {
+        return Err(
+            "The verified Infernet Chat release is not being seeded by an online machine yet."
+                .to_owned(),
+        );
+    }
+    acquire_advertised_model_records(&app, &state, &cache_config, &manifest, &registry, true)
+        .await?;
+    collect_snapshot(
+        &app,
+        &state,
+        DEFAULT_DISCOVERY_TIMEOUT_MS,
+        Some(&manifest.model_id),
+    )
+    .await
+}
+
+#[tauri::command]
 async fn run_demo_inference(
     app: AppHandle,
     state: State<'_, UiState>,
@@ -303,11 +365,6 @@ async fn run_demo_inference(
         discover_registry(&app, &state, &cache_config, DEFAULT_DISCOVERY_TIMEOUT_MS).await?;
     let manifest = manifest_for_model(model_id.as_deref(), &cache_config, Some(&registry))
         .map_err(|error| error.to_string())?;
-
-    if manifest.runtime_kind != RuntimeKind::Demo {
-        acquire_advertised_model_records(&app, &state, &cache_config, &manifest, &registry, true)
-            .await?;
-    }
 
     let snapshot = collect_snapshot(
         &app,
@@ -340,12 +397,14 @@ async fn run_demo_inference(
 
     let (mut config, local_peer_id) = discovery_config_from_state(&state)?;
     config.keypair = identity::Keypair::generate_ed25519();
-    if let Some(mut local_advertisement) =
-        local_cache_advertisement(&cache_config, local_peer_id.clone())
-    {
-        local_advertisement.addresses = local_connect_addresses(&local_peer_id);
-        config.static_peers.push(local_advertisement);
-    }
+    let mut local_advertisement = registry
+        .advertisements()
+        .into_iter()
+        .find(|advertisement| advertisement.peer_id == local_peer_id)
+        .unwrap_or_else(|| local_capability_advertisement(local_peer_id.clone(), String::new()));
+    local_advertisement.addresses = local_connect_addresses(&local_peer_id);
+    config.static_peers.push(local_advertisement);
+    merge_static_peer_advertisements(&mut config.static_peers, registry.advertisements());
     let hidden_size = manifest.hidden_size;
     let result = match infer_over_libp2p(
         config,
@@ -433,19 +492,34 @@ async fn discover_registry(
 ) -> Result<(ShardRegistry, String, String), String> {
     let (mut config, local_peer_id) = discovery_config_from_state(state)?;
     let topic = config.topic.clone();
-    if let Some(local_advertisement) =
-        local_cache_advertisement(cache_config, local_peer_id.clone())
-    {
-        config.advertisement = Some(local_advertisement);
-    }
+    config.advertisement = Some(local_node_advertisement(
+        cache_config,
+        local_peer_id.clone(),
+    ));
     let mut registry = discover_for(config, Duration::from_millis(discovery_timeout_ms))
         .await
         .map_err(|error| error.to_string())?;
+    let fresh_peer_ids = registry
+        .advertisements()
+        .into_iter()
+        .map(|advertisement| advertisement.peer_id)
+        .collect::<BTreeSet<_>>();
     if let Ok(last_registry) = state.last_registry.lock() {
         if let Some(last_registry) = last_registry.as_ref() {
-            registry.extend(last_registry.advertisements());
+            for mut previous in last_registry.advertisements() {
+                if fresh_peer_ids.contains(&previous.peer_id) {
+                    // Preserve cached component availability without replacing a
+                    // fresh machine report with old memory/load telemetry.
+                    previous.available_ram_bytes = None;
+                    previous.available_vram_bytes = None;
+                    previous.latency_hint_ms = None;
+                    previous.capabilities = None;
+                    registry.merge(previous);
+                }
+            }
         }
     }
+    registry = trusted_launch_registry(registry);
     if let Ok(mut last_registry) = state.last_registry.lock() {
         if registry
             .advertisements()
@@ -457,6 +531,47 @@ async fn discover_registry(
     }
 
     Ok((registry, local_peer_id, topic))
+}
+
+fn trusted_launch_registry(registry: ShardRegistry) -> ShardRegistry {
+    let mut trusted = ShardRegistry::new();
+    for mut advertisement in registry.advertisements() {
+        let trusted_records = advertisement
+            .model_shards
+            .iter()
+            .filter(|info| official_info_matches_release(info))
+            .cloned()
+            .collect::<Vec<_>>();
+        let runnable_components = advertisement
+            .hosted_shards
+            .iter()
+            .filter_map(|descriptor| {
+                let info = trusted_records.iter().find(|info| {
+                    info.model_id == descriptor.model_id && info.layers == descriptor.layers
+                })?;
+                let manifest = descriptor.seed_manifest.as_deref()?;
+                (official_record_matches_release(info, manifest)
+                    && official_record_fits_advertised_capacity(&advertisement, info))
+                .then(|| {
+                    (
+                        descriptor.model_id.clone(),
+                        descriptor.layers.start,
+                        descriptor.layers.end,
+                    )
+                })
+            })
+            .collect::<BTreeSet<_>>();
+        advertisement.hosted_shards.retain(|descriptor| {
+            runnable_components.contains(&(
+                descriptor.model_id.clone(),
+                descriptor.layers.start,
+                descriptor.layers.end,
+            ))
+        });
+        advertisement.model_shards = trusted_records;
+        trusted.upsert(advertisement);
+    }
+    trusted
 }
 
 async fn acquire_advertised_model_records(
@@ -496,6 +611,7 @@ async fn acquire_advertised_model_records(
         &cache,
         &manifest.model_id,
         &local_peer_id,
+        &registry.advertisements(),
         plan,
     )
     .map_err(|error| error.to_string())?;
@@ -599,6 +715,7 @@ fn spawn_background_model_record_acquisition(
         &cache,
         &manifest.model_id,
         &local_peer_id,
+        &registry.advertisements(),
         plan,
     )
     .map_err(|error| error.to_string())?;
@@ -716,6 +833,7 @@ fn model_records_to_download_for_local_contribution(
     cache: &ShardCache,
     model_id: &str,
     local_peer_id: &str,
+    advertisements: &[NodeAdvertisement],
     mut plan: Vec<AdvertisedModelRecord>,
 ) -> anyhow::Result<Vec<AdvertisedModelRecord>> {
     plan.sort_by_key(|record| (record.info.layers.start, record.info.layers.end));
@@ -743,26 +861,84 @@ fn model_records_to_download_for_local_contribution(
         .cloned()
         .collect::<Vec<_>>();
 
-    let parity = stable_peer_parity(local_peer_id);
-    let mut selected = plan
+    let components = plan
         .iter()
-        .enumerate()
-        .filter(|(index, _)| index % 2 == parity)
-        .filter(|(_, record)| {
+        .map(|record| FixedModelComponent {
+            content_hash: record.info.checksum.clone(),
+            layers: record.info.layers,
+            weight_bytes: record.info.size_bytes,
+        })
+        .collect::<Vec<_>>();
+    let mut compute_nodes = advertisements.to_vec();
+    if !compute_nodes
+        .iter()
+        .any(|advertisement| advertisement.peer_id == local_peer_id)
+    {
+        compute_nodes.push(local_capability_advertisement(
+            local_peer_id.to_owned(),
+            String::new(),
+        ));
+    }
+
+    let config = |minimum_peer_count| CapacityPlanningConfig {
+        kv_cache_bytes_per_layer: LAUNCH_KV_CACHE_BYTES_PER_LAYER,
+        scratch_bytes_per_peer: RUNTIME_SCRATCH_BYTES_PER_PEER,
+        safety_margin_bytes: CAPACITY_SAFETY_BYTES,
+        safety_margin_basis_points: 1_000,
+        minimum_peer_count,
+    };
+    let reported_compute_nodes = compute_nodes
+        .iter()
+        .filter(|advertisement| {
+            if let Some(capabilities) = advertisement.capabilities.as_ref() {
+                capabilities.max_sessions > capabilities.active_sessions
+                    && (capabilities.available_accelerator_memory_bytes > 0
+                        || capabilities.available_ram_bytes > 0)
+            } else {
+                advertisement
+                    .available_vram_bytes
+                    .is_some_and(|bytes| bytes > 0)
+                    || advertisement
+                        .available_ram_bytes
+                        .is_some_and(|bytes| bytes > 0)
+            }
+        })
+        .map(|advertisement| advertisement.peer_id.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
+    let desired_peer_count = components.len().min(reported_compute_nodes).min(8).max(1);
+    let mut capacity_plan = None;
+    for minimum_peer_count in (2..=desired_peer_count).rev() {
+        if let Ok(candidate) =
+            plan_fixed_components(&components, &compute_nodes, config(minimum_peer_count))
+        {
+            capacity_plan = Some(candidate);
+            break;
+        }
+    }
+    let capacity_plan = match capacity_plan {
+        Some(plan) => plan,
+        None => plan_fixed_components(&components, &compute_nodes, config(1))?,
+    };
+    let local_component_hashes = capacity_plan
+        .assignments
+        .iter()
+        .filter(|assignment| assignment.peer_id == local_peer_id)
+        .flat_map(|assignment| assignment.component_hashes.iter().cloned())
+        .collect::<BTreeSet<_>>();
+
+    let selected = plan
+        .iter()
+        .filter(|record| local_component_hashes.contains(&record.info.checksum))
+        .filter(|record| {
             missing_records.iter().any(|missing| {
                 missing.info.layers == record.info.layers
                     && missing.info.checksum == record.info.checksum
                     && missing.info.version == record.info.version
             })
         })
-        .map(|(_, record)| record.clone())
+        .cloned()
         .collect::<Vec<_>>();
-
-    if selected.is_empty() {
-        if let Some(first) = missing_records.into_iter().next() {
-            selected.push(first);
-        }
-    }
 
     Ok(selected)
 }
@@ -784,13 +960,6 @@ fn model_acquisition_key(model_id: &str, plan: &[AdvertisedModelRecord]) -> Stri
     format!("{model_id}:{}", ranges.join(","))
 }
 
-fn stable_peer_parity(peer_id: &str) -> usize {
-    peer_id
-        .bytes()
-        .fold(0_u8, |accumulator, byte| accumulator.wrapping_add(byte)) as usize
-        % 2
-}
-
 fn model_shard_fetch_timeout_ms(size_bytes: u64) -> u64 {
     let one_megabyte_per_second = size_bytes
         .saturating_div(1024 * 1024)
@@ -806,7 +975,8 @@ fn snapshot_from_registry(
     registry: &ShardRegistry,
     cache_config: &ShardCacheConfig,
 ) -> GridSnapshot {
-    let all_advertisements = registry.advertisements();
+    let all_advertisements =
+        advertisements_with_local_node(registry.advertisements(), cache_config, &local_peer_id);
     let network_peer_count = remote_network_peer_count(&local_peer_id, &all_advertisements);
     let advertisements =
         ui_visible_advertisements(all_advertisements.clone(), Some(&manifest.model_id));
@@ -815,6 +985,7 @@ fn snapshot_from_registry(
         Ok(route) => (route, None),
         Err(error) => (Vec::new(), Some(error.to_string())),
     };
+    let machines = machine_views(&all_advertisements, &local_peer_id);
 
     GridSnapshot {
         local_peer_id,
@@ -827,6 +998,7 @@ fn snapshot_from_registry(
             .iter()
             .map(peer_view_from_advertisement)
             .collect(),
+        machines,
         route: route.iter().map(route_hop_view).collect(),
         missing_ranges,
         coverage: build_coverage(manifest, &route, &advertisements),
@@ -840,9 +1012,11 @@ fn empty_snapshot(
     cache_config: &ShardCacheConfig,
     registry: &ShardRegistry,
 ) -> GridSnapshot {
-    let all_advertisements = registry.advertisements();
+    let all_advertisements =
+        advertisements_with_local_node(registry.advertisements(), cache_config, &local_peer_id);
     let network_peer_count = remote_network_peer_count(&local_peer_id, &all_advertisements);
-    let advertisements = ui_visible_advertisements(all_advertisements, None);
+    let advertisements = ui_visible_advertisements(all_advertisements.clone(), None);
+    let machines = machine_views(&all_advertisements, &local_peer_id);
     GridSnapshot {
         local_peer_id,
         topic,
@@ -854,6 +1028,7 @@ fn empty_snapshot(
             .iter()
             .map(peer_view_from_advertisement)
             .collect(),
+        machines,
         route: Vec::new(),
         missing_ranges: None,
         coverage: Vec::new(),
@@ -864,12 +1039,10 @@ fn empty_snapshot(
 fn model_view_from_manifest(
     manifest: &ModelManifest,
     installed: bool,
+    network_runnable: bool,
     cache_config: &ShardCacheConfig,
 ) -> ModelView {
-    let runnable = manifest.runtime_kind == RuntimeKind::Demo
-        || (manifest.runtime_kind == RuntimeKind::LlamaCpp
-            && installed
-            && local_model_has_complete_coverage(cache_config, manifest));
+    let runnable = manifest.runtime_kind == RuntimeKind::Demo || network_runnable;
     ModelView {
         model_id: manifest.model_id.clone(),
         display_name: manifest.display_name.clone(),
@@ -891,25 +1064,15 @@ fn available_model_views(
     registry: Option<&ShardRegistry>,
 ) -> Vec<ModelView> {
     let installed_ids = installed_model_ids(cache_config);
-    let mut manifests = installed_model_manifests(cache_config);
-    if let Some(registry) = registry {
-        manifests.extend(discovered_model_manifests(registry));
-    }
-    manifests.retain(|manifest| manifest.runtime_kind != RuntimeKind::Demo);
-    manifests.sort_by(|left, right| left.model_id.cmp(&right.model_id));
-    manifests.dedup_by(|left, right| left.model_id == right.model_id);
-    manifests.sort_by(|left, right| left.display_name.cmp(&right.display_name));
-
-    manifests
-        .iter()
-        .map(|manifest| {
-            model_view_from_manifest(
-                manifest,
-                installed_ids.contains(&manifest.model_id),
-                cache_config,
-            )
-        })
-        .collect()
+    let manifest = ModelManifest::infernet_chat_v1();
+    let network_runnable =
+        registry.is_some_and(|registry| registry.route_for_model(&manifest).is_ok());
+    vec![model_view_from_manifest(
+        &manifest,
+        installed_ids.contains(&manifest.model_id),
+        network_runnable,
+        cache_config,
+    )]
 }
 
 fn installed_model_manifests(cache_config: &ShardCacheConfig) -> Vec<ModelManifest> {
@@ -927,6 +1090,9 @@ fn installed_model_manifests(cache_config: &ShardCacheConfig) -> Vec<ModelManife
                 return None;
             }
             let manifest = record.manifest?;
+            if !official_record_matches_release(&record.info, &manifest) {
+                return None;
+            }
             Some(ModelManifest {
                 model_id: manifest.model_id,
                 display_name: manifest.display_name,
@@ -958,44 +1124,6 @@ fn installed_model_ids(cache_config: &ShardCacheConfig) -> Vec<String> {
     ids
 }
 
-fn discovered_model_manifests(registry: &ShardRegistry) -> Vec<ModelManifest> {
-    let mut by_model = BTreeMap::<String, ModelManifest>::new();
-    for shard in registry
-        .advertisements()
-        .iter()
-        .flat_map(|advertisement| advertisement.hosted_shards.iter())
-        .filter(|shard| shard.runtime_kind != RuntimeKind::Demo)
-    {
-        let Some(seed_manifest) = shard.seed_manifest.as_deref() else {
-            continue;
-        };
-        if !seed_manifest_has_executable_payload(seed_manifest) {
-            continue;
-        }
-        by_model
-            .entry(shard.model_id.clone())
-            .and_modify(|manifest| {
-                manifest.layer_count = manifest.layer_count.max(seed_manifest.layer_count);
-                manifest.hidden_size = manifest.hidden_size.max(seed_manifest.hidden_size);
-                if manifest.quantization.is_none() {
-                    manifest.quantization = seed_manifest.metadata.quantization.clone();
-                }
-            })
-            .or_insert_with(|| ModelManifest {
-                model_id: seed_manifest.model_id.clone(),
-                display_name: seed_manifest.display_name.clone(),
-                architecture: seed_manifest.architecture.clone(),
-                layer_count: seed_manifest.layer_count,
-                hidden_size: seed_manifest.hidden_size,
-                activation_dtype: seed_manifest.activation_dtype.clone(),
-                quantization: seed_manifest.metadata.quantization.clone(),
-                runtime_kind: seed_manifest.runtime_kind.clone(),
-            });
-    }
-
-    by_model.into_values().collect()
-}
-
 fn ui_visible_advertisements(
     advertisements: Vec<NodeAdvertisement>,
     model_id: Option<&str>,
@@ -1004,7 +1132,8 @@ fn ui_visible_advertisements(
         .into_iter()
         .filter_map(|mut advertisement| {
             advertisement.hosted_shards.retain(|shard| {
-                shard.runtime_kind != RuntimeKind::Demo
+                shard.model_id == OFFICIAL_CHAT_MODEL_ID
+                    && shard.runtime_kind != RuntimeKind::Demo
                     && executable_seed_manifest_for_descriptor(shard).is_some()
                     && model_id.is_none_or(|model_id| shard.model_id == model_id)
             });
@@ -1014,7 +1143,7 @@ fn ui_visible_advertisements(
                 .map(|shard| (shard.model_id.clone(), shard.layers))
                 .collect::<Vec<_>>();
             advertisement.model_shards.retain(|shard| {
-                shard.model_id != ModelManifest::demo().model_id
+                shard.model_id == OFFICIAL_CHAT_MODEL_ID
                     && executable_keys.iter().any(|(model_id, layers)| {
                         model_id == &shard.model_id && *layers == shard.layers
                     })
@@ -1041,10 +1170,11 @@ fn remote_network_peer_count(local_peer_id: &str, advertisements: &[NodeAdvertis
 }
 
 fn advertisement_has_capacity(advertisement: &NodeAdvertisement) -> bool {
-    advertisement
-        .hosted_shards
-        .iter()
-        .any(|shard| executable_seed_manifest_for_descriptor(shard).is_some())
+    advertisement.capabilities.is_some()
+        || advertisement
+            .hosted_shards
+            .iter()
+            .any(|shard| executable_seed_manifest_for_descriptor(shard).is_some())
         || advertisement
             .model_shards
             .iter()
@@ -1073,6 +1203,80 @@ fn executable_seed_manifest_for_model_shard<'a>(
         .and_then(executable_seed_manifest_for_descriptor)
 }
 
+fn official_record_matches_release(info: &ModelShardInfo, manifest: &SeedShardManifest) -> bool {
+    let model = ModelManifest::infernet_chat_v1();
+    let release = OfficialModelRelease::infernet_chat_v1_compatibility();
+    if release.validate_for_model(&model).is_err()
+        || !official_info_matches_release(info)
+        || manifest.model_id != model.model_id
+        || manifest.display_name != model.display_name
+        || manifest.architecture != model.architecture
+        || manifest.layer_count != model.layer_count
+        || manifest.hidden_size != model.hidden_size
+        || manifest.activation_dtype != model.activation_dtype
+        || manifest.metadata.quantization.as_deref() != model.quantization.as_deref()
+        || manifest.runtime_kind != model.runtime_kind
+        || manifest.layers != info.layers
+        || manifest.metadata.source_checksum.as_deref()
+            != Some(release.upstream.source_sha256.as_str())
+        || manifest.source.checksum_sha256 != release.upstream.source_sha256
+        || manifest.source.file_size_bytes != release.expected_total_bytes
+    {
+        return false;
+    }
+
+    release.components.iter().any(|component| {
+        component.kind == OfficialComponentKind::Transformer
+            && component.layers == Some(info.layers)
+            && component.sha256 == info.checksum
+            && component.size_bytes == info.size_bytes
+    })
+}
+
+fn official_info_matches_release(info: &ModelShardInfo) -> bool {
+    let release = OfficialModelRelease::infernet_chat_v1_compatibility();
+    info.model_id == release.model_id
+        && info.version == release.version
+        && info.protocol_version == PROTOCOL_VERSION
+        && release.components.iter().any(|component| {
+            component.kind == OfficialComponentKind::Transformer
+                && component.layers == Some(info.layers)
+                && component.sha256 == info.checksum
+                && component.size_bytes == info.size_bytes
+        })
+}
+
+fn official_record_fits_advertised_capacity(
+    advertisement: &NodeAdvertisement,
+    info: &ModelShardInfo,
+) -> bool {
+    let available_bytes = if let Some(capabilities) = advertisement.capabilities.as_ref() {
+        if capabilities.max_sessions == 0
+            || capabilities.active_sessions >= capabilities.max_sessions
+        {
+            return false;
+        }
+        if capabilities.available_accelerator_memory_bytes > 0 {
+            capabilities.available_accelerator_memory_bytes
+        } else {
+            capabilities.available_ram_bytes
+        }
+    } else {
+        advertisement
+            .available_vram_bytes
+            .or(advertisement.available_ram_bytes)
+            .unwrap_or(0)
+    };
+    let safety_bytes = CAPACITY_SAFETY_BYTES.max(available_bytes / 10);
+    let kv_cache_bytes =
+        LAUNCH_KV_CACHE_BYTES_PER_LAYER.saturating_mul(u64::from(info.layers.len()));
+    info.size_bytes
+        .saturating_add(kv_cache_bytes)
+        .saturating_add(RUNTIME_SCRATCH_BYTES_PER_PEER)
+        .saturating_add(safety_bytes)
+        <= available_bytes
+}
+
 fn default_bootstrap_peer_ids() -> Vec<String> {
     DEFAULT_BOOTSTRAP_PEERS
         .iter()
@@ -1096,15 +1300,15 @@ fn model_status(
     }
 
     if !installed {
-        return "Available on the network".to_owned();
+        return "Waiting for an online machine to seed the verified release.".to_owned();
     }
 
     if !local_model_has_complete_coverage(cache_config, manifest) {
-        return "Model import is incomplete. Re-add the model to install a complete executable package."
-            .to_owned();
+        return "This computer does not have a complete verified model package yet.".to_owned();
     }
 
-    "Installed locally. Ready for inference and seeding.".to_owned()
+    "Stored and verified, but no online machine currently reports enough free compute memory."
+        .to_owned()
 }
 
 fn normalize_quantization_label(value: &str) -> String {
@@ -1185,6 +1389,84 @@ fn peer_view_from_advertisement(advertisement: &NodeAdvertisement) -> PeerView {
     }
 }
 
+fn advertisements_with_local_node(
+    mut advertisements: Vec<NodeAdvertisement>,
+    cache_config: &ShardCacheConfig,
+    local_peer_id: &str,
+) -> Vec<NodeAdvertisement> {
+    let mut local = local_node_advertisement(cache_config, local_peer_id.to_owned());
+    if let Some(existing) = advertisements
+        .iter()
+        .find(|advertisement| advertisement.peer_id == local_peer_id)
+    {
+        if local.addresses.is_empty() {
+            local.addresses = existing.addresses.clone();
+        }
+    }
+    advertisements.retain(|advertisement| advertisement.peer_id != local_peer_id);
+    advertisements.push(local);
+    advertisements
+}
+
+fn machine_views(advertisements: &[NodeAdvertisement], local_peer_id: &str) -> Vec<MachineView> {
+    let mut views = advertisements
+        .iter()
+        .filter_map(|advertisement| {
+            let capabilities = advertisement.capabilities.as_ref()?;
+            let use_accelerator_memory = capabilities.compute_backend != "cpu"
+                && capabilities.total_accelerator_memory_bytes > 0;
+            let (total_memory_bytes, available_memory_bytes) = if use_accelerator_memory {
+                (
+                    capabilities.total_accelerator_memory_bytes,
+                    capabilities.available_accelerator_memory_bytes,
+                )
+            } else {
+                (
+                    capabilities.total_ram_bytes,
+                    capabilities.available_ram_bytes,
+                )
+            };
+            let hosted_components =
+                advertisement
+                    .hosted_shards
+                    .iter()
+                    .map(|shard| (shard.model_id.clone(), shard.layers.start, shard.layers.end))
+                    .chain(advertisement.model_shards.iter().map(|shard| {
+                        (shard.model_id.clone(), shard.layers.start, shard.layers.end)
+                    }))
+                    .collect::<BTreeSet<_>>();
+
+            Some(MachineView {
+                peer_id: advertisement.peer_id.clone(),
+                short_peer_id: short_peer_id(&advertisement.peer_id),
+                is_local: advertisement.peer_id == local_peer_id,
+                compute_backend: capabilities.compute_backend.clone(),
+                device_name: capabilities.device_name.clone(),
+                logical_cpu_cores: capabilities.logical_cpu_cores,
+                total_memory_bytes,
+                available_memory_bytes,
+                unified_memory: capabilities.unified_memory,
+                max_sessions: capabilities.max_sessions,
+                active_sessions: capabilities.active_sessions,
+                queue_depth: capabilities.queue_depth,
+                measured_prefill_tokens_per_second: capabilities.measured_prefill_tokens_per_second,
+                measured_decode_tokens_per_second: capabilities.measured_decode_tokens_per_second,
+                hosted_component_count: hosted_components.len(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    views.sort_by(|left, right| {
+        right
+            .is_local
+            .cmp(&left.is_local)
+            .then_with(|| left.device_name.cmp(&right.device_name))
+            .then_with(|| left.peer_id.cmp(&right.peer_id))
+    });
+    views.dedup_by(|left, right| left.peer_id == right.peer_id);
+    views
+}
+
 fn advertised_model_record_plan(
     registry: &ShardRegistry,
     model_id: &str,
@@ -1196,7 +1478,7 @@ fn advertised_model_record_plan(
             .iter()
             .filter(|shard| shard.model_id == model_id)
         {
-            if executable_seed_manifest_for_model_shard(&advertisement, info).is_none() {
+            if !official_info_matches_release(info) {
                 continue;
             }
             let record = AdvertisedModelRecord { info: info.clone() };
@@ -1325,13 +1607,18 @@ fn build_distribution_snapshot(
             (
                 records
                     .iter()
-                    .map(|record| InstalledShardView {
-                        model_id: record.info.model_id.clone(),
-                        layer_start: record.info.layers.start,
-                        layer_end: record.info.layers.end,
-                        checksum: record.info.checksum.clone(),
-                        size_bytes: record.info.size_bytes,
-                        version: record.info.version.clone(),
+                    .filter_map(|record| {
+                        let manifest = record.manifest.as_ref()?;
+                        official_record_matches_release(&record.info, manifest).then(|| {
+                            InstalledShardView {
+                                model_id: record.info.model_id.clone(),
+                                layer_start: record.info.layers.start,
+                                layer_end: record.info.layers.end,
+                                checksum: record.info.checksum.clone(),
+                                size_bytes: record.info.size_bytes,
+                                version: record.info.version.clone(),
+                            }
+                        })
                     })
                     .collect::<Vec<_>>(),
                 stats
@@ -1406,6 +1693,12 @@ fn local_cache_advertisement(
         let Some(manifest) = record.manifest.clone() else {
             continue;
         };
+        if manifest.model_id != OFFICIAL_CHAT_MODEL_ID {
+            continue;
+        }
+        if !official_record_matches_release(&record.info, &manifest) {
+            continue;
+        }
         if is_executable_shard_record(&record) && seed_record_is_executable(cache_config, &manifest)
         {
             let seed_manifest = Box::new(seed_manifest_for_network(&manifest));
@@ -1435,9 +1728,16 @@ fn local_cache_advertisement(
         available_ram_bytes: None,
         available_vram_bytes: None,
         latency_hint_ms: Some(0),
+        capabilities: None,
         hosted_shards,
         model_shards,
     })
+}
+
+fn local_node_advertisement(cache_config: &ShardCacheConfig, peer_id: String) -> NodeAdvertisement {
+    let advertisement = local_cache_advertisement(cache_config, peer_id.clone())
+        .unwrap_or_else(|| empty_advertisement(peer_id, String::new()));
+    enrich_local_advertisement(advertisement)
 }
 
 fn seed_record_is_executable(config: &ShardCacheConfig, manifest: &SeedShardManifest) -> bool {
@@ -1474,6 +1774,7 @@ fn local_model_has_complete_coverage(
             return false;
         };
         is_executable_shard_record(&record)
+            && official_record_matches_release(&record.info, manifest)
             && record.info.model_id == model.model_id
             && record.info.layers.start == 0
             && record.info.layers.end == model.layer_count
@@ -1504,7 +1805,10 @@ fn cache_config_for_app(app: &AppHandle) -> ShardCacheConfig {
     // The launch app reads only official release packages. The former `shards`
     // cache is intentionally left untouched so changing product direction
     // never deletes a user's files without consent.
-    ShardCacheConfig::new(app_data_dir(app).join("official-models").join("v1"))
+    let mut config = ShardCacheConfig::new(app_data_dir(app).join("official-models").join("v1"));
+    config.preferred_models = vec![OFFICIAL_CHAT_MODEL_ID.to_owned()];
+    config.pinned_models = vec![OFFICIAL_CHAT_MODEL_ID.to_owned()];
+    config
 }
 
 #[cfg(test)]
@@ -1561,10 +1865,12 @@ async fn ensure_model_distribution_service(
         .lock()
         .map_err(|_| "failed to lock local node identity".to_owned())?
         .clone();
+    let local_peer_id = keypair.public().to_peer_id().to_string();
     let mut discovery = DiscoveryConfig::new(state.topic.clone());
     discovery.keypair = keypair;
     discovery.p2p_listen = format!("/ip4/0.0.0.0/tcp/{UI_LISTEN_PORT}");
     discovery.static_peers = configured_static_peers(state)?;
+    discovery.advertisement = Some(local_node_advertisement(&cache_config, local_peer_id));
 
     let (waiter_sender, waiter_receiver) = oneshot::channel();
     let should_start = {
@@ -1860,41 +2166,18 @@ fn ip_protocol(ip: IpAddr) -> &'static str {
 
 fn manifest_for_model(
     model_id: Option<&str>,
-    cache_config: &ShardCacheConfig,
-    registry: Option<&ShardRegistry>,
+    _cache_config: &ShardCacheConfig,
+    _registry: Option<&ShardRegistry>,
 ) -> anyhow::Result<ModelManifest> {
-    let mut available = installed_model_manifests(cache_config);
-    if let Some(registry) = registry {
-        available.extend(discovered_model_manifests(registry));
-    }
-    available.sort_by(|left, right| left.model_id.cmp(&right.model_id));
-    available.dedup_by(|left, right| left.model_id == right.model_id);
-
     let requested = model_id.map(str::trim).filter(|value| !value.is_empty());
-    let Some(model_id) = requested else {
-        return available
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("no models are installed or discovered yet"));
-    };
+    if requested.is_none_or(|model_id| model_id == OFFICIAL_CHAT_MODEL_ID) {
+        return Ok(ModelManifest::infernet_chat_v1());
+    }
 
-    available
-        .into_iter()
-        .find(|manifest| manifest.model_id == model_id)
-        .ok_or_else(|| {
-            let supported = available_model_views(cache_config, registry)
-                .into_iter()
-                .map(|model| model.model_id)
-                .collect::<Vec<_>>()
-                .join(", ");
-            if supported.is_empty() {
-                anyhow::anyhow!(
-                    "unknown model {model_id}; no models are installed or discovered yet"
-                )
-            } else {
-                anyhow::anyhow!("unknown model {model_id}; available models are {supported}")
-            }
-        })
+    let model_id = requested.unwrap_or_default();
+    Err(anyhow::anyhow!(
+        "unknown model {model_id}; the launch catalog contains only {OFFICIAL_CHAT_MODEL_ID}"
+    ))
 }
 
 fn coverage_segment(
@@ -1978,6 +2261,10 @@ fn discovery_config_from_state(
     let mut config = DiscoveryConfig::new(state.topic.clone());
     config.keypair = keypair;
     config.static_peers = configured_static_peers(state)?;
+    config.advertisement = Some(local_capability_advertisement(
+        local_peer_id.clone(),
+        String::new(),
+    ));
 
     Ok((config, local_peer_id))
 }
@@ -2023,6 +2310,7 @@ pub fn run() {
             add_manual_peer,
             clear_manual_peers,
             get_grid_snapshot,
+            install_official_model,
             run_demo_inference
         ])
         .run(tauri::generate_context!())
@@ -2034,12 +2322,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_cache_does_not_publish_builtin_models() {
+    fn empty_cache_publishes_only_the_official_launch_model() {
         let root = std::env::temp_dir().join(format!("infernet-ui-empty-{}", unix_ms()));
         let cache_config = ShardCacheConfig::new(root.clone());
 
-        assert!(available_model_views(&cache_config, None).is_empty());
-        assert!(manifest_for_model(None, &cache_config, None).is_err());
+        let models = available_model_views(&cache_config, None);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].model_id, OFFICIAL_CHAT_MODEL_ID);
+        assert!(!models[0].installed);
+        assert_eq!(
+            manifest_for_model(None, &cache_config, None)
+                .unwrap()
+                .model_id,
+            OFFICIAL_CHAT_MODEL_ID
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2113,6 +2409,30 @@ mod tests {
             remote_network_peer_count("local-peer", &[connection_only, capacity]),
             1
         );
+
+        let capability_only =
+            local_capability_advertisement("remote-machine".to_owned(), String::new());
+        assert_eq!(
+            remote_network_peer_count("local-peer", &[capability_only]),
+            1,
+            "a compute node does not need a model component yet to count as online"
+        );
+    }
+
+    #[test]
+    fn empty_local_cache_still_reports_this_machine() {
+        let root = std::env::temp_dir().join(format!("infernet-ui-capacity-{}", unix_ms()));
+        let cache_config = ShardCacheConfig::new(root.clone());
+        let advertisement = local_node_advertisement(&cache_config, "local-peer".to_owned());
+        let machines = machine_views(&[advertisement], "local-peer");
+
+        assert_eq!(machines.len(), 1);
+        assert!(machines[0].is_local);
+        assert!(!machines[0].compute_backend.is_empty());
+        assert!(!machines[0].device_name.is_empty());
+        assert!(machines[0].max_sessions > 0);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2131,10 +2451,106 @@ mod tests {
         });
         registry.upsert(orphan);
 
-        assert!(available_model_views(&cache_config, Some(&registry)).is_empty());
+        assert_eq!(
+            available_model_views(&cache_config, Some(&registry)).len(),
+            1
+        );
         assert!(manifest_for_model(Some("gemma"), &cache_config, Some(&registry)).is_err());
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn launch_registry_accepts_only_the_pinned_release_bytes() {
+        let release = OfficialModelRelease::infernet_chat_v1_compatibility();
+        let model = ModelManifest::infernet_chat_v1();
+        let component = &release.components[0];
+        let layers = component.layers.unwrap();
+        let seed_manifest = SeedShardManifest {
+            model_id: model.model_id.clone(),
+            display_name: model.display_name.clone(),
+            architecture: model.architecture.clone(),
+            layer_count: model.layer_count,
+            hidden_size: model.hidden_size,
+            activation_dtype: model.activation_dtype.clone(),
+            runtime_kind: model.runtime_kind.clone(),
+            layers,
+            tokenizer: infernet_model::TokenizerCompatibility {
+                family: model.architecture.clone(),
+                checksum: None,
+            },
+            metadata: infernet_model::ShardMetadata {
+                architecture: model.architecture.clone(),
+                quantization: model.quantization.clone(),
+                source_checksum: Some(release.upstream.source_sha256.clone()),
+                protocol_version: PROTOCOL_VERSION,
+            },
+            source: infernet_model::SeedSourceMetadata {
+                path: String::new(),
+                checksum_sha256: release.upstream.source_sha256.clone(),
+                file_size_bytes: release.expected_total_bytes,
+            },
+            shard_hash: "release-manifest-hash".to_owned(),
+            payload_kind: PAYLOAD_KIND_FULL_MODEL.to_owned(),
+        };
+        let info = ModelShardInfo {
+            model_id: model.model_id.clone(),
+            layers,
+            checksum: component.sha256.clone(),
+            size_bytes: component.size_bytes,
+            version: release.version.clone(),
+            protocol_version: PROTOCOL_VERSION,
+        };
+        let mut valid = empty_advertisement("valid-peer".to_owned(), String::new());
+        valid.available_vram_bytes = Some(24 * 1024 * 1024 * 1024);
+        valid.model_shards.push(info.clone());
+        valid.hosted_shards.push(ShardDescriptor {
+            model_id: model.model_id.clone(),
+            layers,
+            runtime_kind: model.runtime_kind.clone(),
+            tokenizer: Some(seed_manifest.tokenizer.clone()),
+            metadata: Some(seed_manifest.metadata.clone()),
+            shard_hash: Some(seed_manifest.shard_hash.clone()),
+            seed_manifest: Some(Box::new(seed_manifest.clone())),
+        });
+        let mut forged = valid.clone();
+        forged.peer_id = "forged-peer".to_owned();
+        forged.model_shards[0].checksum = "0".repeat(64);
+        let mut too_small = valid.clone();
+        too_small.peer_id = "small-peer".to_owned();
+        too_small.available_vram_bytes = Some(8 * 1024 * 1024 * 1024);
+
+        let mut registry = ShardRegistry::new();
+        registry.upsert(valid);
+        registry.upsert(forged);
+        registry.upsert(too_small);
+        let trusted = trusted_launch_registry(registry);
+        let advertisements = trusted.advertisements();
+        let route = trusted.route_for_model(&model).unwrap();
+
+        assert_eq!(route.len(), 1);
+        assert_eq!(route[0].peer_id, "valid-peer");
+        assert_eq!(
+            advertisements
+                .iter()
+                .find(|advertisement| advertisement.peer_id == "valid-peer")
+                .unwrap()
+                .model_shards
+                .len(),
+            1
+        );
+        let forged = advertisements
+            .iter()
+            .find(|advertisement| advertisement.peer_id == "forged-peer")
+            .unwrap();
+        assert!(forged.model_shards.is_empty());
+        assert!(forged.hosted_shards.is_empty());
+        let too_small = advertisements
+            .iter()
+            .find(|advertisement| advertisement.peer_id == "small-peer")
+            .unwrap();
+        assert_eq!(too_small.model_shards.len(), 1);
+        assert!(too_small.hosted_shards.is_empty());
     }
 
     #[test]
@@ -2181,7 +2597,7 @@ mod tests {
     }
 
     #[test]
-    fn local_physical_shard_advertises_route_and_quantization() {
+    fn launch_app_does_not_advertise_or_select_legacy_gguf_records() {
         let root = std::env::temp_dir().join(format!("infernet-ui-local-gguf-{}", unix_ms()));
         let cache_config = ShardCacheConfig::new(root.join("shards"));
         let cache = ShardCache::new(cache_config.clone()).unwrap();
@@ -2227,39 +2643,12 @@ mod tests {
             )
             .unwrap();
 
-        let advertisement =
-            local_cache_advertisement(&cache_config, "local-peer".to_owned()).unwrap();
-        assert_eq!(advertisement.hosted_shards.len(), 1);
-        assert_eq!(
-            advertisement.hosted_shards[0]
-                .seed_manifest
-                .as_deref()
-                .unwrap()
-                .source
-                .path,
-            "",
-            "network advertisements must not leak the importing user's path"
-        );
-        assert_eq!(advertisement.hosted_shards[0].layers, layers);
-
-        let mut registry = ShardRegistry::new();
-        registry.upsert(advertisement);
-        let manifest = manifest_for_model(
-            Some("gemma-4-12b-it-iq4-xs"),
-            &cache_config,
-            Some(&registry),
-        )
-        .unwrap();
-        let route = registry.route_for_model(&manifest).unwrap();
-        assert_eq!(route.len(), 1);
-        assert_eq!(route[0].layers, layers);
-
-        let view = available_model_views(&cache_config, Some(&registry))
-            .into_iter()
-            .find(|model| model.model_id == "gemma-4-12b-it-iq4-xs")
-            .unwrap();
-        assert_eq!(view.quantization.as_deref(), Some("IQ4_XS"));
-        assert!(view.runnable);
+        assert!(local_cache_advertisement(&cache_config, "local-peer".to_owned()).is_none());
+        assert!(manifest_for_model(Some("gemma-4-12b-it-iq4-xs"), &cache_config, None).is_err());
+        let views = available_model_views(&cache_config, None);
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].model_id, OFFICIAL_CHAT_MODEL_ID);
+        assert!(!views[0].installed);
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2381,10 +2770,14 @@ mod tests {
             version: "v1".to_owned(),
             protocol_version: PROTOCOL_VERSION,
         };
+        let mut local_advertisement = empty_advertisement("local-peer".to_owned(), String::new());
+        local_advertisement.available_ram_bytes = Some(8 * 1024 * 1024 * 1024);
+        let advertisements = vec![local_advertisement];
         let selected = model_records_to_download_for_local_contribution(
             &cache,
             "gemma",
             "local-peer",
+            &advertisements,
             vec![AdvertisedModelRecord { info: complete }],
         )
         .unwrap();

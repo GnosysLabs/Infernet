@@ -678,7 +678,12 @@ impl ShardCache {
             &info.checksum[..16.min(info.checksum.len())],
             data_extension(manifest)
         );
-        if manifest.is_some_and(|manifest| manifest.payload_kind == PAYLOAD_KIND_INFERNET_SHARD) {
+        if manifest.is_some_and(|manifest| {
+            matches!(
+                manifest.payload_kind.as_str(),
+                PAYLOAD_KIND_INFERNET_SHARD | PAYLOAD_KIND_FULL_MODEL
+            )
+        }) {
             self.config
                 .root
                 .join("data")

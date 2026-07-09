@@ -1,3 +1,4 @@
+pub mod capabilities;
 pub mod model_distribution;
 
 use std::collections::HashMap;
@@ -45,6 +46,8 @@ pub use model_distribution::{
 };
 use serde::Deserialize;
 use tokio::time::{Instant, interval, sleep};
+
+pub use capabilities::detect_node_capabilities;
 
 pub type ModelDistributionReadiness = oneshot::Sender<std::result::Result<String, String>>;
 
@@ -443,9 +446,12 @@ pub async fn run_worker_node(mut discovery: DiscoveryConfig, worker: WorkerConfi
                     &mut discovery.advertisement,
                     shard_cache.as_ref(),
                 )?;
-                if let Some(advertisement) = &discovery.advertisement {
-                    publish_advertisement(&mut swarm, &topic, advertisement)?;
-                }
+                publish_local_advertisement(
+                    &mut swarm,
+                    &topic,
+                    &mut discovery.advertisement,
+                    &worker.peer_id,
+                )?;
             }
             event = swarm.select_next_some() => {
                 if let Some(network_event) = handle_grid_event(
@@ -544,9 +550,12 @@ async fn run_model_distribution_node_inner(
             }
             _ = publish_interval.tick() => {
                 refresh_advertisement_model_shards(&mut discovery.advertisement, Some(&shard_cache))?;
-                if let Some(advertisement) = &discovery.advertisement {
-                    publish_advertisement(&mut swarm, &topic, advertisement)?;
-                }
+                publish_local_advertisement(
+                    &mut swarm,
+                    &topic,
+                    &mut discovery.advertisement,
+                    &peer_id,
+                )?;
                 if discovery.relay_advertisements {
                     publish_known_advertisements(
                         &mut swarm,
@@ -766,9 +775,12 @@ pub async fn fetch_model_shard_over_libp2p(
         tokio::select! {
             _ = publish_interval.tick() => {
                 refresh_advertisement_model_shards(&mut config.advertisement, Some(&cache))?;
-                if let Some(advertisement) = &config.advertisement {
-                    publish_advertisement(&mut swarm, &topic, advertisement)?;
-                }
+                publish_local_advertisement(
+                    &mut swarm,
+                    &topic,
+                    &mut config.advertisement,
+                    &local_peer_id,
+                )?;
             }
             event = swarm.select_next_some() => {
                 if let Some(network_event) = handle_grid_event(
@@ -860,9 +872,12 @@ pub async fn fetch_model_shard_over_libp2p(
                                         candidate.seed_manifest.clone(),
                                     )?;
                                     refresh_advertisement_model_shards(&mut config.advertisement, Some(&cache))?;
-                                    if let Some(advertisement) = &config.advertisement {
-                                        publish_advertisement(&mut swarm, &topic, advertisement)?;
-                                    }
+                                    publish_local_advertisement(
+                                        &mut swarm,
+                                        &topic,
+                                        &mut config.advertisement,
+                                        &local_peer_id,
+                                    )?;
 
                                     return Ok(ModelFetchResult {
                                         shard: candidate.shard,
@@ -999,9 +1014,12 @@ pub async fn fetch_model_source_over_libp2p(
         tokio::select! {
             _ = publish_interval.tick() => {
                 refresh_advertisement_model_shards(&mut config.advertisement, Some(&cache))?;
-                if let Some(advertisement) = &config.advertisement {
-                    publish_advertisement(&mut swarm, &topic, advertisement)?;
-                }
+                publish_local_advertisement(
+                    &mut swarm,
+                    &topic,
+                    &mut config.advertisement,
+                    &local_peer_id,
+                )?;
             }
             event = swarm.select_next_some() => {
                 if let Some(network_event) = handle_grid_event(
@@ -1126,9 +1144,12 @@ pub async fn fetch_model_source_over_libp2p(
                                     )
                                 })?;
                                 refresh_advertisement_model_shards(&mut config.advertisement, Some(&cache))?;
-                                if let Some(advertisement) = &config.advertisement {
-                                    publish_advertisement(&mut swarm, &topic, advertisement)?;
-                                }
+                                publish_local_advertisement(
+                                    &mut swarm,
+                                    &topic,
+                                    &mut config.advertisement,
+                                    &local_peer_id,
+                                )?;
                                 return Ok(ModelSourceFetchResult {
                                     model_id,
                                     source_checksum,
@@ -1261,17 +1282,17 @@ pub fn demo_advertisement(
     } else {
         vec![address]
     };
-
-    NodeAdvertisement {
+    enrich_local_advertisement(NodeAdvertisement {
         protocol_version: PROTOCOL_VERSION,
         peer_id,
         addresses,
         available_ram_bytes: None,
         available_vram_bytes: None,
         latency_hint_ms: None,
+        capabilities: None,
         hosted_shards: vec![ShardDescriptor::demo(model_id, layers)],
         model_shards: Vec::new(),
-    }
+    })
 }
 
 pub fn shard_advertisement(
@@ -1285,17 +1306,17 @@ pub fn shard_advertisement(
     } else {
         vec![address]
     };
-
-    NodeAdvertisement {
+    enrich_local_advertisement(NodeAdvertisement {
         protocol_version: PROTOCOL_VERSION,
         peer_id,
         addresses,
         available_ram_bytes: None,
         available_vram_bytes: None,
         latency_hint_ms: None,
+        capabilities: None,
         hosted_shards: vec![ShardDescriptor::for_manifest(manifest, layers)],
         model_shards: Vec::new(),
-    }
+    })
 }
 
 pub fn empty_advertisement(peer_id: String, address: String) -> NodeAdvertisement {
@@ -1304,7 +1325,6 @@ pub fn empty_advertisement(peer_id: String, address: String) -> NodeAdvertisemen
     } else {
         vec![address]
     };
-
     NodeAdvertisement {
         protocol_version: PROTOCOL_VERSION,
         peer_id,
@@ -1312,9 +1332,37 @@ pub fn empty_advertisement(peer_id: String, address: String) -> NodeAdvertisemen
         available_ram_bytes: None,
         available_vram_bytes: None,
         latency_hint_ms: None,
+        capabilities: None,
         hosted_shards: Vec::new(),
         model_shards: Vec::new(),
     }
+}
+
+pub fn local_capability_advertisement(peer_id: String, address: String) -> NodeAdvertisement {
+    enrich_local_advertisement(empty_advertisement(peer_id, address))
+}
+
+pub fn enrich_local_advertisement(mut advertisement: NodeAdvertisement) -> NodeAdvertisement {
+    let local_peer_id = advertisement.peer_id.clone();
+    refresh_local_advertisement_capabilities(&mut advertisement, &local_peer_id);
+    advertisement
+}
+
+pub fn refresh_local_advertisement_capabilities(
+    advertisement: &mut NodeAdvertisement,
+    local_peer_id: &str,
+) -> bool {
+    if advertisement.peer_id != local_peer_id {
+        return false;
+    }
+
+    let capabilities = detect_node_capabilities();
+    advertisement.available_ram_bytes =
+        (capabilities.available_ram_bytes > 0).then_some(capabilities.available_ram_bytes);
+    advertisement.available_vram_bytes = (capabilities.available_accelerator_memory_bytes > 0)
+        .then_some(capabilities.available_accelerator_memory_bytes);
+    advertisement.capabilities = Some(capabilities);
+    true
 }
 
 fn observed_peer_advertisement(
@@ -2838,7 +2886,7 @@ fn handle_grid_event(
             let peer_id = *swarm.local_peer_id();
             if advertise_listen_addresses && update_listen_address(advertisement, peer_id, address)
             {
-                if let Some(advertisement) = advertisement {
+                if let Some(advertisement) = advertisement.as_ref() {
                     println!(
                         "libp2p_listen={}",
                         advertisement
@@ -2847,8 +2895,8 @@ fn handle_grid_event(
                             .map(String::as_str)
                             .unwrap_or("<no-address>")
                     );
-                    publish_advertisement(swarm, topic, advertisement)?;
                 }
+                publish_local_advertisement(swarm, topic, advertisement, &peer_id.to_string())?;
             }
         }
         SwarmEvent::ConnectionEstablished {
@@ -3107,6 +3155,20 @@ fn publish_advertisement(
             gossipsub::PublishError::NoPeersSubscribedToTopic => Ok(()),
             error => Err(anyhow!("failed to publish shard advertisement: {error}")),
         })
+}
+
+fn publish_local_advertisement(
+    swarm: &mut Swarm<GridBehaviour>,
+    topic: &gossipsub::IdentTopic,
+    advertisement: &mut Option<NodeAdvertisement>,
+    local_peer_id: &str,
+) -> Result<()> {
+    let Some(advertisement) = advertisement else {
+        return Ok(());
+    };
+
+    refresh_local_advertisement_capabilities(advertisement, local_peer_id);
+    publish_advertisement(swarm, topic, advertisement)
 }
 
 fn publish_known_advertisements(

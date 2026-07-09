@@ -31,6 +31,24 @@ export interface PeerView {
   shards: ShardView[];
 }
 
+export interface MachineView {
+  peerId: string;
+  shortPeerId: string;
+  isLocal: boolean;
+  computeBackend: string;
+  deviceName: string;
+  logicalCpuCores: number;
+  totalMemoryBytes: number;
+  availableMemoryBytes: number;
+  unifiedMemory: boolean;
+  maxSessions: number;
+  activeSessions: number;
+  queueDepth: number;
+  measuredPrefillTokensPerSecond?: number | null;
+  measuredDecodeTokensPerSecond?: number | null;
+  hostedComponentCount: number;
+}
+
 export interface RouteHopView {
   peerId: string;
   shortPeerId: string;
@@ -82,6 +100,7 @@ export interface GridSnapshot {
   layerCount: number;
   networkPeerCount: number;
   peers: PeerView[];
+  machines: MachineView[];
   route: RouteHopView[];
   missingRanges?: string | null;
   coverage: CoverageSegment[];

@@ -36,6 +36,7 @@ fn shard_downloaders_become_seeders() {
     write_test_gguf(&seed_file).unwrap();
 
     let import_output = Command::new(binary)
+        .env("INFERNET_ALLOW_TEST_MODELS", "1")
         .args([
             "model",
             "add-local",

@@ -775,6 +775,38 @@ button:disabled {
   gap: 9px;
 }
 
+.library-actions {
+  border-top: 1px solid var(--border-soft);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding-top: 14px;
+}
+
+.library-actions button {
+  min-height: 36px;
+  flex: 1 1 150px;
+}
+
+.primary-button {
+  min-height: 42px;
+  border: 1px solid rgba(34, 184, 173, 0.55);
+  border-radius: 10px;
+  background: var(--accent);
+  color: #061313;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 0 14px;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.primary-button span {
+  color: inherit;
+}
+
 .library-empty {
   min-height: 150px;
   align-content: center;
@@ -1853,6 +1885,107 @@ summary:focus-visible {
   color: var(--accent);
   flex: none;
   margin-top: 1px;
+}
+
+.activity-quiet.inline {
+  border: 0;
+  background: transparent;
+  padding: 2px 0;
+}
+
+.machine-list {
+  display: grid;
+  gap: 8px;
+}
+
+.machine-row {
+  border: 1px solid rgba(37, 50, 65, 0.72);
+  border-radius: 10px;
+  background: rgba(10, 15, 21, 0.46);
+  display: grid;
+  gap: 10px;
+  padding: 11px;
+}
+
+.machine-row-main,
+.machine-capacity {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.machine-row-main > div,
+.machine-capacity {
+  min-width: 0;
+}
+
+.machine-row-main > div {
+  display: grid;
+  flex: 1;
+  gap: 2px;
+}
+
+.machine-row-main strong,
+.machine-capacity strong {
+  color: var(--soft);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.machine-row-main span:not(.machine-backend),
+.machine-capacity span,
+.machine-role,
+.machine-row code {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.35;
+}
+
+.machine-role {
+  color: #93aaa9;
+}
+
+.machine-backend {
+  min-width: 45px;
+  border: 1px solid rgba(114, 132, 153, 0.25);
+  border-radius: 6px;
+  color: var(--muted);
+  flex: none;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.07em;
+  padding: 4px 5px;
+  text-align: center;
+  text-transform: uppercase;
+}
+
+.machine-backend.cuda {
+  border-color: rgba(118, 185, 0, 0.34);
+  background: rgba(118, 185, 0, 0.08);
+  color: #a8d95a;
+}
+
+.machine-backend.metal {
+  border-color: rgba(34, 184, 173, 0.34);
+  background: rgba(34, 184, 173, 0.08);
+  color: #78d9d2;
+}
+
+.machine-backend.cpu {
+  background: rgba(114, 132, 153, 0.08);
+}
+
+.machine-capacity {
+  border-top: 1px solid rgba(37, 50, 65, 0.52);
+  padding-top: 9px;
+}
+
+.machine-row code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .technical-details {

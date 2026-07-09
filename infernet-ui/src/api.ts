@@ -16,6 +16,7 @@ export const emptySnapshot: GridSnapshot = {
   layerCount: 0,
   networkPeerCount: 0,
   peers: [],
+  machines: [],
   route: [],
   missingRanges: null,
   coverage: [],
@@ -58,6 +59,10 @@ export async function getGridSnapshot(
 
 export async function runDistributedInference(prompt: string, modelId: string): Promise<RunDemoResponse> {
   return invoke<RunDemoResponse>("run_demo_inference", { prompt, modelId });
+}
+
+export async function installOfficialModel(modelId: string): Promise<GridSnapshot> {
+  return invoke<GridSnapshot>("install_official_model", { modelId });
 }
 
 export async function listenForProgress(

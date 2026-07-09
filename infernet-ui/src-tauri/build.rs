@@ -11,6 +11,7 @@ fn prepare_llama_runtime() {
     println!("cargo:rerun-if-env-changed=INFERNET_SKIP_RUNTIME_PREPARE");
     println!("cargo:rerun-if-env-changed=INFERNET_LLAMA_CLI");
     println!("cargo:rerun-if-env-changed=LLAMA_CPP_REF");
+    println!("cargo:rerun-if-env-changed=INFERNET_CUDA");
 
     let script = std::path::Path::new("../../scripts/prepare-llama-runtime.mjs");
     let status = std::process::Command::new("node")

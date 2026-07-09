@@ -274,8 +274,8 @@ workflow:
 3. It plans a supported component layout and rejects storage amplification.
 4. It writes executable `.infershard` packages and an `.infermodel` manifest.
 5. Release validation exercises loading, routing, generation, integrity checks,
-   and the target hardware matrix, beginning with an RTX 3090-class node and two
-   Apple Silicon MacBook Pro nodes.
+   and the target hardware matrix, beginning with RTX 3090- and RTX 4060-class
+   nodes plus two Apple Silicon MacBook Pro nodes.
 6. The final manifest and components are checksummed, signed, versioned, and
    published to official seed nodes.
 
@@ -291,7 +291,11 @@ The current behavior is:
 
 - discovery finds peers advertising executable shards
 - the app can show that the model is available on the network
-- before chat, the node downloads executable shard files from peers when needed
+- chat uses already-ready local or remote components and never starts a hidden
+  multi-gigabyte download
+- storing the current 14.4 GB compatibility package requires the explicit
+  **Store 14.4 GB here** action; future smaller assigned components may be
+  acquired in the background
 - downloaded shards are verified
 - downloaded shards are cached locally
 - the node immediately begins seeding those shards
@@ -478,8 +482,9 @@ isolated maintainer cache:
 ```sh
 cargo run -p infernet-worker -- model add-local \
   --cache-dir /tmp/infernet-node \
-  --gguf /path/to/model.gguf \
-  --version v1
+  --model infernet-chat-v1 \
+  --gguf /path/to/gemma-4-26B_q4_0-it.gguf \
+  --version 1.0.0-compat.1
 ```
 
 Serve cached model shards:
@@ -494,10 +499,10 @@ Fetch a specific shard from peers:
 ```sh
 cargo run -p infernet-worker -- model fetch \
   --cache-dir /tmp/infernet-peer \
-  --model gemma-4-12b-it-iq4-xs \
-  --layers 0:8 \
-  --checksum <sha256> \
-  --version v1
+  --model infernet-chat-v1 \
+  --layers 0:30 \
+  --checksum 4c856523d61d77922dbc0b26753a6bf6208e5d69d80db0c04dcd776832d054c5 \
+  --version 1.0.0-compat.1
 ```
 
 Download and immediately mirror:
@@ -505,10 +510,10 @@ Download and immediately mirror:
 ```sh
 cargo run -p infernet-worker -- model mirror \
   --cache-dir /tmp/infernet-peer \
-  --model gemma-4-12b-it-iq4-xs \
-  --layers 0:8 \
-  --checksum <sha256> \
-  --version v1
+  --model infernet-chat-v1 \
+  --layers 0:30 \
+  --checksum 4c856523d61d77922dbc0b26753a6bf6208e5d69d80db0c04dcd776832d054c5 \
+  --version 1.0.0-compat.1
 ```
 
 List local cache state:
@@ -518,10 +523,11 @@ cargo run -p infernet-worker -- model list \
   --cache-dir /tmp/infernet-peer
 ```
 
-`model add-local` and `model import` are internal compatibility/debug commands.
-They do not make arbitrary models part of the Infernet catalog. Production
-nodes accept only package identities, versions, checksums, and signatures from
-the official release channel.
+`model add-local` is locked to the pinned Infernet Chat release in normal
+builds. Other low-level model commands are protocol test tooling; they do not
+make arbitrary models part of the Infernet catalog. Production desktop nodes
+accept only the exact official model ID, version, byte count, layer coverage,
+and SHA-256 trust anchor.
 
 ## Toy Split-Inference Demo
 
@@ -652,16 +658,22 @@ Important limitations:
   storage behavior are verified.
 - The launch catalog contains only official curated packages. Arbitrary model
   import is intentionally outside the product scope.
-- Package planning is not yet hardware-aware.
-- The scheduler does not yet optimize for RAM, VRAM, latency, or bandwidth.
+- Nodes now advertise CUDA, Metal, or CPU capacity, free compute memory, CPU
+  cores, session load, queue depth, and optional measured throughput.
+- The fixed-component planner is memory- and load-aware: it reserves weights,
+  KV cache, runtime scratch space, and a safety margin, then assigns contiguous
+  ranges without rewriting or duplicating component bytes. Bandwidth-aware
+  scheduling is still future work.
 - WAN connectivity still needs relay/hole-punching for difficult NAT cases.
 - Downloads are chunked and verified, but not resumable.
 - Multi-source downloads are not implemented.
 - Automatic replication and self-healing are not implemented.
 - Distributed split execution is experimental and currently focused on
   contiguous layer ranges for explicitly supported official models.
-- The bridge is intended to prove a prompt pass plus a sampled token; persistent
-  distributed KV-cache streaming for long chat responses is future work.
+- Persistent distributed KV-cache streaming for reliable multi-token chat is
+  still the release gate. Until it lands, partial Gemma packages remain
+  unavailable in the launch catalog even though capacity planning and placement
+  are implemented.
 - There is no cryptographic proof that a peer executed a layer correctly.
 - There is no privacy layer; peers can inspect the activations they process.
 - The trust model currently assumes participants are cooperative.

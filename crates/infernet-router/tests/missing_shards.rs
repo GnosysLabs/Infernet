@@ -10,6 +10,7 @@ fn advertisement(peer_id: &str, model_id: &str, layers: LayerRange) -> NodeAdver
         available_ram_bytes: None,
         available_vram_bytes: None,
         latency_hint_ms: None,
+        capabilities: None,
         hosted_shards: vec![ShardDescriptor {
             model_id: model_id.to_owned(),
             layers,

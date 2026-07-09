@@ -21,6 +21,7 @@ import {
   getGridSnapshot,
   getLocalIdentity,
   getManualPeers,
+  installOfficialModel,
   listenForProgress,
   listenForModelImportProgress,
   runDistributedInference,
@@ -64,6 +65,7 @@ export default function App() {
   const [route, setRoute] = useState<RouteHopView[]>([]);
   const [lastError, setLastError] = useState<string | null>(null);
   const [transferActivities, setTransferActivities] = useState<TransferActivity[]>([]);
+  const [installingModelId, setInstallingModelId] = useState<string | null>(null);
 
   const officialModels = useMemo(
     () => snapshot.availableModels.filter(isOfficialInfernetModel),
@@ -158,6 +160,32 @@ export default function App() {
   }, [refreshSnapshot, selectedModel]);
 
   useEffect(() => {
+    if (!activityOpen) return;
+    let disposed = false;
+    let inFlight = false;
+    const refreshActivity = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const nextSnapshot = await getGridSnapshot(2500, selectedModel);
+        if (!disposed) {
+          setSnapshot(nextSnapshot);
+          if (!isRunning) setRoute(nextSnapshot.route);
+        }
+      } catch {
+        // The primary refresh path owns user-visible connection errors.
+      } finally {
+        inFlight = false;
+      }
+    };
+    const interval = window.setInterval(refreshActivity, 6000);
+    return () => {
+      disposed = true;
+      window.clearInterval(interval);
+    };
+  }, [activityOpen, isRunning, selectedModel]);
+
+  useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
     listenForProgress(applyProgressEvent).then((dispose) => {
@@ -205,6 +233,25 @@ export default function App() {
     setStatus("Connecting");
   }
 
+  async function handleInstallModel(modelId: string) {
+    if (installingModelId) return;
+    setInstallingModelId(modelId);
+    setActivityOpen(true);
+    setLastError(null);
+    setStatus("Preparing model storage");
+    try {
+      const nextSnapshot = await installOfficialModel(modelId);
+      setSnapshot(nextSnapshot);
+      setRoute(nextSnapshot.route);
+      setStatus("Ready");
+    } catch (error) {
+      setLastError(String(error));
+      setStatus("Needs attention");
+    } finally {
+      setInstallingModelId(null);
+    }
+  }
+
   async function runInference() {
     const userPrompt = prompt.trim();
     if (!userPrompt || isRunning) {
@@ -215,7 +262,7 @@ export default function App() {
       setStatus("No models");
       return;
     }
-    if (!selectedModelView.runnable && selectedModelView.installed) {
+    if (!selectedModelView.runnable) {
       setLastError(selectedModelView.status);
       setStatus("Model not ready");
       return;
@@ -288,6 +335,8 @@ export default function App() {
             snapshot={snapshot}
             selectedModel={selectedModel}
             onModelChange={handleModelChange}
+            onInstallModel={handleInstallModel}
+            installingModelId={installingModelId}
           />
         ) : null}
 
@@ -641,6 +690,45 @@ function ActivitySidebar({
           </section>
         ) : null}
 
+        <section className="activity-sidebar-section">
+          <div className="sidebar-section-heading">
+            <strong>Available compute</strong>
+            <span>{snapshot.machines.length} machine{snapshot.machines.length === 1 ? "" : "s"}</span>
+          </div>
+          {snapshot.machines.length === 0 ? (
+            <div className="activity-quiet inline">
+              <Laptop2 size={17} />
+              <span>Waiting for machine capacity reports.</span>
+            </div>
+          ) : (
+            <div className="machine-list">
+              {snapshot.machines.map((machine) => (
+                <div className="machine-row" key={machine.peerId}>
+                  <div className="machine-row-main">
+                    <span className={`machine-backend ${machine.computeBackend}`}>
+                      {machineBackendLabel(machine.computeBackend)}
+                    </span>
+                    <div>
+                      <strong>{machine.isLocal ? "This Mac" : machine.deviceName}</strong>
+                      <span>{machine.isLocal ? machine.deviceName : `${machine.logicalCpuCores} CPU cores`}</span>
+                    </div>
+                  </div>
+                  <div className="machine-capacity">
+                    <strong>
+                      {formatBytes(machine.availableMemoryBytes)} free of {formatBytes(machine.totalMemoryBytes)}
+                    </strong>
+                    <span>{machineLoadLabel(machine.activeSessions, machine.maxSessions, machine.queueDepth)}</span>
+                  </div>
+                  <span className="machine-role">
+                    {machineRoleLabel(machine.peerId, machine.hostedComponentCount, route, isRunning)}
+                  </span>
+                  {developerMode ? <code>{machine.peerId}</code> : null}
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+
         {activeTransfers.length > 0 ? (
           <section className="activity-sidebar-section">
             <div className="sidebar-section-heading">
@@ -752,10 +840,14 @@ function ModelsPage({
   snapshot,
   selectedModel,
   onModelChange,
+  onInstallModel,
+  installingModelId,
 }: {
   snapshot: GridSnapshot;
   selectedModel: string;
   onModelChange: (modelId: string) => void;
+  onInstallModel: (modelId: string) => void;
+  installingModelId: string | null;
 }) {
   const officialModels = snapshot.availableModels.filter(isOfficialInfernetModel);
 
@@ -794,11 +886,11 @@ function ModelsPage({
         ) : (
           officialModels.map((model) => {
             const installed = model.installed || snapshot.distribution.installedModels.includes(model.modelId);
+            const installing = installingModelId === model.modelId;
             return (
-              <button
+              <div
                 className={selectedModel === model.modelId ? "library-card active" : "library-card"}
                 key={model.modelId}
-                onClick={() => onModelChange(model.modelId)}
               >
                 <div>
                   <span className="model-edition">Infernet edition</span>
@@ -810,7 +902,22 @@ function ModelsPage({
                   <ProgressBar progress={installed ? 100 : 0} />
                   <small>{model.runnable ? "Ready to chat" : "Preparing for this network"}</small>
                 </div>
-              </button>
+                <div className="library-actions">
+                  <button className="secondary-button" onClick={() => onModelChange(model.modelId)}>
+                    Use in chat
+                  </button>
+                  {!installed ? (
+                    <button
+                      className="primary-button"
+                      disabled={installing}
+                      onClick={() => onInstallModel(model.modelId)}
+                    >
+                      <Download size={15} />
+                      <span>{installing ? "Preparing…" : "Store 14.4 GB here"}</span>
+                    </button>
+                  ) : null}
+                </div>
+              </div>
             );
           })
         )}
@@ -1206,6 +1313,41 @@ function formatRelativeTime(timestamp: number): string {
   if (seconds < 60) return `${seconds} sec ago`;
   const minutes = Math.round(seconds / 60);
   return minutes === 1 ? "1 min ago" : `${minutes} min ago`;
+}
+
+function machineBackendLabel(backend: string): string {
+  if (backend === "cuda") return "CUDA";
+  if (backend === "metal") return "Metal";
+  return "CPU";
+}
+
+function machineLoadLabel(activeSessions: number, maxSessions: number, queueDepth: number): string {
+  if (queueDepth > 0) {
+    return `${activeSessions}/${maxSessions} active · ${queueDepth} queued`;
+  }
+  if (activeSessions > 0) {
+    return `${activeSessions}/${maxSessions} sessions active`;
+  }
+  return "Ready";
+}
+
+function machineRoleLabel(
+  peerId: string,
+  hostedComponentCount: number,
+  route: RouteHopView[],
+  isRunning: boolean,
+): string {
+  const assignment = route.find((hop) => hop.peerId === peerId);
+  if (assignment && isRunning) {
+    return `Working on layers ${assignment.layerStart + 1}–${assignment.layerEnd}`;
+  }
+  if (assignment) {
+    return `Assigned layers ${assignment.layerStart + 1}–${assignment.layerEnd}`;
+  }
+  if (hostedComponentCount > 0) {
+    return `Stores ${hostedComponentCount} verified model part${hostedComponentCount === 1 ? "" : "s"}`;
+  }
+  return "Ready to receive a model part";
 }
 
 function friendlyActivityError(error: string): string {

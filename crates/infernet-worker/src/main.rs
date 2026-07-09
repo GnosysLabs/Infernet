@@ -3,13 +3,14 @@ use std::{fs, path::PathBuf, time::Duration};
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 use infernet_model::{
-    GgufShardManifest, GgufSourceMetadata, LayerRange, ModelManifest, RuntimeKind, ShardMetadata,
-    TokenizerCompatibility, gguf,
+    GgufShardManifest, GgufSourceMetadata, LayerRange, ModelManifest, OfficialModelRelease,
+    RuntimeKind, ShardDescriptor, ShardMetadata, TokenizerCompatibility, gguf,
 };
 use infernet_node::{
     DiscoveryConfig, ShardCache, ShardCacheConfig, WorkerConfig, discover_for, empty_advertisement,
-    fetch_model_shard_over_libp2p, import_seed_model_from_file, infer_over_libp2p,
-    load_or_generate_keypair, run_model_distribution_node, run_worker_node, shard_advertisement,
+    enrich_local_advertisement, fetch_model_shard_over_libp2p, import_seed_model_from_file,
+    infer_over_libp2p, load_or_generate_keypair, local_capability_advertisement,
+    run_model_distribution_node, run_worker_node,
 };
 use infernet_protocol::{ModelShardInfo, NodeAdvertisement, RouteHop};
 use infernet_router::ShardRegistry;
@@ -144,11 +145,11 @@ enum ModelCommand {
 struct ModelAddLocalArgs {
     #[command(flatten)]
     cache: ModelCacheArgs,
-    #[arg(long)]
-    model: Option<String>,
+    #[arg(long, default_value = "infernet-chat-v1")]
+    model: String,
     #[arg(long)]
     gguf: PathBuf,
-    #[arg(long, default_value = "v1")]
+    #[arg(long, default_value = "1.0.0-compat.1")]
     version: String,
 }
 
@@ -252,7 +253,8 @@ async fn bootstrap(args: BootstrapArgs) -> Result<()> {
     discovery.dial_discovered_peers = false;
     discovery.relay_advertisements = true;
 
-    let mut bootstrap_advertisement = empty_advertisement(peer_id.clone(), String::new());
+    let mut bootstrap_advertisement =
+        local_capability_advertisement(peer_id.clone(), String::new());
     if let Some(ip) = args.public_ip.as_deref() {
         bootstrap_advertisement
             .addresses
@@ -292,10 +294,40 @@ async fn bootstrap(args: BootstrapArgs) -> Result<()> {
 }
 
 fn add_local_model(args: ModelAddLocalArgs) -> Result<()> {
-    let manifest = match args.model {
-        Some(model) => manifest_for_model(&model)?,
-        None => manifest_from_gguf_source(&args.gguf)?,
-    };
+    let manifest = manifest_for_model(&args.model)?;
+    let release = OfficialModelRelease::infernet_chat_v1_compatibility();
+    let test_model_allowed = cfg!(debug_assertions)
+        && std::env::var("INFERNET_ALLOW_TEST_MODELS").as_deref() == Ok("1")
+        && manifest.runtime_kind == RuntimeKind::Demo;
+    if !test_model_allowed
+        && (manifest.model_id != release.model_id || args.version != release.version)
+    {
+        return Err(anyhow!(
+            "model add-local is reserved for official release {} version {}",
+            release.model_id,
+            release.version
+        ));
+    }
+    if !test_model_allowed {
+        let source_size_bytes = fs::metadata(&args.gguf)
+            .with_context(|| format!("failed to inspect {}", args.gguf.display()))?
+            .len();
+        if source_size_bytes != release.expected_total_bytes {
+            return Err(anyhow!(
+                "official source size mismatch; expected {}, got {}",
+                release.expected_total_bytes,
+                source_size_bytes
+            ));
+        }
+        let source_checksum = gguf::sha256_file(&args.gguf)?;
+        if source_checksum != release.upstream.source_sha256 {
+            return Err(anyhow!(
+                "official source checksum mismatch; expected {}, got {}",
+                release.upstream.source_sha256,
+                source_checksum
+            ));
+        }
+    }
     let cache = ShardCache::new(cache_config(&args.cache))?;
     let summary = import_seed_model_from_file(&cache, &args.gguf, &manifest, args.version)?;
 
@@ -324,12 +356,12 @@ async fn serve(args: ServeArgs) -> Result<()> {
     discovery.p2p_listen = args.p2p_listen;
     let peer_id = discovery.peer_id().to_string();
 
-    discovery.advertisement = Some(shard_advertisement(
+    discovery.advertisement = Some(enrich_local_advertisement(shard_descriptor_advertisement(
         peer_id.clone(),
         String::new(),
         &manifest,
         owned_layers,
-    ));
+    )));
 
     println!("peer_id={peer_id}");
     println!("model={}", manifest.model_id);
@@ -439,91 +471,6 @@ fn manifest_for_model(model: &str) -> Result<ModelManifest> {
     })
 }
 
-fn manifest_from_gguf_source(source: &PathBuf) -> Result<ModelManifest> {
-    let info = gguf::parse_gguf_info(source)?;
-    let display_name =
-        display_name_from_source_path(source).unwrap_or_else(|| "Imported GGUF Model".to_owned());
-    let model_id = model_id_from_source_path(source);
-    Ok(ModelManifest::from_gguf_info(
-        model_id,
-        display_name,
-        &info,
-    )?)
-}
-
-fn display_name_from_source_path(path: &PathBuf) -> Option<String> {
-    let file_name = path.file_name()?.to_str()?;
-    let without_ext = file_name
-        .strip_suffix(".gguf")
-        .or_else(|| file_name.strip_suffix(".GGUF"))
-        .unwrap_or(file_name);
-    let name = without_ext
-        .replace(['_', '-', '.'], " ")
-        .split_whitespace()
-        .map(format_model_name_part)
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    (!name.is_empty()).then_some(name)
-}
-
-fn model_id_from_source_path(path: &PathBuf) -> String {
-    let name = path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .or_else(|| path.file_name().and_then(|value| value.to_str()))
-        .unwrap_or("gguf-model");
-    model_id_from_name(name)
-}
-
-fn model_id_from_name(name: &str) -> String {
-    let mut output = String::new();
-    let mut last_was_separator = false;
-
-    for ch in name.chars().flat_map(|ch| ch.to_lowercase()) {
-        if ch.is_ascii_alphanumeric() || ch == '.' {
-            output.push(ch);
-            last_was_separator = false;
-        } else if !last_was_separator && !output.is_empty() {
-            output.push('-');
-            last_was_separator = true;
-        }
-    }
-
-    while output.ends_with('-') {
-        output.pop();
-    }
-
-    if output.is_empty() {
-        "gguf-model".to_owned()
-    } else {
-        output
-    }
-}
-
-fn format_model_name_part(part: &str) -> String {
-    let lower = part.to_ascii_lowercase();
-    match lower.as_str() {
-        "gguf" => "GGUF".to_owned(),
-        "llama" => "Llama".to_owned(),
-        "gemma" => "Gemma".to_owned(),
-        "qwen" => "Qwen".to_owned(),
-        "mistral" => "Mistral".to_owned(),
-        "instruct" => "Instruct".to_owned(),
-        "it" => "IT".to_owned(),
-        "q4" | "q5" | "q6" | "q8" | "k" | "m" | "s" | "xs" => lower.to_ascii_uppercase(),
-        value
-            if value.ends_with('b')
-                && value[..value.len() - 1]
-                    .chars()
-                    .all(|ch| ch.is_ascii_digit()) =>
-        {
-            value.to_ascii_uppercase()
-        }
-        _ => part.to_owned(),
-    }
-}
-
 fn parse_layer_range(input: &str) -> Result<LayerRange> {
     let separator = if input.contains(':') { ':' } else { '-' };
     let (start, end) = input
@@ -559,12 +506,25 @@ fn parse_static_peer(input: &str, manifest: &ModelManifest) -> Result<NodeAdvert
         .ok_or_else(|| anyhow!("static peer must include #start:end"))?;
     let layers = parse_layer_range(layers)?;
 
-    Ok(shard_advertisement(
+    Ok(shard_descriptor_advertisement(
         peer.to_owned(),
         address.to_owned(),
         manifest,
         layers,
     ))
+}
+
+fn shard_descriptor_advertisement(
+    peer_id: String,
+    address: String,
+    manifest: &ModelManifest,
+    layers: LayerRange,
+) -> NodeAdvertisement {
+    let mut advertisement = empty_advertisement(peer_id, address);
+    advertisement
+        .hosted_shards
+        .push(ShardDescriptor::for_manifest(manifest, layers));
+    advertisement
 }
 
 fn build_shard(args: ShardBuildArgs) -> Result<()> {
@@ -689,6 +649,10 @@ async fn serve_model_distribution(args: ModelServeArgs) -> Result<()> {
     let mut discovery = DiscoveryConfig::new(args.topic);
     discovery.p2p_listen = args.p2p_listen;
     let peer_id = discovery.peer_id().to_string();
+    discovery.advertisement = Some(local_capability_advertisement(
+        peer_id.clone(),
+        String::new(),
+    ));
     println!("peer_id={peer_id}");
     println!("model_protocol=/infernet/model/1");
     println!("cache={}", args.cache.cache_dir.display());
@@ -706,6 +670,10 @@ async fn fetch_model_shard(args: ModelFetchArgs, mirror_after_download: bool) ->
         .iter()
         .map(|peer| parse_static_model_peer(peer))
         .collect::<Result<Vec<_>>>()?;
+    discovery.advertisement = Some(local_capability_advertisement(
+        discovery.peer_id().to_string(),
+        String::new(),
+    ));
     let serving_discovery = discovery.clone();
     let cache_config = cache_config(&args.cache);
     let result = fetch_model_shard_over_libp2p(
@@ -939,6 +907,29 @@ fn print_route(route: &[RouteHop]) {
         println!(
             "{} {} {}:{} {}",
             index, hop.peer_id, hop.layers.start, hop.layers.end, hop.address
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn static_peer_descriptor_does_not_claim_local_capabilities() {
+        let advertisement = parse_static_peer(
+            "remote-peer@/ip4/127.0.0.1/tcp/7001#0:3",
+            &ModelManifest::demo(),
+        )
+        .unwrap();
+
+        assert!(advertisement.capabilities.is_none());
+        assert!(advertisement.available_ram_bytes.is_none());
+        assert!(advertisement.available_vram_bytes.is_none());
+        assert_eq!(advertisement.hosted_shards.len(), 1);
+        assert_eq!(
+            advertisement.hosted_shards[0].layers,
+            LayerRange::new(0, 3).unwrap()
         );
     }
 }

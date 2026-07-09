@@ -123,6 +123,27 @@ impl ModelBlobResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NodeCapabilities {
+    pub os: String,
+    pub arch: String,
+    pub compute_backend: String,
+    pub device_name: String,
+    pub logical_cpu_cores: u32,
+    pub total_ram_bytes: u64,
+    pub available_ram_bytes: u64,
+    pub total_accelerator_memory_bytes: u64,
+    pub available_accelerator_memory_bytes: u64,
+    pub unified_memory: bool,
+    pub max_sessions: u32,
+    pub active_sessions: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured_prefill_tokens_per_second: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured_decode_tokens_per_second: Option<f32>,
+    pub queue_depth: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeAdvertisement {
     pub protocol_version: u32,
     pub peer_id: String,
@@ -130,6 +151,8 @@ pub struct NodeAdvertisement {
     pub available_ram_bytes: Option<u64>,
     pub available_vram_bytes: Option<u64>,
     pub latency_hint_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<NodeCapabilities>,
     pub hosted_shards: Vec<ShardDescriptor>,
     #[serde(default)]
     pub model_shards: Vec<ModelShardInfo>,
@@ -405,5 +428,65 @@ mod tests {
         let decoded_response: ModelShardResponse = serde_json::from_slice(&response_bytes).unwrap();
         assert_eq!(decoded_response, response);
         assert_eq!(MODEL_PROTOCOL, "/infernet/model/1");
+    }
+
+    #[test]
+    fn legacy_advertisement_without_capabilities_still_deserializes() {
+        let json = r#"{
+            "protocol_version": 1,
+            "peer_id": "legacy-peer",
+            "addresses": [],
+            "available_ram_bytes": 4096,
+            "available_vram_bytes": null,
+            "latency_hint_ms": 12,
+            "hosted_shards": []
+        }"#;
+
+        let advertisement: NodeAdvertisement = serde_json::from_str(json).unwrap();
+        assert_eq!(advertisement.peer_id, "legacy-peer");
+        assert_eq!(advertisement.available_ram_bytes, Some(4096));
+        assert_eq!(advertisement.capabilities, None);
+        assert!(advertisement.model_shards.is_empty());
+    }
+
+    #[test]
+    fn capabilities_roundtrip_and_none_is_omitted() {
+        let capabilities = NodeCapabilities {
+            os: "linux".to_owned(),
+            arch: "x86_64".to_owned(),
+            compute_backend: "cuda".to_owned(),
+            device_name: "NVIDIA GeForce RTX 3090".to_owned(),
+            logical_cpu_cores: 16,
+            total_ram_bytes: 64 * 1024 * 1024 * 1024,
+            available_ram_bytes: 48 * 1024 * 1024 * 1024,
+            total_accelerator_memory_bytes: 24 * 1024 * 1024 * 1024,
+            available_accelerator_memory_bytes: 20 * 1024 * 1024 * 1024,
+            unified_memory: false,
+            max_sessions: 1,
+            active_sessions: 0,
+            measured_prefill_tokens_per_second: Some(92.5),
+            measured_decode_tokens_per_second: Some(31.25),
+            queue_depth: 0,
+        };
+        let advertisement = NodeAdvertisement {
+            protocol_version: PROTOCOL_VERSION,
+            peer_id: "gpu-peer".to_owned(),
+            addresses: Vec::new(),
+            available_ram_bytes: Some(capabilities.available_ram_bytes),
+            available_vram_bytes: Some(capabilities.available_accelerator_memory_bytes),
+            latency_hint_ms: None,
+            capabilities: Some(capabilities),
+            hosted_shards: Vec::new(),
+            model_shards: Vec::new(),
+        };
+
+        let bytes = serde_json::to_vec(&advertisement).unwrap();
+        let decoded: NodeAdvertisement = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(decoded, advertisement);
+
+        let mut without_capabilities = advertisement;
+        without_capabilities.capabilities = None;
+        let value = serde_json::to_value(without_capabilities).unwrap();
+        assert!(value.get("capabilities").is_none());
     }
 }

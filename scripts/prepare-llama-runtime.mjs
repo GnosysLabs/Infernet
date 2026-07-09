@@ -28,7 +28,7 @@ const sidecarPath = `${cliSidecarBase}-${targetTriple}${executableSuffix}`;
 const bridgeSidecarPath = `${bridgeSidecarBase}-${targetTriple}${executableSuffix}`;
 const runtimeStampPath = resolve(sidecarDir, `.infernet-llama-runtime-${targetTriple}.stamp`);
 const runtimeLockPath = resolve(sidecarDir, `.infernet-llama-runtime-${targetTriple}.lock`);
-const runtimePatchVersion = "infernet-chat-generation-v3";
+const runtimePatchVersion = "infernet-capacity-gpu-v5";
 const buildRoot = resolve(repoRoot, "target", "llama.cpp-runtime");
 const sourceDir = join(buildRoot, "llama.cpp");
 const buildDir = join(buildRoot, `build-${targetTriple}`);
@@ -243,6 +243,9 @@ function buildFromSource() {
   ];
   if (process.platform === "darwin") {
     cmakeArgs.push("-DGGML_METAL=ON");
+  }
+  if (process.env.INFERNET_CUDA === "1") {
+    cmakeArgs.push("-DGGML_CUDA=ON");
   }
 
   run("cmake", cmakeArgs);

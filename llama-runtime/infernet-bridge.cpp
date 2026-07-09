@@ -48,6 +48,17 @@ static bool parse_u32(const char * text, uint32_t & out) {
     return true;
 }
 
+static bool parse_i32(const char * text, int32_t & out) {
+    char * end = nullptr;
+    errno = 0;
+    const long value = std::strtol(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0' || value < INT32_MIN || value > INT32_MAX) {
+        return false;
+    }
+    out = static_cast<int32_t>(value);
+    return true;
+}
+
 static std::vector<float> read_f32_file(const std::string & path) {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file) {
@@ -142,7 +153,7 @@ static std::string format_chat_prompt(const llama_model * model, const std::stri
 
 static void print_usage(const char * argv0) {
     std::cerr
-        << "usage: " << argv0 << " --model file.gguf --layer-start N --layer-end N --hidden-size N --threads N --prompt text [--full-model] [--input activation.bin] [--output activation.bin]\n"
+        << "usage: " << argv0 << " --model file.gguf --layer-start N --layer-end N --hidden-size N --threads N --prompt text [--gpu-layers N] [--max-context N] [--full-model] [--input activation.bin] [--output activation.bin]\n"
         << "\n"
         << "Runs a patched llama.cpp layer-range graph. If --input is omitted, tokens are embedded and execution starts at layer 0.\n"
         << "If --layer-end is less than the model layer count, hidden activations are written to --output.\n"
@@ -160,6 +171,8 @@ int main(int argc, char ** argv) {
     uint32_t layer_end = 0;
     uint32_t hidden_size = 0;
     uint32_t threads = 4;
+    uint32_t max_context_tokens = 8192;
+    int32_t gpu_layers = -1;
     bool full_model = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -195,6 +208,14 @@ int main(int argc, char ** argv) {
             if (!parse_u32(need_value("--threads"), threads) || threads == 0 || threads > 64) {
                 throw std::runtime_error("invalid --threads");
             }
+        } else if (arg == "--gpu-layers") {
+            if (!parse_i32(need_value("--gpu-layers"), gpu_layers)) {
+                throw std::runtime_error("invalid --gpu-layers");
+            }
+        } else if (arg == "--max-context") {
+            if (!parse_u32(need_value("--max-context"), max_context_tokens) || max_context_tokens == 0) {
+                throw std::runtime_error("invalid --max-context");
+            }
         } else if (arg == "--full-model") {
             full_model = true;
         } else if (arg == "--help" || arg == "-h") {
@@ -216,7 +237,9 @@ int main(int argc, char ** argv) {
         ggml_backend_load_all();
 
         llama_model_params model_params = llama_model_default_params();
-        model_params.n_gpu_layers = 0;
+        // llama.cpp treats a negative value as all available layers. CPU-only
+        // builds safely keep them on CPU; CUDA/Metal builds offload the shard.
+        model_params.n_gpu_layers = gpu_layers;
         model_params.use_mmap = true;
         model_params.infernet_partial = !full_model;
         if (!full_model) {
@@ -273,6 +296,12 @@ int main(int argc, char ** argv) {
         constexpr uint32_t max_generated_tokens = 32;
         llama_context_params ctx_params = llama_context_default_params();
         const size_t context_tokens = tokens.size() + (layer_end == model_layers ? max_generated_tokens : 0);
+        if (context_tokens > max_context_tokens) {
+            std::ostringstream error;
+            error << "request needs " << context_tokens
+                  << " context tokens, exceeding the Infernet launch cap of " << max_context_tokens;
+            throw std::runtime_error(error.str());
+        }
         ctx_params.n_ctx = static_cast<uint32_t>(std::max<size_t>(context_tokens, 1));
         ctx_params.n_batch = static_cast<uint32_t>(tokens.size());
         ctx_params.n_ubatch = static_cast<uint32_t>(tokens.size());
