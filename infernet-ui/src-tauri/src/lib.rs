@@ -1226,7 +1226,12 @@ fn remote_network_peer_count(local_peer_id: &str, advertisements: &[NodeAdvertis
         .iter()
         .filter(|advertisement| advertisement.peer_id != local_peer_id)
         .filter(|advertisement| !bootstrap_peer_ids.contains(&advertisement.peer_id))
+        .filter(|advertisement| advertisement_has_capacity(advertisement))
         .count()
+}
+
+fn advertisement_has_capacity(advertisement: &NodeAdvertisement) -> bool {
+    !advertisement.hosted_shards.is_empty() || !advertisement.model_shards.is_empty()
 }
 
 fn default_bootstrap_peer_ids() -> Vec<String> {
@@ -2328,6 +2333,25 @@ mod tests {
         assert!(manifest_for_model(None, &cache_config, None).is_err());
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remote_peer_count_ignores_connection_only_advertisements() {
+        let connection_only = empty_advertisement("remote-connection".to_owned(), String::new());
+        let mut capacity = empty_advertisement("remote-capacity".to_owned(), String::new());
+        capacity.model_shards.push(ModelShardInfo {
+            model_id: "gemma".to_owned(),
+            layers: LayerRange::new(0, 8).unwrap(),
+            checksum: "checksum".to_owned(),
+            size_bytes: 8,
+            version: "v1".to_owned(),
+            protocol_version: PROTOCOL_VERSION,
+        });
+
+        assert_eq!(
+            remote_network_peer_count("local-peer", &[connection_only, capacity]),
+            1
+        );
     }
 
     #[test]

@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    time::{Duration, Instant},
+};
 
 use infernet_model::{LayerRange, ModelError, ModelManifest, validate_contiguous_coverage};
 use infernet_protocol::{NodeAdvertisement, RouteHop};
@@ -32,26 +36,57 @@ pub enum RouterError {
     InvalidCoverage(#[from] ModelError),
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ShardRegistry {
-    advertisements: BTreeMap<String, NodeAdvertisement>,
+    advertisements: BTreeMap<String, RegistryEntry>,
+    ttl: Duration,
+}
+
+#[derive(Debug, Clone)]
+struct RegistryEntry {
+    advertisement: NodeAdvertisement,
+    seen_at: Instant,
+}
+
+impl Default for ShardRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ShardRegistry {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_ttl(Duration::from_secs(45))
+    }
+
+    pub fn with_ttl(ttl: Duration) -> Self {
+        Self {
+            advertisements: BTreeMap::new(),
+            ttl,
+        }
     }
 
     pub fn upsert(&mut self, advertisement: NodeAdvertisement) {
-        self.advertisements
-            .insert(advertisement.peer_id.clone(), advertisement);
+        self.advertisements.insert(
+            advertisement.peer_id.clone(),
+            RegistryEntry {
+                advertisement,
+                seen_at: Instant::now(),
+            },
+        );
     }
 
     pub fn merge(&mut self, advertisement: NodeAdvertisement) {
         self.advertisements
             .entry(advertisement.peer_id.clone())
-            .and_modify(|existing| merge_advertisement(existing, &advertisement))
-            .or_insert(advertisement);
+            .and_modify(|existing| {
+                merge_advertisement(&mut existing.advertisement, &advertisement);
+                existing.seen_at = Instant::now();
+            })
+            .or_insert_with(|| RegistryEntry {
+                advertisement,
+                seen_at: Instant::now(),
+            });
     }
 
     pub fn extend(&mut self, advertisements: impl IntoIterator<Item = NodeAdvertisement>) {
@@ -61,15 +96,20 @@ impl ShardRegistry {
     }
 
     pub fn len(&self) -> usize {
-        self.advertisements.len()
+        self.advertisements().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.advertisements.is_empty()
+        self.advertisements().is_empty()
     }
 
     pub fn advertisements(&self) -> Vec<NodeAdvertisement> {
-        self.advertisements.values().cloned().collect()
+        let now = Instant::now();
+        self.advertisements
+            .values()
+            .filter(|entry| now.duration_since(entry.seen_at) <= self.ttl)
+            .map(|entry| entry.advertisement.clone())
+            .collect()
     }
 
     pub fn route_for_model(&self, manifest: &ModelManifest) -> Result<Vec<RouteHop>, RouterError> {
@@ -342,6 +382,22 @@ mod tests {
         }
 
         assert_eq!(registry.route_for_model(&manifest).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn registry_expires_stale_advertisements() {
+        let manifest = ModelManifest::demo();
+        let mut registry = ShardRegistry::with_ttl(Duration::from_millis(1));
+        registry.upsert(advertisement(
+            "peer-0",
+            &manifest.model_id,
+            LayerRange::new(0, 12).unwrap(),
+        ));
+
+        std::thread::sleep(Duration::from_millis(5));
+
+        assert!(registry.advertisements().is_empty());
+        assert!(registry.route_for_model(&manifest).is_err());
     }
 
     #[test]
