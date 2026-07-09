@@ -141,6 +141,7 @@ pub struct ModelSourceFetchResult {
 
 const MODEL_BLOB_CHUNK_BYTES: u32 = 4 * 1024 * 1024;
 const MODEL_BLOB_HEADER_MAX_BYTES: usize = 64 * 1024;
+const MODEL_FETCH_PEER_RETRY_COOLDOWN: Duration = Duration::from_secs(5);
 
 #[derive(NetworkBehaviour)]
 struct GridBehaviour {
@@ -632,7 +633,7 @@ pub async fn fetch_model_shard_over_libp2p(
         ModelShardCandidate,
         u64,
     )> = None;
-    let mut failed_peers = Vec::<String>::new();
+    let mut failed_peers = HashMap::<String, Instant>::new();
 
     loop {
         if pending_request.is_none() {
@@ -684,25 +685,39 @@ pub async fn fetch_model_shard_over_libp2p(
                                 }
 
                                 if let Some(error) = response.error {
-                                    failed_peers.push(candidate.advertisement.peer_id);
-                                    eprintln!("model shard chunk request failed: {error}");
+                                    record_model_fetch_peer_failure(
+                                        &mut failed_peers,
+                                        candidate.advertisement.peer_id.clone(),
+                                    );
+                                    eprintln!(
+                                        "model shard chunk request failed: {error}; retrying peer after cooldown"
+                                    );
                                     continue;
                                 }
                                 if response.model_id != model_id
                                     || response.source_checksum != candidate.shard.checksum
                                     || response.layers != Some(layers)
                                 {
-                                    failed_peers.push(candidate.advertisement.peer_id);
+                                    record_model_fetch_peer_failure(
+                                        &mut failed_peers,
+                                        candidate.advertisement.peer_id.clone(),
+                                    );
                                     eprintln!("model shard chunk response identity mismatch");
                                     continue;
                                 }
                                 if response.offset != expected_offset || response.offset != downloaded_bytes {
-                                    failed_peers.push(candidate.advertisement.peer_id);
+                                    record_model_fetch_peer_failure(
+                                        &mut failed_peers,
+                                        candidate.advertisement.peer_id.clone(),
+                                    );
                                     eprintln!("model shard chunk response offset mismatch: got {}, expected {}", response.offset, downloaded_bytes);
                                     continue;
                                 }
                                 if response.total_size_bytes != candidate.shard.size_bytes {
-                                    failed_peers.push(candidate.advertisement.peer_id);
+                                    record_model_fetch_peer_failure(
+                                        &mut failed_peers,
+                                        candidate.advertisement.peer_id.clone(),
+                                    );
                                     eprintln!(
                                         "model shard chunk size mismatch: got {}, expected {}",
                                         response.total_size_bytes, candidate.shard.size_bytes
@@ -710,7 +725,10 @@ pub async fn fetch_model_shard_over_libp2p(
                                     continue;
                                 }
                                 if response.payload.is_empty() && downloaded_bytes < candidate.shard.size_bytes {
-                                    failed_peers.push(candidate.advertisement.peer_id);
+                                    record_model_fetch_peer_failure(
+                                        &mut failed_peers,
+                                        candidate.advertisement.peer_id.clone(),
+                                    );
                                     eprintln!("model shard chunk response returned empty payload before EOF");
                                     continue;
                                 }
@@ -740,8 +758,10 @@ pub async fn fetch_model_shard_over_libp2p(
                         GridNetworkEvent::ModelBlob(ModelBlobNetworkEvent::OutboundFailure { peer, request_id, error }) => {
                             if let Some((pending_id, candidate, expected_offset)) = pending_request.take() {
                                 if request_id == pending_id {
-                                    failed_peers.push(peer.to_string());
-                                    eprintln!("model shard chunk request to {peer} failed: {error}");
+                                    record_model_fetch_peer_failure(&mut failed_peers, peer.to_string());
+                                    eprintln!(
+                                        "model shard chunk request to {peer} failed: {error}; retrying peer after cooldown"
+                                    );
                                     continue;
                                 }
                                 pending_request = Some((pending_id, candidate, expected_offset));
@@ -827,7 +847,7 @@ pub async fn fetch_model_source_over_libp2p(
     let mut total_size_bytes = expected_size_bytes;
     let mut pending_request: Option<(request_response::OutboundRequestId, NodeAdvertisement, u64)> =
         None;
-    let mut failed_peers = Vec::<String>::new();
+    let mut failed_peers = HashMap::<String, Instant>::new();
     on_progress(downloaded_bytes, total_size_bytes);
 
     loop {
@@ -878,22 +898,36 @@ pub async fn fetch_model_source_over_libp2p(
                             }
 
                             if let Some(error) = response.error {
-                                failed_peers.push(advertisement.peer_id);
-                                eprintln!("model blob request failed: {error}");
+                                record_model_fetch_peer_failure(
+                                    &mut failed_peers,
+                                    advertisement.peer_id.clone(),
+                                );
+                                eprintln!(
+                                    "model blob request failed: {error}; retrying peer after cooldown"
+                                );
                                 continue;
                             }
                             if response.model_id != model_id || response.source_checksum != source_checksum {
-                                failed_peers.push(advertisement.peer_id);
+                                record_model_fetch_peer_failure(
+                                    &mut failed_peers,
+                                    advertisement.peer_id.clone(),
+                                );
                                 eprintln!("model blob response identity mismatch");
                                 continue;
                             }
                             if response.offset != expected_offset || response.offset != downloaded_bytes {
-                                failed_peers.push(advertisement.peer_id);
+                                record_model_fetch_peer_failure(
+                                    &mut failed_peers,
+                                    advertisement.peer_id.clone(),
+                                );
                                 eprintln!("model blob response offset mismatch: got {}, expected {}", response.offset, downloaded_bytes);
                                 continue;
                             }
                             if expected_size_bytes > 0 && response.total_size_bytes != expected_size_bytes {
-                                failed_peers.push(advertisement.peer_id);
+                                record_model_fetch_peer_failure(
+                                    &mut failed_peers,
+                                    advertisement.peer_id.clone(),
+                                );
                                 eprintln!(
                                     "model blob size mismatch: got {}, expected {}",
                                     response.total_size_bytes, expected_size_bytes
@@ -902,7 +936,10 @@ pub async fn fetch_model_source_over_libp2p(
                             }
                             total_size_bytes = response.total_size_bytes;
                             if response.payload.is_empty() && downloaded_bytes < total_size_bytes {
-                                failed_peers.push(advertisement.peer_id);
+                                record_model_fetch_peer_failure(
+                                    &mut failed_peers,
+                                    advertisement.peer_id.clone(),
+                                );
                                 eprintln!("model blob response returned an empty chunk before EOF");
                                 continue;
                             }
@@ -959,8 +996,10 @@ pub async fn fetch_model_source_over_libp2p(
                         GridNetworkEvent::ModelBlob(ModelBlobNetworkEvent::OutboundFailure { peer, request_id, error }) => {
                             if let Some((pending_id, advertisement, expected_offset)) = pending_request.take() {
                                 if request_id == pending_id {
-                                    failed_peers.push(peer.to_string());
-                                    eprintln!("model blob request to {peer} failed: {error}");
+                                    record_model_fetch_peer_failure(&mut failed_peers, peer.to_string());
+                                    eprintln!(
+                                        "model blob request to {peer} failed: {error}; retrying peer after cooldown"
+                                    );
                                     continue;
                                 }
                                 pending_request = Some((pending_id, advertisement, expected_offset));
@@ -2853,13 +2892,13 @@ fn select_model_shard_candidate(
     layers: LayerRange,
     checksum: Option<&str>,
     version: Option<&str>,
-    failed_peers: &[String],
+    failed_peers: &HashMap<String, Instant>,
 ) -> Option<ModelShardCandidate> {
     registry
         .advertisements()
         .into_iter()
         .filter(|advertisement| advertisement.peer_id != local_peer_id)
-        .filter(|advertisement| !failed_peers.contains(&advertisement.peer_id))
+        .filter(|advertisement| !model_fetch_peer_is_blocked(failed_peers, &advertisement.peer_id))
         .flat_map(|advertisement| {
             let hosted_shards = advertisement.hosted_shards.clone();
             advertisement
@@ -2906,13 +2945,13 @@ fn select_model_blob_candidate(
     local_peer_id: &str,
     model_id: &str,
     source_checksum: &str,
-    failed_peers: &[String],
+    failed_peers: &HashMap<String, Instant>,
 ) -> Option<NodeAdvertisement> {
     registry
         .advertisements()
         .into_iter()
         .filter(|advertisement| advertisement.peer_id != local_peer_id)
-        .filter(|advertisement| !failed_peers.contains(&advertisement.peer_id))
+        .filter(|advertisement| !model_fetch_peer_is_blocked(failed_peers, &advertisement.peer_id))
         .filter(|advertisement| {
             advertisement.hosted_shards.iter().any(|descriptor| {
                 descriptor.model_id == model_id
@@ -2928,6 +2967,22 @@ fn select_model_blob_candidate(
                 advertisement.peer_id.clone(),
             )
         })
+}
+
+fn record_model_fetch_peer_failure(
+    failed_peers: &mut HashMap<String, Instant>,
+    peer_id: impl Into<String>,
+) {
+    failed_peers.insert(
+        peer_id.into(),
+        Instant::now() + MODEL_FETCH_PEER_RETRY_COOLDOWN,
+    );
+}
+
+fn model_fetch_peer_is_blocked(failed_peers: &HashMap<String, Instant>, peer_id: &str) -> bool {
+    failed_peers
+        .get(peer_id)
+        .is_some_and(|retry_at| Instant::now() < *retry_at)
 }
 
 fn hop_addresses(hop: &RouteHop) -> Result<Vec<Multiaddr>> {
