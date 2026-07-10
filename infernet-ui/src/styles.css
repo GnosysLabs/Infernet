@@ -832,6 +832,7 @@ button:disabled {
   height: 100%;
   border-radius: inherit;
   background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  transition: width 240ms linear;
 }
 
 .modal-backdrop {

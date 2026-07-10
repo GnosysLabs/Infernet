@@ -957,7 +957,7 @@ function MachineStatusCard({
 
 function MachineTransferProgress({ activity }: { activity: TransferActivity }) {
   const percent = activity.totalBytes && activity.downloadedBytes > 0
-    ? Math.min(100, Math.round((activity.downloadedBytes / activity.totalBytes) * 100))
+    ? Math.min(100, (activity.downloadedBytes / activity.totalBytes) * 100)
     : null;
 
   return (
@@ -966,7 +966,7 @@ function MachineTransferProgress({ activity }: { activity: TransferActivity }) {
       <small>
         {percent === null
           ? humanTransferStage(activity.stage)
-          : `${percent}% · ${formatBytes(activity.downloadedBytes)} of ${formatBytes(activity.totalBytes ?? 0)}`}
+          : `${formatProgressPercent(percent)}% · ${formatBytes(activity.downloadedBytes)} of ${formatBytes(activity.totalBytes ?? 0)}`}
       </small>
     </div>
   );
@@ -982,7 +982,7 @@ function TransferActivityRow({
   developerMode: boolean;
 }) {
   const percent = activity.totalBytes && (activity.downloadedBytes > 0 || activity.status !== "active")
-    ? Math.min(100, Math.round((activity.downloadedBytes / activity.totalBytes) * 100))
+    ? Math.min(100, (activity.downloadedBytes / activity.totalBytes) * 100)
     : null;
   const stage = humanTransferStage(activity.stage);
 
@@ -1001,7 +1001,7 @@ function TransferActivityRow({
           <ProgressBar progress={percent ?? 0} indeterminate={percent === null && activity.status === "active"} />
           <small>
             {percent !== null
-              ? `${percent}% · ${formatBytes(activity.downloadedBytes)} of ${formatBytes(activity.totalBytes ?? 0)}`
+              ? `${formatProgressPercent(percent)}% · ${formatBytes(activity.downloadedBytes)} of ${formatBytes(activity.totalBytes ?? 0)}`
               : activity.status === "active" ? "Working" : stage}
           </small>
         </div>
@@ -1476,6 +1476,16 @@ function upsertTransferActivity(
   return next
     .sort((left, right) => right.updatedAt - left.updatedAt)
     .slice(0, 24);
+}
+
+function formatProgressPercent(percent: number): string {
+  if (percent > 0 && percent < 1) {
+    return percent.toFixed(2);
+  }
+  if (percent < 10) {
+    return percent.toFixed(1);
+  }
+  return Math.round(percent).toString();
 }
 
 function transferActivityId(event: ModelImportProgress): string {

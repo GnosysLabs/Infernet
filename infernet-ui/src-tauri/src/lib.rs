@@ -52,7 +52,10 @@ const OFFICIAL_CHAT_MODEL_ID: &str = "infernet-chat-v1";
 const LAUNCH_KV_CACHE_BYTES_PER_LAYER: u64 = 32 * 1024 * 1024;
 const RUNTIME_SCRATCH_BYTES_PER_PEER: u64 = 768 * 1024 * 1024;
 const CAPACITY_SAFETY_BYTES: u64 = 1024 * 1024 * 1024;
-const MODEL_PROGRESS_EMIT_BYTES: u64 = 64 * 1024 * 1024;
+// The transport delivers 4 MiB chunks. Forward every completed chunk so the
+// desktop progress bar reflects the live transfer instead of appearing frozen
+// until another 64 MiB has accumulated.
+const MODEL_PROGRESS_EMIT_BYTES: u64 = 4 * 1024 * 1024;
 const DEFAULT_BOOTSTRAP_PEERS: &[&str] = &[
     "12D3KooWRJrnpHPQTWdThpDGZMwRCHhEBL4JCAxFMwYMfFavxa2h@/ip4/217.77.11.197/tcp/9777/p2p/12D3KooWRJrnpHPQTWdThpDGZMwRCHhEBL4JCAxFMwYMfFavxa2h",
     "12D3KooWRJrnpHPQTWdThpDGZMwRCHhEBL4JCAxFMwYMfFavxa2h@/dns4/infernet.gnosyslabs.xyz/tcp/9777/p2p/12D3KooWRJrnpHPQTWdThpDGZMwRCHhEBL4JCAxFMwYMfFavxa2h",
