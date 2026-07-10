@@ -1276,6 +1276,35 @@ fn spawn_background_model_record_acquisition(
 
     tauri::async_runtime::spawn(async move {
         let result = async {
+            // Snapshot refreshes can automatically prepare this machine for a
+            // compute assignment. Keep that path on the same source policy as
+            // explicit installs: pinned HTTPS first, peers only after failure.
+            let https_error = if manifest.model_id == OFFICIAL_CHAT_MODEL_ID {
+                match acquire_official_model_over_https(&app, &cache_config, &manifest).await {
+                    Ok(()) => {
+                        emit_model_import_progress(
+                            &app,
+                            &manifest.model_id,
+                            "Ready",
+                            "Official model verified and seeding",
+                            1,
+                            Some(1),
+                        );
+                        return Ok::<(), anyhow::Error>(());
+                    }
+                    Err(error) => {
+                        let error = error.to_string();
+                        eprintln!(
+                            "official HTTPS model acquisition for {} failed; trying P2P fallback: {error}",
+                            manifest.model_id
+                        );
+                        Some(error)
+                    }
+                }
+            } else {
+                None
+            };
+
             for record in plan {
                 let cache = ShardCache::new(cache_config.clone())?;
                 if cache
@@ -1294,21 +1323,15 @@ fn spawn_background_model_record_acquisition(
                     &app,
                     &manifest.model_id,
                     "Downloading shard",
-                    format!(
-                        "layers {}:{}",
-                        record.info.layers.start, record.info.layers.end
-                    ),
+                    model_download_progress_detail(&record, https_error.is_some()),
                     0,
                     Some(record.info.size_bytes),
                 );
                 let progress_app = app.clone();
                 let progress_model_id = manifest.model_id.clone();
-                let progress_detail = format!(
-                    "layers {}:{}",
-                    record.info.layers.start, record.info.layers.end
-                );
+                let progress_detail = model_download_progress_detail(&record, https_error.is_some());
                 let mut last_progress_emit = 0_u64;
-                fetch_model_shard_over_libp2p_with_progress(
+                let p2p_result = fetch_model_shard_over_libp2p_with_progress(
                     config.clone(),
                     cache_config.clone(),
                     manifest.model_id.clone(),
@@ -1334,15 +1357,20 @@ fn spawn_background_model_record_acquisition(
                         }
                     },
                 )
-                .await?;
+                .await;
+                if let Err(p2p_error) = p2p_result {
+                    return match https_error.as_deref() {
+                        Some(https_error) => Err(anyhow::anyhow!(
+                            "Hugging Face download failed ({https_error}); P2P fallback also failed: {p2p_error}"
+                        )),
+                        None => Err(p2p_error),
+                    };
+                }
                 emit_model_import_progress(
                     &app,
                     &manifest.model_id,
                     "Shard ready",
-                    format!(
-                        "layers {}:{}",
-                        record.info.layers.start, record.info.layers.end
-                    ),
+                    model_download_progress_detail(&record, https_error.is_some()),
                     record.info.size_bytes,
                     Some(record.info.size_bytes),
                 );
@@ -1381,6 +1409,14 @@ fn spawn_background_model_record_acquisition(
     });
 
     Ok(())
+}
+
+fn model_download_progress_detail(record: &AdvertisedModelRecord, p2p_fallback: bool) -> String {
+    let fallback = if p2p_fallback { " · P2P fallback" } else { "" };
+    format!(
+        "layers {}:{}{}",
+        record.info.layers.start, record.info.layers.end, fallback
+    )
 }
 
 fn model_records_to_download_for_local_contribution(
@@ -4132,6 +4168,29 @@ mod tests {
             Some(4_194_304)
         );
         assert_eq!(content_range_start("invalid"), None);
+    }
+
+    #[test]
+    fn peer_download_progress_is_identified_as_a_fallback() {
+        let record = AdvertisedModelRecord {
+            info: ModelShardInfo {
+                model_id: OFFICIAL_CHAT_MODEL_ID.to_owned(),
+                layers: LayerRange::new(0, 30).unwrap(),
+                checksum: "checksum".to_owned(),
+                size_bytes: 16,
+                version: "v1".to_owned(),
+                protocol_version: PROTOCOL_VERSION,
+            },
+        };
+
+        assert_eq!(
+            model_download_progress_detail(&record, true),
+            "layers 0:30 · P2P fallback"
+        );
+        assert_eq!(
+            model_download_progress_detail(&record, false),
+            "layers 0:30"
+        );
     }
 
     #[test]

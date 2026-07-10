@@ -678,5 +678,6 @@ Read these for deeper architecture notes:
 
 - [docs/infernet-technical-design.md](docs/infernet-technical-design.md)
 - [docs/infernet-chat-v1.md](docs/infernet-chat-v1.md)
+- [docs/infernet-image-v1.md](docs/infernet-image-v1.md)
 - [docs/gguf-split-inference-design.md](docs/gguf-split-inference-design.md)
 - [docs/model-distribution-design.md](docs/model-distribution-design.md)

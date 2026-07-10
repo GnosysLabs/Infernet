@@ -1,7 +1,9 @@
 use infernet_model::{
     INFERNET_CHAT_KV_CACHE_BYTES_PER_LAYER, LayerRange, ModelManifest, OfficialModelRelease,
 };
-use infernet_protocol::{NodeAdvertisement, NodeCapabilities, RouteHop};
+use infernet_protocol::{
+    MIN_INFERENCE_MACHINE_COUNT, NodeAdvertisement, NodeCapabilities, RouteHop,
+};
 use infernet_router::ShardRegistry;
 use serde::Serialize;
 use std::collections::BTreeSet;
@@ -27,12 +29,13 @@ pub struct WorkerExecutionPlan {
     pub route: Vec<RouteHop>,
     pub participants: Vec<ExecutionParticipantView>,
     peer_bindings: Vec<String>,
+    machine_bindings: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 struct Candidate {
     peer_id: String,
-    machine_id: Option<String>,
+    machine_id: String,
     address: String,
     compute_backend: String,
     device_name: String,
@@ -69,11 +72,11 @@ pub fn plan_worker_execution(
     });
 
     let mut machines = BTreeSet::new();
-    candidates.retain(|candidate| machines.insert(candidate.physical_key()));
+    candidates.retain(|candidate| machines.insert(candidate.machine_id.clone()));
     candidates.truncate(MAX_PIPELINE_WORKERS.min(model.layer_count as usize));
-    if candidates.is_empty() {
+    if candidates.len() < MIN_INFERENCE_MACHINE_COUNT {
         return Err(
-            "No connected GPU or Apple-silicon worker has the verified Infernet model on disk yet."
+            "Infernet requires at least two different computers with the verified model before inference can begin."
                 .to_owned(),
         );
     }
@@ -170,6 +173,10 @@ pub fn plan_worker_execution(
 
     Ok(WorkerExecutionPlan {
         peer_bindings: route.iter().map(|hop| hop.peer_id.clone()).collect(),
+        machine_bindings: candidates
+            .iter()
+            .map(|candidate| candidate.machine_id.clone())
+            .collect(),
         route,
         participants,
     })
@@ -177,10 +184,27 @@ pub fn plan_worker_execution(
 
 impl WorkerExecutionPlan {
     pub fn remains_usable(&self, registry: &ShardRegistry, model: &ModelManifest) -> bool {
+        if self
+            .machine_bindings
+            .iter()
+            .collect::<BTreeSet<_>>()
+            .len()
+            < MIN_INFERENCE_MACHINE_COUNT
+        {
+            return false;
+        }
         let advertisements = registry.advertisements();
-        self.peer_bindings.iter().all(|peer_id| {
+        self.peer_bindings
+            .iter()
+            .zip(&self.machine_bindings)
+            .all(|(peer_id, machine_id)| {
             advertisements.iter().any(|advertisement| {
                 advertisement.peer_id == *peer_id
+                    && advertisement
+                        .capabilities
+                        .as_ref()
+                        .and_then(|capabilities| capabilities.machine_id.as_ref())
+                        == Some(machine_id)
                     && hosts_verified_full_model(advertisement, model)
                     && advertisement
                         .capabilities
@@ -200,6 +224,12 @@ fn candidate(
     if !worker_is_available(capabilities) {
         return None;
     }
+    let machine_id = capabilities
+        .machine_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|machine_id| !machine_id.is_empty())?
+        .to_owned();
     let address = preferred_address(advertisement)?;
     let available_memory_bytes = capabilities.available_accelerator_memory_bytes;
     let usable_memory_bytes = safe_model_memory(available_memory_bytes);
@@ -226,7 +256,7 @@ fn candidate(
     }
     Some(Candidate {
         peer_id: advertisement.peer_id.clone(),
-        machine_id: capabilities.machine_id.clone(),
+        machine_id,
         address,
         compute_backend: capabilities.compute_backend.clone(),
         device_name: capabilities.device_name.clone(),
@@ -271,14 +301,6 @@ fn preferred_address(advertisement: &NodeAdvertisement) -> Option<String> {
         })
         .or_else(|| advertisement.addresses.first())
         .cloned()
-}
-
-impl Candidate {
-    fn physical_key(&self) -> String {
-        self.machine_id
-            .clone()
-            .unwrap_or_else(|| format!("peer:{}", self.peer_id))
-    }
 }
 
 fn safe_model_memory(available_memory_bytes: u64) -> u64 {
@@ -335,19 +357,28 @@ mod tests {
     }
 
     #[test]
-    fn counts_resident_model_layers_when_physical_free_memory_is_low() {
+    fn rejects_one_resident_machine_even_when_it_can_hold_every_layer() {
         let model = ModelManifest::infernet_chat_v1();
         let mut registry = ShardRegistry::new();
         let mut peer = advertisement("resident-worker", 1, &model);
         peer.hosted_shards[0].resident = true;
         registry.upsert(peer);
 
-        let plan = plan_worker_execution(&registry, &model).unwrap();
-        assert_eq!(plan.route.len(), 1);
-        assert_eq!(
-            plan.route[0].layers,
-            LayerRange::new(0, model.layer_count).unwrap()
-        );
+        assert!(plan_worker_execution(&registry, &model).is_err());
+    }
+
+    #[test]
+    fn rejects_two_peer_ids_on_the_same_physical_machine() {
+        let model = ModelManifest::infernet_chat_v1();
+        let mut registry = ShardRegistry::new();
+        let mut first = advertisement("worker-a", 24, &model);
+        let mut second = advertisement("worker-b", 24, &model);
+        first.capabilities.as_mut().unwrap().machine_id = Some("same-machine".to_owned());
+        second.capabilities.as_mut().unwrap().machine_id = Some("same-machine".to_owned());
+        registry.upsert(first);
+        registry.upsert(second);
+
+        assert!(plan_worker_execution(&registry, &model).is_err());
     }
 
     #[test]

@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub const PROTOCOL_VERSION: u32 = 1;
+/// Infernet never executes a real inference job on one physical machine.
+/// Planners and workers must reject routes below this product invariant.
+pub const MIN_INFERENCE_MACHINE_COUNT: usize = 2;
 pub const ACTIVATION_PROTOCOL: &str = "/infernet/activation/2";
 pub const MODEL_PROTOCOL: &str = "/infernet/model/1";
 pub const MODEL_BLOB_PROTOCOL: &str = "/infernet/model-blob/1";

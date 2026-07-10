@@ -1460,6 +1460,91 @@ select:focus-visible {
   grid-template-rows: minmax(0, 1fr) auto;
 }
 
+.image-screen {
+  min-height: 0;
+  overflow: hidden;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+}
+
+.image-workspace {
+  min-height: 0;
+  overflow: auto;
+  display: grid;
+  place-items: center;
+  padding: 40px 30px;
+}
+
+.empty-image-hero {
+  width: min(620px, 100%);
+  display: grid;
+  justify-items: center;
+  gap: 12px;
+  text-align: center;
+}
+
+.image-mode-mark {
+  width: 52px;
+  height: 52px;
+  margin-bottom: 5px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface);
+  color: var(--soft);
+  display: grid;
+  place-items: center;
+}
+
+.empty-image-hero > span {
+  color: var(--soft);
+  font-size: 12px;
+  font-weight: 780;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+.empty-image-hero h2 {
+  margin: 0;
+  color: var(--text);
+  font-size: 42px;
+  line-height: 1.05;
+  letter-spacing: -0.035em;
+  font-weight: 650;
+}
+
+.empty-image-hero p {
+  max-width: 56ch;
+  margin: 2px 0 0;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.image-composer-dock {
+  position: sticky;
+  bottom: 0;
+  z-index: 4;
+  display: grid;
+  justify-items: center;
+  padding: 16px 36px 22px;
+  background: linear-gradient(180deg, oklch(0.135 0 0 / 0), var(--bg) 24px);
+}
+
+.image-composer {
+  min-height: 0;
+  border-color: var(--border);
+  background: oklch(0.19 0 0 / 0.98);
+  box-shadow: 0 18px 54px rgba(0, 0, 0, 0.36);
+}
+
+.image-runtime-note {
+  margin: 9px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+  text-align: center;
+}
+
 .conversation {
   width: 100%;
   min-height: 0;
@@ -3096,6 +3181,48 @@ select:focus-visible {
   letter-spacing: -0.015em;
 }
 
+.mode-switcher {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 3px;
+  margin-top: 16px;
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  background: var(--surface-3);
+  padding: 3px;
+}
+
+.mode-switcher button {
+  min-width: 0;
+  min-height: 34px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 0 9px;
+  font-size: 12px;
+  font-weight: 700;
+  transition: background-color 160ms ease-out, color 160ms ease-out;
+}
+
+.mode-switcher button:hover:not(.active) {
+  background: var(--surface);
+  color: var(--soft);
+}
+
+.mode-switcher button.active {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.mode-switcher + .new-thread-button {
+  margin-top: 12px;
+}
+
 .new-thread-button {
   width: 100%;
   min-height: 40px;
@@ -3133,6 +3260,29 @@ select:focus-visible {
   flex: 1;
   overflow-y: auto;
   overscroll-behavior: contain;
+}
+
+.sidebar-mode-empty {
+  min-height: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+.sidebar-mode-empty > div:last-child {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin: 2px 8px 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.sidebar-mode-empty svg {
+  flex: none;
+  margin-top: 1px;
+  color: var(--soft);
 }
 
 .thread-list {
@@ -3408,12 +3558,34 @@ select:focus-visible {
     display: none;
   }
 
+  .mode-switcher {
+    width: auto;
+    flex: none;
+    grid-template-columns: repeat(2, 36px);
+    margin: 0;
+    padding: 2px;
+  }
+
+  .mode-switcher button {
+    min-height: 36px;
+    padding: 0;
+  }
+
+  .mode-switcher button span,
+  .sidebar-mode-empty {
+    display: none;
+  }
+
   .new-thread-button {
     width: 40px;
     min-height: 40px;
     flex: none;
     margin: 0;
     padding: 0;
+  }
+
+  .mode-switcher + .new-thread-button {
+    margin-top: 0;
   }
 
   .thread-nav {
@@ -3476,6 +3648,14 @@ select:focus-visible {
     font-size: clamp(34px, 11vw, 46px);
   }
 
+  .image-workspace {
+    padding: 28px 18px;
+  }
+
+  .empty-image-hero h2 {
+    font-size: 34px;
+  }
+
   .composer-dock {
     padding: 12px 14px 16px;
   }
@@ -3483,6 +3663,10 @@ select:focus-visible {
   .composer {
     min-height: 0;
     grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .image-composer-dock {
+    padding: 12px 14px 14px;
   }
 
   .send-button span {

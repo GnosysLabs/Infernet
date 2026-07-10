@@ -11,6 +11,7 @@ import {
   Download,
   Globe,
   HardDrive,
+  Image as ImageIcon,
   Laptop2,
   Layers3,
   MemoryStick,
@@ -47,7 +48,8 @@ import type { ChatMessage, ChatThread } from "./chatHistory";
 import { buildConversationPrompt } from "./conversationContext";
 import { usePersistentChatHistory } from "./usePersistentChatHistory";
 
-type Page = "chat" | "network" | "downloads" | "settings";
+type PrimaryMode = "chat" | "image";
+type Page = PrimaryMode | "network" | "downloads" | "settings";
 type TransferStatus = "active" | "complete" | "error";
 type TransferActivity = ModelImportProgress & {
   id: string;
@@ -94,6 +96,7 @@ const EMPTY_LOCAL_NODE_ACTIVITY: LocalNodeActivitySnapshot = {
 
 export default function App() {
   const [page, setPage] = useState<Page>("chat");
+  const [primaryMode, setPrimaryMode] = useState<PrimaryMode>("chat");
   const [activityOpen, setActivityOpen] = useState(false);
   const {
     history: chatHistory,
@@ -112,6 +115,7 @@ export default function App() {
   const [snapshot, setSnapshot] = useState<GridSnapshot>(emptySnapshot);
   const [selectedModel, setSelectedModel] = useState("");
   const [prompt, setPrompt] = useState(DEFAULT_PROMPT);
+  const [imagePrompt, setImagePrompt] = useState("");
   const [runningThreadId, setRunningThreadId] = useState<string | null>(null);
   const runningThreadIdRef = useRef<string | null>(null);
   const [threadErrors, setThreadErrors] = useState<Record<string, string>>({});
@@ -119,6 +123,7 @@ export default function App() {
     Record<string, ChatMessage[]>
   >({});
   const [composerFocusRequest, setComposerFocusRequest] = useState(0);
+  const [imageFocusRequest, setImageFocusRequest] = useState(0);
   const [lastError, setLastError] = useState<string | null>(null);
   const [transferActivities, setTransferActivities] = useState<TransferActivity[]>([]);
   const [connectionGraceExpired, setConnectionGraceExpired] = useState(false);
@@ -387,6 +392,7 @@ export default function App() {
 
   async function createNewThread() {
     if (!chatHistoryReady) return;
+    setPrimaryMode("chat");
     setPage("chat");
     const nextHistory = await createThread();
     if (nextHistory) {
@@ -397,6 +403,7 @@ export default function App() {
   }
 
   async function openThread(threadId: string) {
+    setPrimaryMode("chat");
     if (!chatHistoryReady || threadId === chatHistory.activeThreadId) {
       setPage("chat");
       return;
@@ -407,6 +414,18 @@ export default function App() {
       setPrompt("");
       setLastError(null);
     }
+  }
+
+  function selectPrimaryMode(mode: PrimaryMode) {
+    setPrimaryMode(mode);
+    setPage(mode);
+  }
+
+  function startNewImage() {
+    setPrimaryMode("image");
+    setPage("image");
+    setImagePrompt("");
+    setImageFocusRequest((request) => request + 1);
   }
 
   async function removeThread(threadId: string) {
@@ -498,10 +517,13 @@ export default function App() {
         threads={chatHistory.threads}
         activeThreadId={chatHistory.activeThreadId}
         chatIsVisible={page === "chat"}
+        primaryMode={primaryMode}
         runningThreadId={runningThreadId}
         disabled={!chatHistoryReady || chatHistoryBusy}
         persistenceError={chatHistoryError}
         onCreateThread={createNewThread}
+        onStartImage={startNewImage}
+        onModeChange={selectPrimaryMode}
         onOpenThread={openThread}
         onDeleteThread={removeThread}
       />
@@ -537,6 +559,14 @@ export default function App() {
           />
         ) : null}
 
+        {page === "image" ? (
+          <ImagePage
+            prompt={imagePrompt}
+            setPrompt={setImagePrompt}
+            focusRequest={imageFocusRequest}
+          />
+        ) : null}
+
         {page === "downloads" ? (
           <DownloadsPage
             snapshot={snapshot}
@@ -568,20 +598,26 @@ function Sidebar({
   threads,
   activeThreadId,
   chatIsVisible,
+  primaryMode,
   runningThreadId,
   disabled,
   persistenceError,
   onCreateThread,
+  onStartImage,
+  onModeChange,
   onOpenThread,
   onDeleteThread,
 }: {
   threads: ChatThread[];
   activeThreadId: string;
   chatIsVisible: boolean;
+  primaryMode: PrimaryMode;
   runningThreadId: string | null;
   disabled: boolean;
   persistenceError: string | null;
   onCreateThread: () => Promise<void>;
+  onStartImage: () => void;
+  onModeChange: (mode: PrimaryMode) => void;
   onOpenThread: (threadId: string) => Promise<void>;
   onDeleteThread: (threadId: string) => Promise<void>;
 }) {
@@ -609,7 +645,7 @@ function Sidebar({
   }, [confirmingDeleteId, threads]);
 
   return (
-    <aside className="sidebar" aria-label="Chat history">
+    <aside className="sidebar" aria-label="Infernet navigation and history">
       <div className="sidebar-brand">
         <div className="brand-block">
           <svg
@@ -634,108 +670,158 @@ function Sidebar({
         <strong>Infernet</strong>
       </div>
 
+      <div className="mode-switcher" role="group" aria-label="Mode">
+        <button
+          type="button"
+          className={primaryMode === "chat" ? "active" : undefined}
+          aria-pressed={primaryMode === "chat"}
+          title="Chat"
+          onClick={() => onModeChange("chat")}
+        >
+          <MessageSquare size={16} />
+          <span>Chat</span>
+        </button>
+        <button
+          type="button"
+          className={primaryMode === "image" ? "active" : undefined}
+          aria-pressed={primaryMode === "image"}
+          title="Image"
+          onClick={() => onModeChange("image")}
+        >
+          <ImageIcon size={16} />
+          <span>Image</span>
+        </button>
+      </div>
+
       <button
         className="new-thread-button"
         type="button"
-        aria-label="New chat"
-        title="New chat"
-        disabled={disabled}
-        onClick={() => void onCreateThread()}
+        aria-label={primaryMode === "chat" ? "New chat" : "New image"}
+        title={primaryMode === "chat" ? "New chat" : "New image"}
+        disabled={primaryMode === "chat" && disabled}
+        onClick={() => {
+          if (primaryMode === "chat") {
+            void onCreateThread();
+          } else {
+            onStartImage();
+          }
+        }}
       >
         <Plus size={17} />
-        <span>New chat</span>
+        <span>{primaryMode === "chat" ? "New chat" : "New image"}</span>
       </button>
 
-      <div className="thread-list-heading">Chats</div>
-      <nav className="thread-nav" aria-label="Chat threads" aria-busy={disabled}>
-        <ul className="thread-list">
-          {threads.map((thread) => {
-            const active = thread.id === activeThreadId;
-            const isRunning = thread.id === runningThreadId;
-            const confirmingDelete = thread.id === confirmingDeleteId;
-            const deleting = thread.id === deletingThreadId;
+      {primaryMode === "chat" ? (
+        <>
+          <div className="thread-list-heading">Chats</div>
+          <nav className="thread-nav" aria-label="Chat threads" aria-busy={disabled}>
+            <ul className="thread-list">
+              {threads.map((thread) => {
+                const active = thread.id === activeThreadId;
+                const isRunning = thread.id === runningThreadId;
+                const confirmingDelete = thread.id === confirmingDeleteId;
+                const deleting = thread.id === deletingThreadId;
 
-            return (
-              <li
-                className={active ? "thread-list-item active" : "thread-list-item"}
-                key={thread.id}
-              >
-                {confirmingDelete ? (
-                  <div className="thread-delete-confirm" role="group" aria-label={`Delete ${thread.title}?`}>
-                    <span>Delete this chat?</span>
-                    <div>
-                      <button
-                        type="button"
-                        className="thread-confirm-cancel"
-                        autoFocus
-                        disabled={disabled || deleting}
-                        onClick={() => {
-                          setConfirmingDeleteId(null);
-                          restoreDeleteButtonFocus(thread.id);
-                        }}
+                return (
+                  <li
+                    className={active ? "thread-list-item active" : "thread-list-item"}
+                    key={thread.id}
+                  >
+                    {confirmingDelete ? (
+                      <div
+                        className="thread-delete-confirm"
+                        role="group"
+                        aria-label={`Delete ${thread.title}?`}
                       >
-                        Cancel
-                      </button>
-                      <button
-                        type="button"
-                        className="thread-confirm-delete"
-                        disabled={disabled || deleting}
-                        onClick={async () => {
-                          if (deleting) return;
-                          setDeletingThreadId(thread.id);
-                          await onDeleteThread(thread.id);
-                          setDeletingThreadId(null);
-                          setConfirmingDeleteId(null);
-                          restoreThreadFocus();
-                        }}
-                      >
-                        Delete
-                      </button>
-                    </div>
-                  </div>
-                ) : (
-                  <>
-                    <button
-                      ref={(element) => {
-                        if (element) threadButtonRefs.current.set(thread.id, element);
-                        else threadButtonRefs.current.delete(thread.id);
-                      }}
-                      type="button"
-                      className="thread-select-button"
-                      disabled={disabled}
-                      aria-current={active && chatIsVisible ? "page" : undefined}
-                      onClick={() => void onOpenThread(thread.id)}
-                    >
-                      <span>{thread.title}</span>
-                      {isRunning ? (
-                        <i className="thread-running-indicator" aria-label="Generating response" />
-                      ) : null}
-                    </button>
-                    <button
-                      ref={(element) => {
-                        if (element) deleteButtonRefs.current.set(thread.id, element);
-                        else deleteButtonRefs.current.delete(thread.id);
-                      }}
-                      type="button"
-                      className="thread-delete-button"
-                      disabled={disabled || isRunning}
-                      aria-label={isRunning
-                        ? `Wait for ${thread.title} to finish before deleting`
-                        : `Delete ${thread.title}`}
-                      title={isRunning ? "This chat is still responding" : `Delete ${thread.title}`}
-                      onClick={() => setConfirmingDeleteId(thread.id)}
-                    >
-                      <Trash2 size={15} />
-                    </button>
-                  </>
-                )}
-              </li>
-            );
-          })}
-        </ul>
-      </nav>
+                        <span>Delete this chat?</span>
+                        <div>
+                          <button
+                            type="button"
+                            className="thread-confirm-cancel"
+                            autoFocus
+                            disabled={disabled || deleting}
+                            onClick={() => {
+                              setConfirmingDeleteId(null);
+                              restoreDeleteButtonFocus(thread.id);
+                            }}
+                          >
+                            Cancel
+                          </button>
+                          <button
+                            type="button"
+                            className="thread-confirm-delete"
+                            disabled={disabled || deleting}
+                            onClick={async () => {
+                              if (deleting) return;
+                              setDeletingThreadId(thread.id);
+                              await onDeleteThread(thread.id);
+                              setDeletingThreadId(null);
+                              setConfirmingDeleteId(null);
+                              restoreThreadFocus();
+                            }}
+                          >
+                            Delete
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <>
+                        <button
+                          ref={(element) => {
+                            if (element) threadButtonRefs.current.set(thread.id, element);
+                            else threadButtonRefs.current.delete(thread.id);
+                          }}
+                          type="button"
+                          className="thread-select-button"
+                          disabled={disabled}
+                          aria-current={active && chatIsVisible ? "page" : undefined}
+                          onClick={() => void onOpenThread(thread.id)}
+                        >
+                          <span>{thread.title}</span>
+                          {isRunning ? (
+                            <i
+                              className="thread-running-indicator"
+                              aria-label="Generating response"
+                            />
+                          ) : null}
+                        </button>
+                        <button
+                          ref={(element) => {
+                            if (element) deleteButtonRefs.current.set(thread.id, element);
+                            else deleteButtonRefs.current.delete(thread.id);
+                          }}
+                          type="button"
+                          className="thread-delete-button"
+                          disabled={disabled || isRunning}
+                          aria-label={isRunning
+                            ? `Wait for ${thread.title} to finish before deleting`
+                            : `Delete ${thread.title}`}
+                          title={isRunning
+                            ? "This chat is still responding"
+                            : `Delete ${thread.title}`}
+                          onClick={() => setConfirmingDeleteId(thread.id)}
+                        >
+                          <Trash2 size={15} />
+                        </button>
+                      </>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          </nav>
+        </>
+      ) : (
+        <div className="sidebar-mode-empty">
+          <div className="thread-list-heading">Creations</div>
+          <div>
+            <ImageIcon size={17} aria-hidden="true" />
+            <span>Your generated images will appear here.</span>
+          </div>
+        </div>
+      )}
 
-      {persistenceError ? (
+      {primaryMode === "chat" && persistenceError ? (
         <p className="sidebar-storage-error" role="alert">{persistenceError}</p>
       ) : null}
     </aside>
@@ -976,6 +1062,73 @@ function ChatPage({
             <span>Send</span>
           </button>
         </div>
+      </div>
+    </section>
+  );
+}
+
+function ImagePage({
+  prompt,
+  setPrompt,
+  focusRequest,
+}: {
+  prompt: string;
+  setPrompt: (value: string) => void;
+  focusRequest: number;
+}) {
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+
+  useLayoutEffect(() => {
+    const input = inputRef.current;
+    if (!input) return;
+    resizeComposerInput(input);
+  }, [prompt]);
+
+  useEffect(() => {
+    if (focusRequest > 0) inputRef.current?.focus();
+  }, [focusRequest]);
+
+  return (
+    <section className="image-screen">
+      <div className="image-workspace">
+        <div className="empty-image-hero">
+          <div className="image-mode-mark" aria-hidden="true">
+            <ImageIcon size={24} />
+          </div>
+          <span>Infernet Image</span>
+          <h2>What do you want to make?</h2>
+          <p>
+            Describe a scene, subject, or style. Infernet Image will use the official
+            Z-Image Turbo edition.
+          </p>
+        </div>
+      </div>
+
+      <div className="image-composer-dock">
+        <div className="composer image-composer">
+          <textarea
+            ref={inputRef}
+            rows={1}
+            value={prompt}
+            onChange={(event) => setPrompt(event.target.value)}
+            placeholder="Describe an image"
+            aria-label="Describe an image"
+            aria-describedby="image-runtime-note"
+          />
+          <button
+            className="send-button"
+            type="button"
+            disabled
+            aria-label="Generate image"
+            title="Image runtime not connected"
+          >
+            <ImageIcon size={18} />
+            <span>Generate</span>
+          </button>
+        </div>
+        <p id="image-runtime-note" className="image-runtime-note" role="status">
+          Image generation is not connected to a runtime in this build yet.
+        </p>
       </div>
     </section>
   );
@@ -2280,6 +2433,7 @@ function transferStatus(stage: string): TransferStatus {
 
 function pageTitle(page: Page, chatTitle = "Chat"): string {
   if (page === "chat") return chatTitle;
+  if (page === "image") return "Image";
   if (page === "network") return "Network";
   if (page === "downloads") return "Downloads";
   return "Settings";
