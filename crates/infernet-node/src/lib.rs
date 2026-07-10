@@ -1762,6 +1762,15 @@ pub async fn infer_over_libp2p(
         .current_hop()
         .cloned()
         .ok_or_else(|| anyhow!("route must contain at least one hop"))?;
+    connect_to_activation_hop(
+        &mut swarm,
+        &mut registry,
+        &mut config,
+        &topic,
+        &first_hop,
+        Duration::from_secs(30),
+    )
+    .await?;
     let outbound_id =
         send_activation_request_with_relays(&mut swarm, &config.static_peers, &first_hop, request)?;
     let response = wait_for_client_response(
@@ -2885,6 +2894,91 @@ async fn wait_for_client_response(
             }
             _ = sleep_until(deadline) => {
                 bail!("timed out waiting for activation response");
+            }
+        }
+    }
+}
+
+async fn connect_to_activation_hop(
+    swarm: &mut Swarm<GridBehaviour>,
+    registry: &mut ShardRegistry,
+    config: &mut DiscoveryConfig,
+    topic: &gossipsub::IdentTopic,
+    hop: &RouteHop,
+    timeout: Duration,
+) -> Result<()> {
+    let peer_id = hop
+        .peer_id
+        .parse::<PeerId>()
+        .with_context(|| format!("invalid libp2p peer id {}", hop.peer_id))?;
+    if swarm.is_connected(&peer_id) {
+        return Ok(());
+    }
+
+    let addresses = hop_addresses(hop)?;
+    let deadline = Instant::now() + timeout;
+    let mut retry = interval(Duration::from_millis(500));
+    let mut last_error = None::<String>;
+
+    loop {
+        tokio::select! {
+            _ = retry.tick() => {
+                if swarm.is_connected(&peer_id) {
+                    return Ok(());
+                }
+                let dial = if addresses.is_empty() {
+                    DialOpts::peer_id(peer_id)
+                        .condition(PeerCondition::DisconnectedAndNotDialing)
+                        .build()
+                } else {
+                    DialOpts::peer_id(peer_id)
+                        .condition(PeerCondition::DisconnectedAndNotDialing)
+                        .addresses(addresses.clone())
+                        .extend_addresses_through_behaviour()
+                        .build()
+                };
+                if let Err(error) = swarm.dial(dial) {
+                    last_error = Some(error.to_string());
+                }
+            }
+            event = swarm.select_next_some() => {
+                let connected = matches!(
+                    &event,
+                    SwarmEvent::ConnectionEstablished { peer_id: connected_peer, .. }
+                        if connected_peer == &peer_id
+                );
+                if let SwarmEvent::OutgoingConnectionError {
+                    peer_id: Some(failed_peer),
+                    error,
+                    ..
+                } = &event
+                {
+                    if failed_peer == &peer_id {
+                        last_error = Some(error.to_string());
+                    }
+                }
+                let _ = handle_grid_event(
+                    swarm,
+                    event,
+                    registry,
+                    &mut config.advertisement,
+                    topic,
+                    config.advertise_listen_addresses,
+                    config.dial_discovered_peers,
+                )?;
+                if connected || swarm.is_connected(&peer_id) {
+                    return Ok(());
+                }
+            }
+            _ = sleep_until(deadline) => {
+                bail!(
+                    "timed out connecting to activation peer {}{}",
+                    hop.peer_id,
+                    last_error
+                        .as_deref()
+                        .map(|error| format!(": {error}"))
+                        .unwrap_or_default()
+                );
             }
         }
     }
