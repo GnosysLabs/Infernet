@@ -4300,6 +4300,7 @@ fn select_model_shard_candidate(
                                 manifest.payload_kind.as_str(),
                                 model_distribution::PAYLOAD_KIND_GGUF_SHARD
                                     | model_distribution::PAYLOAD_KIND_INFERNET_SHARD
+                                    | model_distribution::PAYLOAD_KIND_FULL_MODEL
                             )
                         })
                         .cloned();
@@ -5084,5 +5085,47 @@ mod tests {
         assert_eq!(response.payload, b"456789");
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn full_model_package_is_a_download_candidate() {
+        let (_, layers, _, manifest, package) = official_rpc_fixture();
+        let mut advertisement =
+            empty_advertisement("seed-peer".to_owned(), "/ip4/127.0.0.1/tcp/9777".to_owned());
+        advertisement.hosted_shards.push(ShardDescriptor {
+            model_id: manifest.model_id.clone(),
+            layers,
+            runtime_kind: manifest.runtime_kind.clone(),
+            tokenizer: Some(manifest.tokenizer.clone()),
+            metadata: Some(manifest.metadata.clone()),
+            shard_hash: Some(manifest.shard_hash.clone()),
+            seed_manifest: Some(Box::new(manifest.clone())),
+        });
+        advertisement.model_shards.push(ModelShardInfo {
+            model_id: manifest.model_id.clone(),
+            layers,
+            checksum: package.payload.checksum_sha256.clone(),
+            size_bytes: package.payload.size_bytes,
+            version: "1".to_owned(),
+            protocol_version: PROTOCOL_VERSION,
+        });
+        let mut registry = ShardRegistry::new();
+        registry.upsert(advertisement);
+
+        let candidate = select_model_shard_candidate(
+            &registry,
+            "downloader",
+            &manifest.model_id,
+            layers,
+            Some(&package.payload.checksum_sha256),
+            Some("1"),
+            &HashMap::new(),
+        );
+
+        assert!(candidate.is_some());
+        assert_eq!(
+            candidate.unwrap().seed_manifest.unwrap().payload_kind,
+            PAYLOAD_KIND_FULL_MODEL
+        );
     }
 }
