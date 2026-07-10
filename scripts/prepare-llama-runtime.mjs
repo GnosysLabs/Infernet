@@ -41,7 +41,7 @@ const runtimeLockPath = resolve(
   "llama.cpp-runtime",
   `.infernet-llama-runtime-${targetTriple}.lock`,
 );
-const runtimePatchVersion = "infernet-pinned-persistent-server-runtime-v8";
+const runtimePatchVersion = "infernet-persistent-local-layer-workers-v10";
 const buildRoot = resolve(repoRoot, "target", "llama.cpp-runtime");
 const sourceDir = join(buildRoot, "llama.cpp");
 const downloadDir = join(buildRoot, "downloads");
@@ -430,6 +430,9 @@ function patchLlamaHeader() {
     "        bool no_alloc;        // only load metadata and simulate memory allocations\n",
     "        bool no_alloc;        // only load metadata and simulate memory allocations\n        bool infernet_partial; // load/evaluate only infernet_layer_start..infernet_layer_end\n");
   text = replaceOnce(text,
+    "        uint32_t n_outputs_max;     // max outputs in a ubatch (0 = n_batch)\n",
+    "        uint32_t n_outputs_max;     // max outputs in a ubatch (0 = n_batch)\n        uint32_t infernet_layer_start; // first resident layer for an Infernet worker\n        uint32_t infernet_layer_end;   // exclusive resident layer end\n        bool infernet_partial;         // allocate KV/graphs only for this range\n");
+  text = replaceOnce(text,
     "    // Frees all allocated memory\n    LLAMA_API void llama_free(struct llama_context * ctx);\n",
     "    // Infernet experimental split-layer execution. Must be called before llama_decode().\n    LLAMA_API void llama_infernet_set_layer_range(struct llama_context * ctx, uint32_t layer_start, uint32_t layer_end);\n\n    // Frees all allocated memory\n    LLAMA_API void llama_free(struct llama_context * ctx);\n");
   writeFileSync(path, text);
@@ -471,7 +474,10 @@ function patchLlamaContext() {
   let text = readText(cppPath);
   text = replaceOnce(text,
     "    cparams.embeddings_nextn_masked = false;\n",
-    "    cparams.embeddings_nextn_masked = false;\n    cparams.infernet_partial = false;\n    cparams.infernet_layer_start = 0;\n    cparams.infernet_layer_end = UINT32_MAX;\n");
+    "    cparams.embeddings_nextn_masked = false;\n    cparams.infernet_partial = params.infernet_partial;\n    cparams.infernet_layer_start = params.infernet_layer_start;\n    cparams.infernet_layer_end = params.infernet_layer_end;\n");
+  text = replaceOnce(text,
+    "        /*.n_outputs_max               =*/ 0,\n        /*.n_threads",
+    "        /*.n_outputs_max               =*/ 0,\n        /*.infernet_layer_start        =*/ 0,\n        /*.infernet_layer_end          =*/ UINT32_MAX,\n        /*.infernet_partial            =*/ false,\n        /*.n_threads");
   text = replaceOnce(text,
     "void llama_context::set_nextn_layer_offset(int32_t offset) {\n    cparams.nextn_layer_offset = offset;\n}\n",
     "void llama_context::infernet_set_layer_range(uint32_t layer_start, uint32_t layer_end) {\n    GGML_ASSERT(layer_start < layer_end);\n    GGML_ASSERT(layer_end <= model.hparams.n_layer());\n    cparams.infernet_partial = true;\n    cparams.infernet_layer_start = layer_start;\n    cparams.infernet_layer_end = layer_end;\n    sched_need_reserve = true;\n}\n\nvoid llama_context::set_nextn_layer_offset(int32_t offset) {\n    cparams.nextn_layer_offset = offset;\n}\n");
@@ -519,6 +525,13 @@ function patchModelLoader() {
     "        if (!t_meta) {\n            if (flags & TENSOR_NOT_REQUIRED) {\n                return nullptr;\n            }\n            throw std::runtime_error(format(\"missing tensor '%s'\", tn.str().c_str()));\n        }\n",
     "        if (!t_meta) {\n            if ((flags & TENSOR_SKIP) || (flags & TENSOR_NOT_REQUIRED)) {\n                return nullptr;\n            }\n            throw std::runtime_error(format(\"missing tensor '%s'\", tn.str().c_str()));\n        }\n");
   writeFileSync(loaderPath, loader);
+
+  const modelPath = join(sourceDir, "src", "llama-model.cpp");
+  let model = readText(modelPath);
+  model = replaceOnce(model,
+    "                    if (arch == LLM_ARCH_DEEPSEEK4) {\n",
+    "                    if (cparams.infernet_partial) {\n                        const uint32_t infernet_start = cparams.infernet_layer_start;\n                        const uint32_t infernet_end = cparams.infernet_layer_end;\n                        filter = [&, infernet_start, infernet_end](uint32_t il) {\n                            const bool assigned = il >= infernet_start && il < infernet_end;\n                            const bool gemma_shared_kv = (arch == LLM_ARCH_GEMMA3N || arch == LLM_ARCH_GEMMA4)\n                                && il < (uint32_t) hparams.n_layer_kv_from_start;\n                            return assigned || gemma_shared_kv;\n                        };\n                    }\n\n                    if (arch == LLM_ARCH_DEEPSEEK4) {\n");
+  writeFileSync(modelPath, model);
 }
 
 function patchDecoderGraphs() {

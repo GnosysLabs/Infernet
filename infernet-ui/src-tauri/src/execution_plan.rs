@@ -1,6 +1,5 @@
-use infernet_model::{ModelManifest, OfficialModelRelease};
-use infernet_node::{INFERNET_LLAMA_RPC_RUNTIME_ABI, LLAMA_RPC_PROTOCOL_VERSION};
-use infernet_protocol::{LLAMA_RPC_TUNNEL_PROTOCOL, NodeAdvertisement, NodeCapabilities, RouteHop};
+use infernet_model::{LayerRange, ModelManifest, OfficialModelRelease};
+use infernet_protocol::{NodeAdvertisement, NodeCapabilities, RouteHop};
 use infernet_router::ShardRegistry;
 use serde::Serialize;
 use std::collections::BTreeSet;
@@ -8,7 +7,7 @@ use std::collections::BTreeSet;
 const SAFETY_RESERVE_BYTES: u64 = 1024 * 1024 * 1024;
 const RUNTIME_SCRATCH_BYTES: u64 = 768 * 1024 * 1024;
 const KV_CACHE_BYTES_PER_LAYER: u64 = 32 * 1024 * 1024;
-const MINIMUM_WORKER_CAPACITY_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_PIPELINE_WORKERS: usize = 8;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -23,238 +22,232 @@ pub struct ExecutionParticipantView {
 }
 
 #[derive(Debug, Clone)]
-pub struct RpcExecutionPlan {
-    pub coordinator_peer_id: String,
-    pub worker_peer_ids: Vec<String>,
+pub struct WorkerExecutionPlan {
+    pub route: Vec<RouteHop>,
     pub participants: Vec<ExecutionParticipantView>,
-    worker_bindings: Vec<String>,
+    peer_bindings: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 struct Candidate {
     peer_id: String,
     machine_id: Option<String>,
-    tunnel_ready: bool,
+    address: String,
     compute_backend: String,
     device_name: String,
     available_memory_bytes: u64,
     usable_memory_bytes: u64,
-    coordinator: bool,
+    layer_capacity: u32,
+    assigned_layers: u32,
 }
 
-pub fn plan_rpc_execution(
+pub fn plan_worker_execution(
     registry: &ShardRegistry,
-    route: &[RouteHop],
     model: &ModelManifest,
-) -> Result<RpcExecutionPlan, String> {
-    let coordinator_hop = route
-        .first()
-        .ok_or_else(|| "Infernet Chat is not available on a coordinator yet.".to_owned())?;
-    if route.len() != 1
-        || coordinator_hop.layers.start != 0
-        || coordinator_hop.layers.end != model.layer_count
-    {
-        return Err(
-            "Infernet Chat requires one verified full-model coordinator before it can distribute execution."
-                .to_owned(),
-        );
+) -> Result<WorkerExecutionPlan, String> {
+    if model.layer_count == 0 {
+        return Err("The selected model has no executable layers.".to_owned());
     }
+    let release = OfficialModelRelease::infernet_chat_v1_compatibility();
+    let bytes_per_layer = release
+        .expected_total_bytes
+        .div_ceil(u64::from(model.layer_count))
+        .saturating_add(KV_CACHE_BYTES_PER_LAYER);
 
     let advertisements = registry.advertisements();
-    let coordinator_advertisement = advertisements
+    let mut candidates = advertisements
         .iter()
-        .find(|advertisement| advertisement.peer_id == coordinator_hop.peer_id)
-        .ok_or_else(|| "The selected model coordinator stopped advertising capacity.".to_owned())?;
-    let coordinator = candidate_for_coordinator(coordinator_advertisement)?;
-    let coordinator_machine_id = coordinator_advertisement
-        .capabilities
-        .as_ref()
-        .and_then(|capabilities| capabilities.machine_id.as_deref());
-
-    let mut workers = advertisements
-        .iter()
-        .filter(|advertisement| advertisement.peer_id != coordinator.peer_id)
-        .filter_map(|advertisement| candidate_for_worker(advertisement, coordinator_machine_id))
+        .filter(|advertisement| hosts_verified_full_model(advertisement, model))
+        .filter_map(|advertisement| candidate(advertisement, bytes_per_layer))
         .collect::<Vec<_>>();
-    workers.sort_by(|left, right| {
+    candidates.sort_by(|left, right| {
         right
             .usable_memory_bytes
             .cmp(&left.usable_memory_bytes)
             .then_with(|| left.peer_id.cmp(&right.peer_id))
     });
 
-    let mut seen_machines = BTreeSet::new();
-    workers.retain(|candidate| seen_machines.insert(candidate.physical_key()));
-    if workers.is_empty() {
+    let mut machines = BTreeSet::new();
+    candidates.retain(|candidate| machines.insert(candidate.physical_key()));
+    candidates.truncate(MAX_PIPELINE_WORKERS.min(model.layer_count as usize));
+    if candidates.is_empty() {
         return Err(
-            "Distributed inference needs at least one other GPU or Apple-silicon machine with its compute service ready."
+            "No connected GPU or Apple-silicon worker has the verified Infernet model on disk yet."
                 .to_owned(),
         );
     }
-
-    let mut candidates = Vec::with_capacity(workers.len() + 1);
-    candidates.push(coordinator);
-    candidates.extend(workers);
-    let total_usable_memory = candidates
+    let total_capacity = candidates
         .iter()
-        .map(|candidate| candidate.usable_memory_bytes)
-        .sum::<u64>();
-    if total_usable_memory == 0 {
-        return Err("The available machines did not report usable model memory.".to_owned());
-    }
-    let release = OfficialModelRelease::infernet_chat_v1_compatibility();
-    let required_memory = release
-        .expected_total_bytes
-        .saturating_add(KV_CACHE_BYTES_PER_LAYER.saturating_mul(u64::from(model.layer_count)));
-    if total_usable_memory < required_memory {
+        .map(|candidate| candidate.layer_capacity)
+        .sum::<u32>();
+    if total_capacity < model.layer_count {
         return Err(format!(
-            "The ready machines have {} GB of safe model memory, but Infernet Chat needs at least {} GB.",
-            total_usable_memory / 1_000_000_000,
-            required_memory.div_ceil(1_000_000_000),
+            "The workers with the model on disk can safely hold {} of {} layers.",
+            total_capacity, model.layer_count
         ));
     }
 
-    let mut allocated_percent = 0_u32;
-    let last_index = candidates.len() - 1;
-    let participants = candidates
-        .iter()
-        .enumerate()
-        .map(|(index, candidate)| {
-            let estimated_share_percent = if index == last_index {
-                100_u32.saturating_sub(allocated_percent)
-            } else {
-                let proportional = ((candidate.usable_memory_bytes as u128 * 100)
-                    / total_usable_memory as u128) as u32;
-                let remaining_participants = (last_index - index) as u32;
-                let maximum = 100_u32
-                    .saturating_sub(allocated_percent)
-                    .saturating_sub(remaining_participants);
-                let share = proportional.max(1).min(maximum.max(1));
-                allocated_percent = allocated_percent.saturating_add(share);
-                share
-            };
-            ExecutionParticipantView {
-                peer_id: candidate.peer_id.clone(),
-                short_peer_id: short_peer_id(&candidate.peer_id),
-                role: if candidate.coordinator {
-                    "coordinator"
-                } else {
-                    "worker"
-                },
-                compute_backend: candidate.compute_backend.clone(),
-                device_name: candidate.device_name.clone(),
-                available_memory_bytes: candidate.available_memory_bytes,
-                estimated_share_percent,
-            }
-        })
-        .collect();
-    let worker_peer_ids = candidates
-        .iter()
-        .filter(|candidate| !candidate.coordinator && candidate.tunnel_ready)
-        .map(|candidate| candidate.peer_id.clone())
-        .collect();
-
-    let coordinator_peer_id = coordinator_hop.peer_id.clone();
-    let worker_bindings = candidates
-        .iter()
-        .filter(|candidate| !candidate.coordinator && candidate.tunnel_ready)
-        .map(|candidate| candidate.peer_id.clone())
-        .collect();
-
-    Ok(RpcExecutionPlan {
-        coordinator_peer_id,
-        worker_peer_ids,
-        participants,
-        worker_bindings,
-    })
-}
-
-impl RpcExecutionPlan {
-    pub fn remains_usable(&self, registry: &ShardRegistry, route: &[RouteHop]) -> bool {
-        if route.len() != 1 || route[0].peer_id != self.coordinator_peer_id {
-            return false;
-        }
-        let advertisements = registry.advertisements();
-        let coordinator_online = advertisements
+    // Every available machine participates. One layer is assigned first, then
+    // remaining layers are placed on the machine with the most memory per
+    // assigned layer. This keeps boundaries few and respects current capacity.
+    for candidate in &mut candidates {
+        candidate.assigned_layers = 1;
+    }
+    let mut remaining = model.layer_count.saturating_sub(candidates.len() as u32);
+    while remaining > 0 {
+        let Some(index) = candidates
             .iter()
-            .any(|advertisement| advertisement.peer_id == self.coordinator_peer_id);
-        coordinator_online
-            && self.worker_bindings.iter().all(|peer_id| {
-                advertisements.iter().any(|advertisement| {
-                    advertisement.peer_id == *peer_id
-                        && advertisement
-                            .capabilities
-                            .as_ref()
-                            .is_some_and(rpc_endpoint_is_usable)
-                })
+            .enumerate()
+            .filter(|(_, candidate)| candidate.assigned_layers < candidate.layer_capacity)
+            .max_by(|(_, left), (_, right)| {
+                let left_score =
+                    u128::from(left.usable_memory_bytes) * u128::from(right.assigned_layers + 1);
+                let right_score =
+                    u128::from(right.usable_memory_bytes) * u128::from(left.assigned_layers + 1);
+                left_score
+                    .cmp(&right_score)
+                    .then_with(|| right.peer_id.cmp(&left.peer_id))
             })
+            .map(|(index, _)| index)
+        else {
+            return Err("The worker layer allocator exhausted reported capacity.".to_owned());
+        };
+        candidates[index].assigned_layers += 1;
+        remaining -= 1;
     }
-}
 
-fn candidate_for_coordinator(advertisement: &NodeAdvertisement) -> Result<Candidate, String> {
-    let capabilities = advertisement.capabilities.as_ref().ok_or_else(|| {
-        "The selected model coordinator has not reported its hardware capacity.".to_owned()
-    })?;
-    if !matches!(capabilities.compute_backend.as_str(), "cuda" | "metal") {
-        return Err("The model coordinator needs a CUDA GPU or Apple silicon.".to_owned());
+    // The largest worker owns embeddings. Put the next-largest at the tail so
+    // the output head and sampler also land on a high-capacity machine.
+    if candidates.len() > 2 {
+        let second = candidates.remove(1);
+        candidates.push(second);
     }
-    if capabilities.active_sessions >= capabilities.max_sessions {
-        return Err("The model coordinator is already being used by another request.".to_owned());
+
+    let mut layer_start = 0_u32;
+    let mut route = Vec::with_capacity(candidates.len());
+    let mut participants = Vec::with_capacity(candidates.len());
+    let mut allocated_percent = 0_u32;
+    for (index, candidate) in candidates.iter().enumerate() {
+        let layer_end = layer_start + candidate.assigned_layers;
+        route.push(RouteHop {
+            peer_id: candidate.peer_id.clone(),
+            address: candidate.address.clone(),
+            layers: LayerRange {
+                start: layer_start,
+                end: layer_end,
+            },
+        });
+        let role = if index == 0 {
+            "entry worker"
+        } else if index + 1 == candidates.len() {
+            "sampling worker"
+        } else {
+            "worker"
+        };
+        let estimated_share_percent = if index + 1 == candidates.len() {
+            100_u32.saturating_sub(allocated_percent)
+        } else {
+            let remaining_workers = (candidates.len() - index - 1) as u32;
+            let share = (candidate.assigned_layers * 100 / model.layer_count)
+                .max(1)
+                .min(100_u32.saturating_sub(allocated_percent + remaining_workers));
+            allocated_percent += share;
+            share
+        };
+        participants.push(ExecutionParticipantView {
+            peer_id: candidate.peer_id.clone(),
+            short_peer_id: short_peer_id(&candidate.peer_id),
+            role,
+            compute_backend: candidate.compute_backend.clone(),
+            device_name: candidate.device_name.clone(),
+            available_memory_bytes: candidate.available_memory_bytes,
+            estimated_share_percent,
+        });
+        layer_start = layer_end;
     }
-    let available_memory_bytes = capabilities.available_accelerator_memory_bytes;
-    if !capabilities.unified_memory && capabilities.available_ram_bytes < 2 * SAFETY_RESERVE_BYTES {
-        return Err(
-            "The model coordinator does not currently have enough free system memory.".to_owned(),
-        );
-    }
-    let usable_memory_bytes = safe_model_memory(available_memory_bytes);
-    if usable_memory_bytes < MINIMUM_WORKER_CAPACITY_BYTES {
-        return Err("The model coordinator does not currently have enough free memory.".to_owned());
-    }
-    Ok(Candidate {
-        peer_id: advertisement.peer_id.clone(),
-        machine_id: capabilities.machine_id.clone(),
-        tunnel_ready: false,
-        compute_backend: capabilities.compute_backend.clone(),
-        device_name: capabilities.device_name.clone(),
-        available_memory_bytes,
-        usable_memory_bytes,
-        coordinator: true,
+
+    Ok(WorkerExecutionPlan {
+        peer_bindings: route.iter().map(|hop| hop.peer_id.clone()).collect(),
+        route,
+        participants,
     })
 }
 
-fn candidate_for_worker(
-    advertisement: &NodeAdvertisement,
-    coordinator_machine_id: Option<&str>,
-) -> Option<Candidate> {
+impl WorkerExecutionPlan {
+    pub fn remains_usable(&self, registry: &ShardRegistry, model: &ModelManifest) -> bool {
+        let advertisements = registry.advertisements();
+        self.peer_bindings.iter().all(|peer_id| {
+            advertisements.iter().any(|advertisement| {
+                advertisement.peer_id == *peer_id
+                    && hosts_verified_full_model(advertisement, model)
+                    && advertisement
+                        .capabilities
+                        .as_ref()
+                        .is_some_and(worker_is_available)
+            })
+        })
+    }
+}
+
+fn candidate(advertisement: &NodeAdvertisement, bytes_per_layer: u64) -> Option<Candidate> {
     let capabilities = advertisement.capabilities.as_ref()?;
-    if !matches!(capabilities.compute_backend.as_str(), "cuda" | "metal")
-        || capabilities.active_sessions >= capabilities.max_sessions
-    {
+    if !worker_is_available(capabilities) {
         return None;
     }
-    if !rpc_endpoint_is_usable(capabilities)
-        || coordinator_machine_id
-            .zip(capabilities.machine_id.as_deref())
-            .is_some_and(|(coordinator, worker)| coordinator == worker)
-    {
-        return None;
-    }
+    let address = preferred_address(advertisement)?;
     let available_memory_bytes = capabilities.available_accelerator_memory_bytes;
     let usable_memory_bytes = safe_model_memory(available_memory_bytes);
-    if usable_memory_bytes < MINIMUM_WORKER_CAPACITY_BYTES {
+    let layer_capacity = usable_memory_bytes.checked_div(bytes_per_layer)? as u32;
+    if layer_capacity == 0 {
         return None;
     }
     Some(Candidate {
         peer_id: advertisement.peer_id.clone(),
         machine_id: capabilities.machine_id.clone(),
-        tunnel_ready: true,
+        address,
         compute_backend: capabilities.compute_backend.clone(),
         device_name: capabilities.device_name.clone(),
         available_memory_bytes,
         usable_memory_bytes,
-        coordinator: false,
+        layer_capacity,
+        assigned_layers: 0,
     })
+}
+
+fn worker_is_available(capabilities: &NodeCapabilities) -> bool {
+    matches!(capabilities.compute_backend.as_str(), "cuda" | "metal")
+        && capabilities.active_sessions < capabilities.max_sessions
+        && capabilities.available_accelerator_memory_bytes > 0
+}
+
+pub fn worker_is_usable(capabilities: &NodeCapabilities) -> bool {
+    worker_is_available(capabilities)
+}
+
+fn hosts_verified_full_model(advertisement: &NodeAdvertisement, model: &ModelManifest) -> bool {
+    advertisement.hosted_shards.iter().any(|shard| {
+        shard.model_id == model.model_id
+            && shard.layers.start == 0
+            && shard.layers.end == model.layer_count
+            && shard
+                .shard_hash
+                .as_ref()
+                .is_some_and(|hash| !hash.is_empty())
+    })
+}
+
+fn preferred_address(advertisement: &NodeAdvertisement) -> Option<String> {
+    advertisement
+        .addresses
+        .iter()
+        .find(|address| address.contains("/p2p-circuit"))
+        .or_else(|| {
+            advertisement.addresses.iter().find(|address| {
+                !address.contains("/ip4/127.0.0.1/") && !address.contains("/ip6/::1/")
+            })
+        })
+        .or_else(|| advertisement.addresses.first())
+        .cloned()
 }
 
 impl Candidate {
@@ -272,16 +265,6 @@ fn safe_model_memory(available_memory_bytes: u64) -> u64 {
         .saturating_sub(safety)
 }
 
-pub fn rpc_endpoint_is_usable(capabilities: &NodeCapabilities) -> bool {
-    capabilities.llama_rpc.as_ref().is_some_and(|endpoint| {
-        endpoint.ready
-            && endpoint.rpc_protocol_version == LLAMA_RPC_PROTOCOL_VERSION
-            && endpoint.runtime_abi == INFERNET_LLAMA_RPC_RUNTIME_ABI
-            && endpoint.backend == capabilities.compute_backend
-            && endpoint.tunnel_protocol.as_deref() == Some(LLAMA_RPC_TUNNEL_PROTOCOL)
-    })
-}
-
 fn short_peer_id(peer_id: &str) -> String {
     if peer_id.len() <= 16 {
         return peer_id.to_owned();
@@ -291,92 +274,49 @@ fn short_peer_id(peer_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use infernet_model::LayerRange;
-    use infernet_protocol::{LlamaRpcEndpoint, NodeCapabilities, PROTOCOL_VERSION};
+    use infernet_model::{RuntimeKind, ShardDescriptor};
+    use infernet_protocol::{NodeAdvertisement, NodeCapabilities, PROTOCOL_VERSION};
 
     use super::*;
 
     #[test]
-    fn requires_and_splits_across_a_distinct_ready_worker() {
-        let mut registry = ShardRegistry::new();
-        registry.upsert(advertisement("coordinator-peer", "192.168.1.10", 24));
-        registry.upsert(advertisement("worker-peer", "192.168.1.11", 8));
+    fn assigns_contiguous_ranges_to_every_ready_local_model_worker() {
         let model = ModelManifest::infernet_chat_v1();
-        let route = vec![RouteHop {
-            peer_id: "coordinator-peer".to_owned(),
-            address: "/ip4/192.168.1.10/tcp/9777".to_owned(),
-            layers: LayerRange {
-                start: 0,
-                end: model.layer_count,
-            },
-        }];
+        let mut registry = ShardRegistry::new();
+        registry.upsert(advertisement("worker-3090", 24, &model));
+        registry.upsert(advertisement("worker-4060", 8, &model));
+        registry.upsert(advertisement("worker-mac", 16, &model));
 
-        let plan = plan_rpc_execution(&registry, &route, &model).unwrap();
-
-        assert_eq!(plan.worker_peer_ids, vec!["worker-peer"]);
-        assert_eq!(plan.participants.len(), 2);
-        assert_eq!(plan.participants[0].role, "coordinator");
-        assert_eq!(plan.participants[1].role, "worker");
-        assert_eq!(
+        let plan = plan_worker_execution(&registry, &model).unwrap();
+        assert_eq!(plan.route.len(), 3);
+        assert_eq!(plan.route.first().unwrap().layers.start, 0);
+        assert_eq!(plan.route.last().unwrap().layers.end, model.layer_count);
+        for pair in plan.route.windows(2) {
+            assert_eq!(pair[0].layers.end, pair[1].layers.start);
+        }
+        assert!(
             plan.participants
                 .iter()
-                .map(|participant| participant.estimated_share_percent)
-                .sum::<u32>(),
-            100
+                .all(|participant| participant.estimated_share_percent > 0)
         );
     }
 
     #[test]
-    fn raw_rpc_address_is_not_used_for_tunnel_selection() {
-        let mut registry = ShardRegistry::new();
-        registry.upsert(advertisement("coordinator-peer", "192.168.1.10", 24));
-        registry.upsert(advertisement("worker-peer", "203.0.113.10", 8));
+    fn ignores_gpu_peers_without_the_verified_model() {
         let model = ModelManifest::infernet_chat_v1();
-        let route = vec![RouteHop {
-            peer_id: "coordinator-peer".to_owned(),
-            address: "/ip4/192.168.1.10/tcp/9777".to_owned(),
-            layers: LayerRange {
-                start: 0,
-                end: model.layer_count,
-            },
-        }];
-
-        let plan = plan_rpc_execution(&registry, &route, &model).unwrap();
-        assert_eq!(plan.worker_peer_ids, vec!["worker-peer"]);
+        let mut registry = ShardRegistry::new();
+        let mut peer = advertisement("worker", 24, &model);
+        peer.hosted_shards.clear();
+        registry.upsert(peer);
+        assert!(plan_worker_execution(&registry, &model).is_err());
     }
 
-    #[test]
-    fn two_identities_on_one_physical_machine_do_not_count_twice() {
-        let mut registry = ShardRegistry::new();
-        let coordinator = advertisement("coordinator-peer", "192.168.1.10", 24);
-        let mut duplicate = advertisement("other-app-peer", "100.64.1.10", 8);
-        duplicate.capabilities.as_mut().unwrap().machine_id = coordinator
-            .capabilities
-            .as_ref()
-            .unwrap()
-            .machine_id
-            .clone();
-        registry.upsert(coordinator);
-        registry.upsert(duplicate);
-        let model = ModelManifest::infernet_chat_v1();
-        let route = vec![RouteHop {
-            peer_id: "coordinator-peer".to_owned(),
-            address: "/ip4/192.168.1.10/tcp/9777".to_owned(),
-            layers: LayerRange {
-                start: 0,
-                end: model.layer_count,
-            },
-        }];
-
-        assert!(plan_rpc_execution(&registry, &route, &model).is_err());
-    }
-
-    fn advertisement(peer_id: &str, host: &str, memory_gib: u64) -> NodeAdvertisement {
+    fn advertisement(peer_id: &str, memory_gib: u64, model: &ModelManifest) -> NodeAdvertisement {
         let memory = memory_gib * 1024 * 1024 * 1024;
         NodeAdvertisement {
             protocol_version: PROTOCOL_VERSION,
             peer_id: peer_id.to_owned(),
-            addresses: Vec::new(),
+            addresses: vec![format!("/ip4/192.168.1.10/tcp/9777/p2p/{peer_id}")],
             available_ram_bytes: Some(memory),
             available_vram_bytes: Some(memory),
             latency_hint_ms: Some(1),
@@ -384,7 +324,7 @@ mod tests {
                 os: "linux".to_owned(),
                 arch: "x86_64".to_owned(),
                 compute_backend: "cuda".to_owned(),
-                device_name: "NVIDIA GPU".to_owned(),
+                device_name: "GPU".to_owned(),
                 machine_id: Some(format!("machine-{peer_id}")),
                 logical_cpu_cores: 16,
                 total_ram_bytes: memory,
@@ -397,17 +337,20 @@ mod tests {
                 measured_prefill_tokens_per_second: None,
                 measured_decode_tokens_per_second: None,
                 queue_depth: 0,
-                llama_rpc: Some(LlamaRpcEndpoint {
-                    host: host.to_owned(),
-                    port: 50052,
-                    rpc_protocol_version: LLAMA_RPC_PROTOCOL_VERSION.to_owned(),
-                    runtime_abi: INFERNET_LLAMA_RPC_RUNTIME_ABI.to_owned(),
-                    backend: "cuda".to_owned(),
-                    ready: true,
-                    tunnel_protocol: Some(infernet_protocol::LLAMA_RPC_TUNNEL_PROTOCOL.to_owned()),
-                }),
+                llama_rpc: None,
             }),
-            hosted_shards: Vec::new(),
+            hosted_shards: vec![ShardDescriptor {
+                model_id: model.model_id.clone(),
+                layers: LayerRange {
+                    start: 0,
+                    end: model.layer_count,
+                },
+                runtime_kind: RuntimeKind::LlamaCpp,
+                tokenizer: None,
+                metadata: None,
+                shard_hash: Some("verified".to_owned()),
+                seed_manifest: None,
+            }],
             model_shards: Vec::new(),
         }
     }

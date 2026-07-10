@@ -1,9 +1,9 @@
-use infernet_model::{LayerRange, ShardDescriptor};
+use infernet_model::{LayerRange, SeedShardManifest, ShardDescriptor};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub const PROTOCOL_VERSION: u32 = 1;
-pub const ACTIVATION_PROTOCOL: &str = "/infernet/activation/1";
+pub const ACTIVATION_PROTOCOL: &str = "/infernet/activation/2";
 pub const MODEL_PROTOCOL: &str = "/infernet/model/1";
 pub const MODEL_BLOB_PROTOCOL: &str = "/infernet/model-blob/1";
 pub const LLAMA_RPC_TUNNEL_PROTOCOL: &str = "/infernet/llama-rpc-tunnel/1";
@@ -78,6 +78,8 @@ pub struct ModelBlobResponse {
     pub source_checksum: String,
     pub offset: u64,
     pub total_size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_manifest: Option<SeedShardManifest>,
     pub payload: Vec<u8>,
     pub error: Option<String>,
 }
@@ -98,6 +100,7 @@ impl ModelBlobResponse {
             source_checksum: request.source_checksum.clone(),
             offset: request.offset,
             total_size_bytes,
+            seed_manifest: None,
             payload,
             error: None,
         }
@@ -117,6 +120,7 @@ impl ModelBlobResponse {
             source_checksum: request.source_checksum.clone(),
             offset: request.offset,
             total_size_bytes: 0,
+            seed_manifest: None,
             payload: Vec::new(),
             error: Some(error.into()),
         }
@@ -234,6 +238,10 @@ pub struct ActivationRequest {
     pub current_hop_index: usize,
     pub hidden_size: usize,
     pub sequence_position: u32,
+    /// The token sampled by the final worker on the previous pipeline pass.
+    /// `None` marks the initial prompt-prefill pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_token_id: Option<i32>,
     pub activation: Vec<f32>,
     pub prompt: Option<PromptMetadata>,
     pub trace: Vec<TraceEvent>,
@@ -255,6 +263,7 @@ impl ActivationRequest {
             current_hop_index: 0,
             hidden_size,
             sequence_position: 0,
+            input_token_id: None,
             activation,
             prompt,
             trace: Vec::new(),
@@ -281,6 +290,14 @@ pub struct ActivationResponse {
     pub timing_ms: u64,
     pub trace: Vec<TraceEvent>,
     pub output_text: Option<String>,
+    /// Token selected by the final layer worker. The client sends this token
+    /// back through the same route while every worker keeps its KV cache hot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampled_token_id: Option<i32>,
+    #[serde(default)]
+    pub generation_complete: bool,
+    #[serde(default)]
+    pub next_sequence_position: u32,
     pub error: Option<String>,
 }
 
@@ -377,6 +394,9 @@ impl ActivationResponse {
             timing_ms,
             trace: request.trace,
             output_text,
+            sampled_token_id: None,
+            generation_complete: false,
+            next_sequence_position: 0,
             error: None,
         }
     }
@@ -397,6 +417,9 @@ impl ActivationResponse {
             timing_ms: 0,
             trace,
             output_text: None,
+            sampled_token_id: None,
+            generation_complete: false,
+            next_sequence_position: 0,
             error: Some(error.into()),
         }
     }
@@ -445,7 +468,7 @@ mod tests {
 
         assert_eq!(decoded_response, response);
         assert_eq!(decoded_response.protocol_version, PROTOCOL_VERSION);
-        assert_eq!(ACTIVATION_PROTOCOL, "/infernet/activation/1");
+        assert_eq!(ACTIVATION_PROTOCOL, "/infernet/activation/2");
     }
 
     #[test]

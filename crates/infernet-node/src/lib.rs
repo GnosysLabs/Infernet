@@ -6,13 +6,13 @@ pub mod rpc_tunnel;
 
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::mem;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -257,6 +257,170 @@ pub struct ModelServingTelemetry {
     pub last_activity_unix_ms: Option<u64>,
 }
 
+/// A point-in-time view of work performed by this node process.
+///
+/// `current` is ordered by start time. `journal` is bounded and ordered from
+/// oldest to newest completion.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalNodeActivitySnapshot {
+    pub current: Vec<LocalNodeActivityTask>,
+    pub journal: Vec<LocalNodeActivityEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalNodeActivityTask {
+    pub id: String,
+    pub trace_id: String,
+    pub kind: LocalNodeActivityKind,
+    pub started_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalNodeActivityEntry {
+    pub id: String,
+    pub trace_id: String,
+    pub kind: LocalNodeActivityKind,
+    pub outcome: LocalNodeActivityOutcome,
+    pub started_at_unix_ms: u64,
+    pub completed_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LocalNodeActivityKind {
+    ChatCompletion,
+    ComputeContribution,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LocalNodeActivityOutcome {
+    Success,
+    Error,
+}
+
+const LOCAL_NODE_ACTIVITY_JOURNAL_LIMIT: usize = 50;
+
+#[derive(Default)]
+struct LocalNodeActivityState {
+    current: Vec<LocalNodeActivityTask>,
+    journal: Vec<LocalNodeActivityEntry>,
+}
+
+impl LocalNodeActivityState {
+    fn snapshot(&self) -> LocalNodeActivitySnapshot {
+        LocalNodeActivitySnapshot {
+            current: self.current.clone(),
+            journal: self.journal.clone(),
+        }
+    }
+
+    fn start(&mut self, mut task: LocalNodeActivityTask) {
+        if self
+            .current
+            .iter()
+            .any(|current| current.trace_id == task.trace_id)
+        {
+            return;
+        }
+        if let Some(index) = self
+            .journal
+            .iter()
+            .position(|entry| entry.trace_id == task.trace_id)
+        {
+            let previous = self.journal.remove(index);
+            task.started_at_unix_ms = task.started_at_unix_ms.min(previous.started_at_unix_ms);
+        }
+        self.current.push(task);
+    }
+
+    fn finish(
+        &mut self,
+        id: &str,
+        completed_kind: Option<LocalNodeActivityKind>,
+        outcome: LocalNodeActivityOutcome,
+        completed_at_unix_ms: u64,
+    ) {
+        let Some(index) = self.current.iter().position(|task| task.id == id) else {
+            return;
+        };
+        let task = self.current.remove(index);
+        self.journal.push(LocalNodeActivityEntry {
+            id: task.trace_id.clone(),
+            trace_id: task.trace_id,
+            kind: completed_kind.unwrap_or(task.kind),
+            outcome,
+            started_at_unix_ms: task.started_at_unix_ms,
+            completed_at_unix_ms: completed_at_unix_ms.max(task.started_at_unix_ms),
+        });
+        let excess = self
+            .journal
+            .len()
+            .saturating_sub(LOCAL_NODE_ACTIVITY_JOURNAL_LIMIT);
+        if excess > 0 {
+            self.journal.drain(..excess);
+        }
+    }
+}
+
+static LOCAL_NODE_ACTIVITY: OnceLock<Mutex<LocalNodeActivityState>> = OnceLock::new();
+
+/// Returns the authoritative process-local activation activity snapshot.
+pub fn local_node_activity_snapshot() -> LocalNodeActivitySnapshot {
+    LOCAL_NODE_ACTIVITY
+        .get_or_init(|| Mutex::new(LocalNodeActivityState::default()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .snapshot()
+}
+
+fn start_local_node_activity(
+    job_id: uuid::Uuid,
+    trace_id: uuid::Uuid,
+    kind: LocalNodeActivityKind,
+) {
+    LOCAL_NODE_ACTIVITY
+        .get_or_init(|| Mutex::new(LocalNodeActivityState::default()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .start(LocalNodeActivityTask {
+            id: job_id.to_string(),
+            trace_id: trace_id.to_string(),
+            kind,
+            started_at_unix_ms: model_serving_now_unix_ms(),
+        });
+}
+
+fn finish_local_node_activity(job_id: uuid::Uuid, activation: &LocalActivationOutcome) {
+    let (completed_kind, outcome) = match activation {
+        LocalActivationOutcome::Response(response) => (
+            None,
+            if response.error.is_some() {
+                LocalNodeActivityOutcome::Error
+            } else {
+                LocalNodeActivityOutcome::Success
+            },
+        ),
+        LocalActivationOutcome::Forward(_) => (
+            Some(LocalNodeActivityKind::ComputeContribution),
+            LocalNodeActivityOutcome::Success,
+        ),
+    };
+    LOCAL_NODE_ACTIVITY
+        .get_or_init(|| Mutex::new(LocalNodeActivityState::default()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .finish(
+            &job_id.to_string(),
+            completed_kind,
+            outcome,
+            model_serving_now_unix_ms(),
+        );
+}
+
 struct ModelServingTelemetryCounters {
     bytes_served: AtomicU64,
     chunks_served: AtomicU64,
@@ -398,7 +562,7 @@ struct GridBehaviour {
     ping: ping::Behaviour,
     gossipsub: gossipsub::Behaviour,
     mdns: Toggle<mdns::tokio::Behaviour>,
-    activation: request_response::json::Behaviour<ActivationRequest, ActivationResponse>,
+    activation: request_response::Behaviour<ActivationCodec>,
     model: request_response::json::Behaviour<ModelShardRequest, ModelShardResponse>,
     blob: request_response::Behaviour<ModelBlobCodec>,
     rpc_tunnel: libp2p_stream::Behaviour,
@@ -406,6 +570,213 @@ struct GridBehaviour {
 
 #[derive(Debug, Clone, Default)]
 struct ModelBlobCodec;
+
+#[derive(Debug, Clone, Default)]
+struct ActivationCodec;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ActivationRequestHeader {
+    protocol_version: u32,
+    trace_id: uuid::Uuid,
+    model_id: String,
+    route: Vec<RouteHop>,
+    current_hop_index: usize,
+    hidden_size: usize,
+    sequence_position: u32,
+    input_token_id: Option<i32>,
+    prompt: Option<PromptMetadata>,
+    trace: Vec<TraceEvent>,
+    activation_f32_count: u32,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ActivationResponseHeader {
+    protocol_version: u32,
+    trace_id: uuid::Uuid,
+    peer_id: String,
+    processed_layer_start: u32,
+    processed_layer_end: u32,
+    timing_ms: u64,
+    trace: Vec<TraceEvent>,
+    output_text: Option<String>,
+    sampled_token_id: Option<i32>,
+    generation_complete: bool,
+    next_sequence_position: u32,
+    error: Option<String>,
+    activation_f32_count: u32,
+}
+
+const ACTIVATION_HEADER_MAX_BYTES: usize = 1024 * 1024;
+const ACTIVATION_PAYLOAD_MAX_BYTES: usize = 128 * 1024 * 1024;
+
+#[async_trait]
+impl request_response::Codec for ActivationCodec {
+    type Protocol = StreamProtocol;
+    type Request = ActivationRequest;
+    type Response = ActivationResponse;
+
+    async fn read_request<T>(
+        &mut self,
+        _protocol: &Self::Protocol,
+        io: &mut T,
+    ) -> io::Result<Self::Request>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        let header: ActivationRequestHeader =
+            serde_json::from_slice(&read_blob_frame(io, ACTIVATION_HEADER_MAX_BYTES).await?)
+                .map_err(invalid_data)?;
+        let activation = read_f32_frame(io, header.activation_f32_count).await?;
+        Ok(ActivationRequest {
+            protocol_version: header.protocol_version,
+            trace_id: header.trace_id,
+            model_id: header.model_id,
+            route: header.route,
+            current_hop_index: header.current_hop_index,
+            hidden_size: header.hidden_size,
+            sequence_position: header.sequence_position,
+            input_token_id: header.input_token_id,
+            activation,
+            prompt: header.prompt,
+            trace: header.trace,
+        })
+    }
+
+    async fn read_response<T>(
+        &mut self,
+        _protocol: &Self::Protocol,
+        io: &mut T,
+    ) -> io::Result<Self::Response>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        let header: ActivationResponseHeader =
+            serde_json::from_slice(&read_blob_frame(io, ACTIVATION_HEADER_MAX_BYTES).await?)
+                .map_err(invalid_data)?;
+        let output_activation = read_f32_frame(io, header.activation_f32_count).await?;
+        Ok(ActivationResponse {
+            protocol_version: header.protocol_version,
+            trace_id: header.trace_id,
+            peer_id: header.peer_id,
+            processed_layer_start: header.processed_layer_start,
+            processed_layer_end: header.processed_layer_end,
+            output_activation,
+            timing_ms: header.timing_ms,
+            trace: header.trace,
+            output_text: header.output_text,
+            sampled_token_id: header.sampled_token_id,
+            generation_complete: header.generation_complete,
+            next_sequence_position: header.next_sequence_position,
+            error: header.error,
+        })
+    }
+
+    async fn write_request<T>(
+        &mut self,
+        _protocol: &Self::Protocol,
+        io: &mut T,
+        req: Self::Request,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        let activation_f32_count = checked_activation_count(req.activation.len())?;
+        let header = ActivationRequestHeader {
+            protocol_version: req.protocol_version,
+            trace_id: req.trace_id,
+            model_id: req.model_id,
+            route: req.route,
+            current_hop_index: req.current_hop_index,
+            hidden_size: req.hidden_size,
+            sequence_position: req.sequence_position,
+            input_token_id: req.input_token_id,
+            prompt: req.prompt,
+            trace: req.trace,
+            activation_f32_count,
+        };
+        write_blob_frame(io, &serde_json::to_vec(&header).map_err(invalid_data)?).await?;
+        write_f32_frame(io, &req.activation).await?;
+        io.close().await
+    }
+
+    async fn write_response<T>(
+        &mut self,
+        _protocol: &Self::Protocol,
+        io: &mut T,
+        res: Self::Response,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        let activation_f32_count = checked_activation_count(res.output_activation.len())?;
+        let header = ActivationResponseHeader {
+            protocol_version: res.protocol_version,
+            trace_id: res.trace_id,
+            peer_id: res.peer_id,
+            processed_layer_start: res.processed_layer_start,
+            processed_layer_end: res.processed_layer_end,
+            timing_ms: res.timing_ms,
+            trace: res.trace,
+            output_text: res.output_text,
+            sampled_token_id: res.sampled_token_id,
+            generation_complete: res.generation_complete,
+            next_sequence_position: res.next_sequence_position,
+            error: res.error,
+            activation_f32_count,
+        };
+        write_blob_frame(io, &serde_json::to_vec(&header).map_err(invalid_data)?).await?;
+        write_f32_frame(io, &res.output_activation).await?;
+        io.close().await
+    }
+}
+
+fn checked_activation_count(count: usize) -> io::Result<u32> {
+    let bytes = count
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "activation byte size overflow")
+        })?;
+    if bytes > ACTIVATION_PAYLOAD_MAX_BYTES || count > u32::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("activation payload is too large: {bytes} bytes"),
+        ));
+    }
+    Ok(count as u32)
+}
+
+async fn read_f32_frame<T>(io: &mut T, count: u32) -> io::Result<Vec<f32>>
+where
+    T: AsyncRead + Unpin + Send,
+{
+    let byte_len = (count as usize)
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "activation size overflow"))?;
+    if byte_len > ACTIVATION_PAYLOAD_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("activation payload is too large: {byte_len} bytes"),
+        ));
+    }
+    let mut bytes = vec![0_u8; byte_len];
+    io.read_exact(&mut bytes).await?;
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect())
+}
+
+async fn write_f32_frame<T>(io: &mut T, values: &[f32]) -> io::Result<()>
+where
+    T: AsyncWrite + Unpin + Send,
+{
+    checked_activation_count(values.len())?;
+    let mut bytes = Vec::with_capacity(values.len() * 4);
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    io.write_all(&bytes).await
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ModelBlobResponseHeader {
@@ -417,6 +788,7 @@ struct ModelBlobResponseHeader {
     source_checksum: String,
     offset: u64,
     total_size_bytes: u64,
+    seed_manifest: Option<SeedShardManifest>,
     payload_len: u32,
     error: Option<String>,
 }
@@ -474,6 +846,7 @@ impl request_response::Codec for ModelBlobCodec {
             source_checksum: header.source_checksum,
             offset: header.offset,
             total_size_bytes: header.total_size_bytes,
+            seed_manifest: header.seed_manifest,
             payload,
             error: header.error,
         })
@@ -521,6 +894,7 @@ impl request_response::Codec for ModelBlobCodec {
             source_checksum: res.source_checksum,
             offset: res.offset,
             total_size_bytes: res.total_size_bytes,
+            seed_manifest: res.seed_manifest,
             payload_len: res.payload.len() as u32,
             error: res.error,
         };
@@ -1260,14 +1634,14 @@ pub async fn fetch_model_shard_over_libp2p_with_progress(
                     config.dial_discovered_peers,
                 )? {
                     match network_event {
-                        GridNetworkEvent::ModelBlob(ModelBlobNetworkEvent::Response { request_id, response }) => {
-                            if let Some((pending_id, candidate, expected_offset)) = pending_request.take() {
+                        GridNetworkEvent::ModelBlob(ModelBlobNetworkEvent::Response { request_id, mut response }) => {
+                            if let Some((pending_id, mut candidate, expected_offset)) = pending_request.take() {
                                 if request_id != pending_id {
                                     pending_request = Some((pending_id, candidate, expected_offset));
                                     continue;
                                 }
 
-                                if let Some(error) = response.error {
+                                if let Some(error) = response.error.take() {
                                     record_model_fetch_peer_failure(
                                         &mut failed_peers,
                                         candidate.advertisement.peer_id.clone(),
@@ -1276,6 +1650,9 @@ pub async fn fetch_model_shard_over_libp2p_with_progress(
                                         "model shard chunk request failed: {error}; retrying peer after cooldown"
                                     );
                                     continue;
+                                }
+                                if candidate.seed_manifest.is_none() {
+                                    candidate.seed_manifest = response.seed_manifest.clone();
                                 }
                                 if response.model_id != model_id
                                     || response.source_checksum != candidate.shard.checksum
@@ -1747,17 +2124,18 @@ pub async fn infer_over_libp2p(
     } else {
         Vec::new()
     };
+    let prompt_metadata = PromptMetadata {
+        prompt,
+        demo_mode,
+        rpc_endpoints: Vec::new(),
+        rpc_worker_peer_ids: Vec::new(),
+    };
     let request = ActivationRequest::new(
         manifest.model_id.clone(),
         route.clone(),
         hidden_size,
         activation,
-        Some(PromptMetadata {
-            prompt,
-            demo_mode,
-            rpc_endpoints: Vec::new(),
-            rpc_worker_peer_ids: config.rpc_worker_peer_ids.clone(),
-        }),
+        Some(prompt_metadata.clone()),
     );
     let first_hop = request
         .current_hop()
@@ -1774,7 +2152,7 @@ pub async fn infer_over_libp2p(
     .await?;
     let outbound_id =
         send_activation_request_with_relays(&mut swarm, &config.static_peers, &first_hop, request)?;
-    let response = wait_for_client_response(
+    let mut response = wait_for_client_response(
         &mut swarm,
         &mut registry,
         &mut config,
@@ -1787,10 +2165,78 @@ pub async fn infer_over_libp2p(
     )
     .await?;
 
-    if let Some(error) = &response.error {
-        bail!("remote activation error: {error}");
+    if demo_mode {
+        if let Some(error) = &response.error {
+            bail!("remote activation error: {error}");
+        }
+        return Ok(InferenceResult { route, response });
     }
 
+    const MAX_GENERATED_TOKENS: usize = 64;
+    let trace_id = response.trace_id;
+    let mut output_text = String::new();
+    let mut complete_trace = Vec::new();
+    let mut generated_tokens = 0_usize;
+    loop {
+        if let Some(error) = &response.error {
+            bail!("remote activation error: {error}");
+        }
+        complete_trace.append(&mut response.trace);
+        if let Some(piece) = response.output_text.take() {
+            output_text.push_str(&piece);
+        }
+        if response.generation_complete || generated_tokens >= MAX_GENERATED_TOKENS {
+            break;
+        }
+        let sampled_token_id = response.sampled_token_id.ok_or_else(|| {
+            anyhow!("final Infernet worker returned no sampled token for the next pipeline pass")
+        })?;
+        generated_tokens += 1;
+        if generated_tokens >= MAX_GENERATED_TOKENS {
+            break;
+        }
+
+        let mut next_request = ActivationRequest::new(
+            manifest.model_id.clone(),
+            route.clone(),
+            hidden_size,
+            Vec::new(),
+            Some(prompt_metadata.clone()),
+        );
+        next_request.trace_id = trace_id;
+        next_request.input_token_id = Some(sampled_token_id);
+        next_request.sequence_position = response.next_sequence_position;
+        let first_hop = next_request
+            .current_hop()
+            .cloned()
+            .ok_or_else(|| anyhow!("route must contain at least one hop"))?;
+        connect_to_activation_hop(
+            &mut swarm,
+            &mut registry,
+            &mut config,
+            &topic,
+            &first_hop,
+            Duration::from_secs(30),
+        )
+        .await?;
+        let outbound_id = send_activation_request_with_relays(
+            &mut swarm,
+            &config.static_peers,
+            &first_hop,
+            next_request,
+        )?;
+        response = wait_for_client_response(
+            &mut swarm,
+            &mut registry,
+            &mut config,
+            &topic,
+            outbound_id,
+            Duration::from_secs(5 * 60),
+        )
+        .await?;
+    }
+    response.trace = complete_trace;
+    response.output_text = Some(output_text);
     Ok(InferenceResult { route, response })
 }
 
@@ -1849,10 +2295,9 @@ fn validate_planned_route(
         }
         let advertised = advertisements.iter().any(|advertisement| {
             advertisement.peer_id == hop.peer_id
-                && advertisement
-                    .hosted_shards
-                    .iter()
-                    .any(|shard| shard.model_id == manifest.model_id && shard.layers == hop.layers)
+                && advertisement.hosted_shards.iter().any(|shard| {
+                    shard.model_id == manifest.model_id && shard.layers.contains(&hop.layers)
+                })
         });
         if !advertised {
             bail!(
@@ -2089,6 +2534,9 @@ pub fn process_activation_step(
         .expect("validation ensures a current hop exists");
     let started = Instant::now();
     let mut output_text = None;
+    let mut sampled_token_id = None;
+    let mut generation_complete = false;
+    let mut next_sequence_position = request.sequence_position;
     let timing_ms;
 
     match config.runtime_kind {
@@ -2111,6 +2559,9 @@ pub fn process_activation_step(
             Ok(output) => {
                 request.activation = output.activation;
                 output_text = output.output_text;
+                sampled_token_id = output.sampled_token_id;
+                generation_complete = output.generation_complete;
+                next_sequence_position = output.next_sequence_position;
                 timing_ms = output.timing_ms;
             }
             Err(error) => {
@@ -2142,12 +2593,12 @@ pub fn process_activation_step(
     } else {
         let output =
             output_text.unwrap_or_else(|| DemoRuntime::decode_activation(&request.activation));
-        Ok(ActivationStep::Final(ActivationResponse::success(
-            request,
-            config.peer_id.clone(),
-            Some(output),
-            timing_ms,
-        )))
+        let mut response =
+            ActivationResponse::success(request, config.peer_id.clone(), Some(output), timing_ms);
+        response.sampled_token_id = sampled_token_id;
+        response.generation_complete = generation_complete;
+        response.next_sequence_position = next_sequence_position;
+        Ok(ActivationStep::Final(response))
     }
 }
 
@@ -2155,6 +2606,9 @@ pub fn process_activation_step(
 struct LlamaShardOutput {
     activation: Vec<f32>,
     output_text: Option<String>,
+    sampled_token_id: Option<i32>,
+    generation_complete: bool,
+    next_sequence_position: u32,
     timing_ms: u64,
 }
 
@@ -2172,7 +2626,192 @@ struct LlamaBridgeJson {
     #[serde(default)]
     output_text: Option<String>,
     #[serde(default)]
+    sampled_token_id: Option<i32>,
+    #[serde(default)]
+    generation_complete: bool,
+    #[serde(default)]
+    next_sequence_position: u32,
+    #[serde(default)]
     timing_ms: Option<f64>,
+}
+
+struct PersistentInfernetWorker {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+}
+
+static PERSISTENT_INFERNET_WORKERS: OnceLock<Mutex<HashMap<String, PersistentInfernetWorker>>> =
+    OnceLock::new();
+
+impl PersistentInfernetWorker {
+    fn spawn(
+        bridge: &Path,
+        model_path: &Path,
+        layers: LayerRange,
+        hidden_size: usize,
+    ) -> Result<Self> {
+        let mut command = Command::new(bridge);
+        if let Some(runtime_dir) = bridge.parent() {
+            command.current_dir(runtime_dir);
+        }
+        constrain_llama_bridge_library_threads(&mut command);
+        #[cfg(target_os = "windows")]
+        {
+            let mut library_dirs = Vec::new();
+            if let Some(parent) = bridge.parent() {
+                library_dirs.push(parent.to_path_buf());
+            }
+            if let Some(path) = env::var_os("PATH") {
+                library_dirs.extend(env::split_paths(&path));
+            }
+            if let Ok(path) = env::join_paths(library_dirs) {
+                command.env("PATH", path);
+            }
+        }
+        command
+            .arg("--model")
+            .arg(model_path)
+            .arg("--layer-start")
+            .arg(layers.start.to_string())
+            .arg("--layer-end")
+            .arg(layers.end.to_string())
+            .arg("--hidden-size")
+            .arg(hidden_size.to_string())
+            .arg("--threads")
+            .arg(llama_bridge_thread_cap().to_string())
+            .arg("--max-context")
+            .arg("8192")
+            .arg("--server")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+
+        let mut child = command.spawn().with_context(|| {
+            format!(
+                "failed to start persistent Infernet worker for {}:{}",
+                layers.start, layers.end
+            )
+        })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("persistent Infernet worker has no stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("persistent Infernet worker has no stdout"))?;
+        let mut worker = Self {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+        };
+        let ready = worker.read_json_line()?;
+        if !ready
+            .get("ready")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            let error = ready
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("worker stopped before becoming ready");
+            bail!("persistent Infernet worker failed to load local layers: {error}");
+        }
+        Ok(worker)
+    }
+
+    fn request(&mut self, command: &str) -> Result<LlamaBridgeJson> {
+        if self.child.try_wait()?.is_some() {
+            bail!("persistent Infernet worker exited unexpectedly");
+        }
+        self.stdin
+            .write_all(command.as_bytes())
+            .context("failed to send work to persistent Infernet worker")?;
+        self.stdin.write_all(b"\n")?;
+        self.stdin.flush()?;
+        let value = self.read_json_line()?;
+        serde_json::from_value(value).context("failed to parse persistent Infernet worker response")
+    }
+
+    fn read_json_line(&mut self) -> Result<serde_json::Value> {
+        let mut line = String::new();
+        let read = self
+            .stdout
+            .read_line(&mut line)
+            .context("failed to read persistent Infernet worker response")?;
+        if read == 0 {
+            bail!("persistent Infernet worker closed its output stream");
+        }
+        serde_json::from_str(line.trim()).with_context(|| {
+            format!(
+                "persistent Infernet worker emitted invalid JSON: {}",
+                line.trim()
+            )
+        })
+    }
+}
+
+impl Drop for PersistentInfernetWorker {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn encode_worker_field(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(value.len() * 2);
+    for byte in value.as_bytes() {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn run_persistent_infernet_worker(
+    bridge: &Path,
+    model_path: &Path,
+    layers: LayerRange,
+    hidden_size: usize,
+    command: &str,
+) -> Result<LlamaBridgeJson> {
+    let key = format!(
+        "{}:{}:{}:{}:{}",
+        bridge.display(),
+        model_path.display(),
+        layers.start,
+        layers.end,
+        hidden_size
+    );
+    let workers = PERSISTENT_INFERNET_WORKERS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut workers = workers
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for attempt in 0..2 {
+        if !workers.contains_key(&key) {
+            workers.insert(
+                key.clone(),
+                PersistentInfernetWorker::spawn(bridge, model_path, layers, hidden_size)?,
+            );
+        }
+        let result = workers
+            .get_mut(&key)
+            .expect("worker was inserted")
+            .request(command);
+        match result {
+            Ok(output) => return Ok(output),
+            Err(error) if attempt == 0 => {
+                workers.remove(&key);
+                eprintln!(
+                    "persistent_worker_restart layers={}:{} error={error:#}",
+                    layers.start, layers.end
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!()
 }
 
 fn execute_llama_cpp_shard(
@@ -2213,37 +2852,6 @@ fn execute_llama_cpp_shard(
             manifest.runtime_kind.as_str()
         );
     }
-    let rpc_endpoints =
-        validated_rpc_endpoints_for_execution(config, layers, request, &manifest, &model_path)?;
-    if !rpc_endpoints.is_empty() {
-        let binary = find_llama_server_binary().ok_or_else(|| {
-            anyhow!(
-                "llama-server binary is missing; run npm run prepare-runtime or set INFERNET_LLAMA_SERVER"
-            )
-        })?;
-        let release = OfficialModelRelease::infernet_chat_v1_compatibility();
-        let completion = complete_with_persistent_llama_server(
-            LlamaServerConfig {
-                binary,
-                model_path,
-                rpc_endpoints,
-                context_size: release.launch_context_cap_tokens,
-                threads: llama_bridge_thread_cap(),
-                cache_ram_mib: 0,
-                startup_timeout: Duration::from_secs(8 * 60),
-                request_timeout: Duration::from_secs(7 * 60),
-                log_dir: cache_config.root.join("runtime"),
-            },
-            &prompt.prompt,
-            64,
-        )?;
-        return Ok(LlamaShardOutput {
-            activation: Vec::new(),
-            output_text: Some(completion.text),
-            timing_ms: completion.timing_ms,
-        });
-    }
-
     let bridge = find_llama_bridge_binary().ok_or_else(|| {
         anyhow!(
             "infernet-llama-bridge binary is missing; run npm run prepare-runtime or set INFERNET_LLAMA_BRIDGE"
@@ -2253,7 +2861,10 @@ fn execute_llama_cpp_shard(
     let temp_root = env::temp_dir().join("infernet-activation-frames");
     fs::create_dir_all(&temp_root)
         .with_context(|| format!("failed to create {}", temp_root.display()))?;
-    let frame_id = format!("{}-{}", request.trace_id, request.current_hop_index);
+    let frame_id = format!(
+        "{}-{}-{}",
+        request.trace_id, request.current_hop_index, request.sequence_position
+    );
     let input_path = temp_root.join(format!("{frame_id}-in.f32"));
     let output_path = temp_root.join(format!("{frame_id}-out.f32"));
 
@@ -2261,79 +2872,45 @@ fn execute_llama_cpp_shard(
         write_f32_activation(&input_path, &request.activation)?;
     }
 
-    let mut command = Command::new(&bridge);
-    if let Some(runtime_dir) = bridge.parent() {
-        command.current_dir(runtime_dir);
-    }
-    constrain_llama_bridge_library_threads(&mut command);
-    #[cfg(target_os = "windows")]
-    {
-        let mut library_dirs = Vec::new();
-        if let Some(parent) = bridge.parent() {
-            library_dirs.push(parent.to_path_buf());
-        }
-        if let Some(path) = env::var_os("PATH") {
-            library_dirs.extend(env::split_paths(&path));
-        }
-        if let Ok(path) = env::join_paths(library_dirs) {
-            command.env("PATH", path);
-        }
-    }
+    let input = if request.activation.is_empty() {
+        String::new()
+    } else {
+        input_path.to_string_lossy().into_owned()
+    };
+    let output = if request.next_hop().is_some() {
+        output_path.to_string_lossy().into_owned()
+    } else {
+        String::new()
+    };
+    let command = match request.input_token_id {
+        Some(token_id) => format!(
+            "TOKEN\t{}\t{}\t{}\t{}\t{}",
+            request.trace_id,
+            token_id,
+            request.sequence_position,
+            encode_worker_field(&input),
+            encode_worker_field(&output)
+        ),
+        None => format!(
+            "PREFILL\t{}\t{}\t{}\t{}",
+            request.trace_id,
+            encode_worker_field(&prompt.prompt),
+            encode_worker_field(&input),
+            encode_worker_field(&output)
+        ),
+    };
+    let bridge_output =
+        run_persistent_infernet_worker(&bridge, &model_path, layers, config.hidden_size, &command)?;
 
-    command
-        .arg("--model")
-        .arg(&model_path)
-        .arg("--layer-start")
-        .arg(layers.start.to_string())
-        .arg("--layer-end")
-        .arg(layers.end.to_string())
-        .arg("--hidden-size")
-        .arg(config.hidden_size.to_string())
-        .arg("--threads")
-        .arg(llama_bridge_thread_cap().to_string())
-        .arg("--prompt")
-        .arg(&prompt.prompt);
-    if layers.start == 0 && layers.end == manifest.layer_count {
-        // Compatibility packages must use llama.cpp's unmodified full graph.
-        // Enabling Infernet's partial-graph patch here breaks architectures for
-        // which no split executor exists yet (including Qwen 3.5).
-        command.arg("--full-model");
-    }
-    append_llama_rpc_arguments(&mut command, &rpc_endpoints);
-    if !request.activation.is_empty() {
-        command.arg("--input").arg(&input_path);
-    }
-    if request.next_hop().is_some() {
-        command.arg("--output").arg(&output_path);
-    }
-
-    let output = run_llama_bridge_with_timeout(&mut command, LLAMA_BRIDGE_EXECUTION_TIMEOUT)
-        .with_context(|| {
-            format!(
-                "failed to run {} for {} {}:{}",
-                bridge.display(),
-                config.model_id,
-                layers.start,
-                layers.end
-            )
-        })?;
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let bridge_output = parse_llama_bridge_json(&output)?;
-
-    if !output.status.success() || !bridge_output.ok {
+    if !bridge_output.ok {
         bail!(
-            "infernet-llama-bridge failed for {} {}:{}: {}{}",
+            "persistent Infernet worker failed for {} {}:{}: {}",
             config.model_id,
             layers.start,
             layers.end,
             bridge_output
                 .error
-                .unwrap_or_else(|| format!("exit status {:?}", output.status.code())),
-            if stderr.trim().is_empty() {
-                String::new()
-            } else {
-                format!("; stderr={}", stderr.trim())
-            }
+                .unwrap_or_else(|| "unknown worker error".to_owned()),
         );
     }
 
@@ -2383,6 +2960,9 @@ fn execute_llama_cpp_shard(
     Ok(LlamaShardOutput {
         activation,
         output_text: bridge_output.output_text,
+        sampled_token_id: bridge_output.sampled_token_id,
+        generation_complete: bridge_output.generation_complete,
+        next_sequence_position: bridge_output.next_sequence_position,
         timing_ms: bridge_output
             .timing_ms
             .map(|value| value.max(0.0).round() as u64)
@@ -3168,7 +3748,7 @@ fn handle_cached_activation_request(
     pending_forwards: &mut HashMap<request_response::OutboundRequestId, PendingOutbound>,
     completion_sender: &mpsc::UnboundedSender<CompletedLocalActivation>,
     pending_local_activations: &mut HashMap<uuid::Uuid, PendingLocalActivation>,
-    rpc_tunnel_control: libp2p_stream::Control,
+    _rpc_tunnel_control: libp2p_stream::Control,
 ) -> Result<()> {
     let trace_id = request.trace_id;
     if request
@@ -3236,6 +3816,11 @@ fn handle_cached_activation_request(
     };
 
     let job_id = uuid::Uuid::new_v4();
+    let activity_kind = if request.prompt.is_some() && request.route.len() == 1 {
+        LocalNodeActivityKind::ChatCompletion
+    } else {
+        LocalNodeActivityKind::ComputeContribution
+    };
     pending_local_activations.insert(
         job_id,
         PendingLocalActivation {
@@ -3243,45 +3828,24 @@ fn handle_cached_activation_request(
             peer_id: peer_id.to_owned(),
         },
     );
+    start_local_node_activity(job_id, trace_id, activity_kind);
     let completion_sender = completion_sender.clone();
     let peer_id = peer_id.to_owned();
-    let worker_peer_ids = request
-        .prompt
-        .as_ref()
-        .map(|prompt| prompt.rpc_worker_peer_ids.clone())
-        .unwrap_or_default();
     set_local_inference_active(true);
     tokio::spawn(async move {
         let trace_id = request.trace_id;
         let failure_trace = request.trace.clone();
-        let outcome = match ensure_persistent_rpc_tunnels(rpc_tunnel_control, &worker_peer_ids)
-            .await
+        let processing_peer_id = peer_id.clone();
+        let outcome = match tokio::task::spawn_blocking(move || {
+            process_local_activation_steps(&worker, &processing_peer_id, request)
+        })
+        .await
         {
-            Ok(endpoints) => {
-                let mut request = request;
-                if let Some(prompt) = request.prompt.as_mut() {
-                    prompt.rpc_endpoints = endpoints;
-                    prompt.rpc_worker_peer_ids.clear();
-                }
-                let processing_peer_id = peer_id.clone();
-                match tokio::task::spawn_blocking(move || {
-                    process_local_activation_steps(&worker, &processing_peer_id, request)
-                })
-                .await
-                {
-                    Ok(outcome) => outcome,
-                    Err(error) => LocalActivationOutcome::Response(ActivationResponse::failure(
-                        trace_id,
-                        peer_id,
-                        format!("local inference task failed: {error}"),
-                        failure_trace,
-                    )),
-                }
-            }
+            Ok(outcome) => outcome,
             Err(error) => LocalActivationOutcome::Response(ActivationResponse::failure(
                 trace_id,
                 peer_id,
-                format!("failed to prepare distributed RPC tunnels: {error:#}"),
+                format!("local persistent worker task failed: {error}"),
                 failure_trace,
             )),
         };
@@ -3326,6 +3890,7 @@ fn handle_completed_local_activation(
         return Ok(());
     };
     set_local_inference_active(false);
+    finish_local_node_activity(completed.job_id, &completed.outcome);
     match completed.outcome {
         LocalActivationOutcome::Response(response) => {
             send_response(swarm, pending.channel, response);
@@ -3570,25 +4135,26 @@ fn model_blob_response_from_cache(
             }
         };
 
-        if request.offset >= record.info.size_bytes {
-            return ModelBlobResponse::success(
+        let success = |payload| {
+            let mut response = ModelBlobResponse::success(
                 request,
                 peer_id.to_owned(),
                 record.info.size_bytes,
-                Vec::new(),
+                payload,
             );
+            response.seed_manifest = record.manifest.clone();
+            response
+        };
+
+        if request.offset >= record.info.size_bytes {
+            return success(Vec::new());
         }
         let bytes_to_read = request
             .max_bytes
             .min(MODEL_BLOB_CHUNK_BYTES)
             .min((record.info.size_bytes - request.offset).min(u64::from(u32::MAX)) as u32);
         return match read_source_chunk(&record.path, request.offset, bytes_to_read as usize) {
-            Ok(payload) => ModelBlobResponse::success(
-                request,
-                peer_id.to_owned(),
-                record.info.size_bytes,
-                payload,
-            ),
+            Ok(payload) => success(payload),
             Err(error) => {
                 ModelBlobResponse::failure(request, peer_id.to_owned(), error.to_string())
             }
@@ -3617,13 +4183,14 @@ fn model_blob_response_from_cache(
     };
 
     let total_size_bytes = manifest.source.file_size_bytes;
+    let success = |payload| {
+        let mut response =
+            ModelBlobResponse::success(request, peer_id.to_owned(), total_size_bytes, payload);
+        response.seed_manifest = Some(manifest.clone());
+        response
+    };
     if request.offset >= total_size_bytes {
-        return ModelBlobResponse::success(
-            request,
-            peer_id.to_owned(),
-            total_size_bytes,
-            Vec::new(),
-        );
+        return success(Vec::new());
     }
 
     let bytes_to_read = request
@@ -3632,9 +4199,7 @@ fn model_blob_response_from_cache(
         .min((total_size_bytes - request.offset).min(u64::from(u32::MAX)) as u32);
 
     match read_source_chunk(&source_path, request.offset, bytes_to_read as usize) {
-        Ok(payload) => {
-            ModelBlobResponse::success(request, peer_id.to_owned(), total_size_bytes, payload)
-        }
+        Ok(payload) => success(payload),
         Err(error) => ModelBlobResponse::failure(request, peer_id.to_owned(), error.to_string()),
     }
 }
@@ -3664,25 +4229,29 @@ fn executable_seed_manifest_for_layers(
     model_id: &str,
     layers: LayerRange,
 ) -> Result<Option<(SeedShardManifest, PathBuf)>> {
+    let mut containing = None;
     for record in cache.list()? {
-        if record.info.model_id != model_id || record.info.layers != layers {
+        if record.info.model_id != model_id || !record.info.layers.contains(&layers) {
             continue;
         }
         let Some(manifest) = record.manifest.clone() else {
             continue;
         };
-        if manifest.model_id != model_id || manifest.layers != layers {
+        if manifest.model_id != model_id || !manifest.layers.contains(&layers) {
             continue;
         }
         if manifest.runtime_kind == RuntimeKind::Demo {
             return Ok(Some((manifest, PathBuf::new())));
         }
         if is_executable_shard_record(&record) {
-            return Ok(Some((manifest, record.path)));
+            if manifest.layers == layers {
+                return Ok(Some((manifest, record.path)));
+            }
+            containing = Some((manifest, record.path));
         }
     }
 
-    Ok(None)
+    Ok(containing)
 }
 
 fn read_source_chunk(path: &Path, offset: u64, len: usize) -> Result<Vec<u8>> {
@@ -3855,18 +4424,12 @@ fn handle_grid_event(
     match event {
         SwarmEvent::NewListenAddr { address, .. } => {
             let peer_id = *swarm.local_peer_id();
+            let printable = match address.clone().with_p2p(peer_id) {
+                Ok(address) | Err(address) => address,
+            };
+            println!("libp2p_listen={printable}");
             if advertise_listen_addresses && update_listen_address(advertisement, peer_id, address)
             {
-                if let Some(advertisement) = advertisement.as_ref() {
-                    println!(
-                        "libp2p_listen={}",
-                        advertisement
-                            .addresses
-                            .last()
-                            .map(String::as_str)
-                            .unwrap_or("<no-address>")
-                    );
-                }
                 publish_local_advertisement(swarm, topic, advertisement, &peer_id.to_string())?;
             }
         }
@@ -4137,7 +4700,7 @@ fn build_grid_swarm(
                 .then(|| mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id))
                 .transpose()?
                 .into();
-            let activation = request_response::json::Behaviour::new(
+            let activation = request_response::Behaviour::new(
                 [(
                     StreamProtocol::new(ACTIVATION_PROTOCOL),
                     request_response::ProtocolSupport::Full,
@@ -4516,11 +5079,15 @@ fn select_model_shard_candidate(
                         })
                         .cloned();
 
-                    seed_manifest.map(|seed_manifest| ModelShardCandidate {
-                        advertisement: advertisement.clone(),
-                        shard,
-                        seed_manifest: Some(seed_manifest),
-                    })
+                    if seed_manifest.is_some() || (checksum.is_some() && version.is_some()) {
+                        Some(ModelShardCandidate {
+                            advertisement: advertisement.clone(),
+                            shard,
+                            seed_manifest,
+                        })
+                    } else {
+                        None
+                    }
                 })
         })
         .filter(|candidate| {
@@ -4677,6 +5244,97 @@ mod tests {
             address: String::new(),
             layers: LayerRange::new(start, end).unwrap(),
         }
+    }
+
+    #[test]
+    fn local_node_activity_journal_is_bounded_and_chronological() {
+        let mut state = LocalNodeActivityState::default();
+
+        for index in 0..(LOCAL_NODE_ACTIVITY_JOURNAL_LIMIT + 2) {
+            let id = format!("job-{index}");
+            state.start(LocalNodeActivityTask {
+                id: id.clone(),
+                trace_id: format!("trace-{index}"),
+                kind: LocalNodeActivityKind::ChatCompletion,
+                started_at_unix_ms: index as u64,
+            });
+            state.finish(
+                &id,
+                None,
+                LocalNodeActivityOutcome::Success,
+                index as u64 + 1,
+            );
+        }
+
+        let snapshot = state.snapshot();
+        assert!(snapshot.current.is_empty());
+        assert_eq!(snapshot.journal.len(), LOCAL_NODE_ACTIVITY_JOURNAL_LIMIT);
+        assert_eq!(snapshot.journal.first().unwrap().id, "trace-2");
+        assert_eq!(
+            snapshot.journal.last().unwrap().id,
+            format!("trace-{}", LOCAL_NODE_ACTIVITY_JOURNAL_LIMIT + 1)
+        );
+        assert!(
+            snapshot
+                .journal
+                .windows(2)
+                .all(|entries| entries[0].completed_at_unix_ms <= entries[1].completed_at_unix_ms)
+        );
+    }
+
+    #[test]
+    fn local_node_activity_coalesces_repeated_work_for_one_trace() {
+        let mut state = LocalNodeActivityState::default();
+        state.start(LocalNodeActivityTask {
+            id: "job-one".to_owned(),
+            trace_id: "trace-shared".to_owned(),
+            kind: LocalNodeActivityKind::ChatCompletion,
+            started_at_unix_ms: 10,
+        });
+        state.finish("job-one", None, LocalNodeActivityOutcome::Success, 20);
+        state.start(LocalNodeActivityTask {
+            id: "job-two".to_owned(),
+            trace_id: "trace-shared".to_owned(),
+            kind: LocalNodeActivityKind::ChatCompletion,
+            started_at_unix_ms: 21,
+        });
+
+        assert!(state.journal.is_empty());
+        assert_eq!(state.current[0].started_at_unix_ms, 10);
+
+        state.finish("job-two", None, LocalNodeActivityOutcome::Success, 30);
+        assert_eq!(state.journal.len(), 1);
+        assert_eq!(state.journal[0].id, "trace-shared");
+        assert_eq!(state.journal[0].started_at_unix_ms, 10);
+        assert_eq!(state.journal[0].completed_at_unix_ms, 30);
+    }
+
+    #[test]
+    fn local_node_activity_snapshot_serializes_for_the_ui() {
+        let snapshot = LocalNodeActivitySnapshot {
+            current: vec![LocalNodeActivityTask {
+                id: "job-current".to_owned(),
+                trace_id: "trace-current".to_owned(),
+                kind: LocalNodeActivityKind::ChatCompletion,
+                started_at_unix_ms: 10,
+            }],
+            journal: vec![LocalNodeActivityEntry {
+                id: "job-complete".to_owned(),
+                trace_id: "trace-complete".to_owned(),
+                kind: LocalNodeActivityKind::ComputeContribution,
+                outcome: LocalNodeActivityOutcome::Error,
+                started_at_unix_ms: 20,
+                completed_at_unix_ms: 30,
+            }],
+        };
+
+        let value = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(value["current"][0]["traceId"], "trace-current");
+        assert_eq!(value["current"][0]["kind"], "chatCompletion");
+        assert_eq!(value["current"][0]["startedAtUnixMs"], 10);
+        assert_eq!(value["journal"][0]["kind"], "computeContribution");
+        assert_eq!(value["journal"][0]["outcome"], "error");
+        assert_eq!(value["journal"][0]["completedAtUnixMs"], 30);
     }
 
     fn official_rpc_fixture() -> (
@@ -5242,6 +5900,57 @@ mod tests {
         let decoded = request_response::Codec::read_response(&mut codec, &protocol, &mut reader)
             .await
             .unwrap();
+        assert_eq!(decoded, response);
+    }
+
+    #[tokio::test]
+    async fn activation_codec_keeps_f32_payload_binary_and_roundtrips_token_state() {
+        let protocol = StreamProtocol::new(ACTIVATION_PROTOCOL);
+        let mut request = ActivationRequest::new(
+            "infernet-chat-v1",
+            vec![hop("peer-a", 0, 5)],
+            4,
+            vec![0.125, -2.5, 7.0, f32::MIN_POSITIVE],
+            None,
+        );
+        request.input_token_id = Some(42);
+        request.sequence_position = 9;
+
+        let mut writer = futures::io::Cursor::new(Vec::new());
+        request_response::Codec::write_request(
+            &mut ActivationCodec,
+            &protocol,
+            &mut writer,
+            request.clone(),
+        )
+        .await
+        .unwrap();
+        let bytes = writer.into_inner();
+        assert!(bytes.len() < 1024, "small activation was JSON-expanded");
+        let mut reader = futures::io::Cursor::new(bytes);
+        let decoded =
+            request_response::Codec::read_request(&mut ActivationCodec, &protocol, &mut reader)
+                .await
+                .unwrap();
+        assert_eq!(decoded, request);
+
+        let mut response = ActivationResponse::success(request, "peer-a", Some("x".into()), 3);
+        response.sampled_token_id = Some(99);
+        response.next_sequence_position = 10;
+        let mut writer = futures::io::Cursor::new(Vec::new());
+        request_response::Codec::write_response(
+            &mut ActivationCodec,
+            &protocol,
+            &mut writer,
+            response.clone(),
+        )
+        .await
+        .unwrap();
+        let mut reader = futures::io::Cursor::new(writer.into_inner());
+        let decoded =
+            request_response::Codec::read_response(&mut ActivationCodec, &protocol, &mut reader)
+                .await
+                .unwrap();
         assert_eq!(decoded, response);
     }
 

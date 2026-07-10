@@ -265,19 +265,20 @@ Sources:
 - `expires_at`
 - `signature`
 
-`ActivationRequest` over `/infernet/activation/1`:
+`ActivationRequest` over `/infernet/activation/2`:
 
 - `trace_id`
 - `model_id`
 - `route`
 - `current_hop_index`
 - `sequence_position`
+- `input_token_id` for decode passes
 - `hidden_size`
 - `activation`
 - `prompt` metadata for demo mode
 - `trace`
 
-`ActivationResponse` over `/infernet/activation/1`:
+`ActivationResponse` over `/infernet/activation/2`:
 
 - `trace_id`
 - `peer_id`
@@ -287,6 +288,9 @@ Sources:
 - `timing_ms`
 - `trace`
 - `output_text` for demo mode
+- `sampled_token_id`
+- `generation_complete`
+- `next_sequence_position`
 - `error`
 
 ### Inference Flow
@@ -300,7 +304,7 @@ Sources:
 5. Client tokenizes prompt and creates the first activation request.
 6. Peer 0 executes its local layer range.
 7. Peer 0 forwards the resulting activation request to peer 1 over
-   `/infernet/activation/1`.
+   `/infernet/activation/2`.
 8. Each peer repeats execution and forwarding.
 9. Final peer returns logits or generated token output through the
    request-response chain.
@@ -367,7 +371,7 @@ The current libp2p implementation uses two separate traffic classes:
 - mDNS for LAN discovery;
 - gossipsub for small `NodeAdvertisement` metadata;
 - request-response for directed activation payloads on
-  `/infernet/activation/1`.
+  `/infernet/activation/2`.
 
 Discovery gossip is not in the data path. A client and workers use mDNS and
 gossipsub to learn `peer_id`, libp2p listen addresses, `model_id`, hosted layer
@@ -439,7 +443,7 @@ discovers advertisements, inserts them into a shard registry, and asks the route
 to construct a complete ordered route.
 
 The activation data path has moved off direct TCP. Inference now uses the
-libp2p request-response protocol `/infernet/activation/1`. The request includes
+libp2p request-response protocol `/infernet/activation/2`. The request includes
 `trace_id`, `model_id`, the full route, `current_hop_index`, the demo activation
 payload, and prompt metadata. Each worker validates that the current route hop
 matches its peer id and hosted layer range, executes those layers, appends a
@@ -463,7 +467,7 @@ Current implementation:
 - The route view discovers workers through the existing mDNS/gossipsub path and
   displays peer advertisements, shard ranges, selected model, and coverage.
 - The chat panel invokes Rust commands, runs the selected model route through
-  `/infernet/activation/1`, and listens for `infernet-progress` events.
+  `/infernet/activation/2`, and listens for `infernet-progress` events.
 - Progress events currently include route discovery, hop start, hop completion,
   activation size, timing, checksum, and final output.
 

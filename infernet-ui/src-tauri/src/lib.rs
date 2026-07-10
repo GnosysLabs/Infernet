@@ -12,7 +12,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use execution_plan::{ExecutionParticipantView, plan_rpc_execution, rpc_endpoint_is_usable};
+use execution_plan::{ExecutionParticipantView, plan_worker_execution, worker_is_usable};
 use futures::{StreamExt, channel::oneshot};
 use infernet_model::{
     LayerRange, ModelManifest, OfficialComponentKind, OfficialModelRelease, RuntimeKind,
@@ -20,16 +20,17 @@ use infernet_model::{
 };
 use infernet_node::{
     DiscoveryConfig, INFERNET_LLAMA_RPC_RUNTIME_ABI, LLAMA_RPC_DEFAULT_PORT,
-    LLAMA_RPC_PROTOCOL_VERSION, LlamaRpcServer, LlamaRpcServerConfig, PAYLOAD_KIND_FULL_MODEL,
-    PAYLOAD_KIND_GGUF_SHARD, PAYLOAD_KIND_INFERNET_SHARD, ShardCache, ShardCacheConfig,
-    clear_local_llama_rpc_endpoint, detect_node_capabilities, empty_advertisement,
-    enrich_local_advertisement, fetch_model_shard_over_libp2p_with_progress,
-    find_llama_rpc_server_binary, import_seed_model_from_file_consuming_verified,
-    infer_over_libp2p, is_executable_shard_record, load_or_generate_keypair,
-    local_capability_advertisement, model_serving_telemetry,
-    run_model_distribution_node_with_readiness_and_registry, seed_manifest_for_network,
-    set_local_inference_active, set_local_llama_rpc_endpoint, set_local_rpc_active, sha256_file,
-    spawn_llama_rpc_server, stop_persistent_llama_server, stop_persistent_rpc_tunnels,
+    LLAMA_RPC_PROTOCOL_VERSION, LlamaRpcServer, LlamaRpcServerConfig, LocalNodeActivityEntry,
+    LocalNodeActivityTask, PAYLOAD_KIND_FULL_MODEL, PAYLOAD_KIND_GGUF_SHARD,
+    PAYLOAD_KIND_INFERNET_SHARD, ShardCache, ShardCacheConfig, clear_local_llama_rpc_endpoint,
+    detect_node_capabilities, empty_advertisement, enrich_local_advertisement,
+    fetch_model_shard_over_libp2p_with_progress, find_llama_rpc_server_binary,
+    import_seed_model_from_file_consuming_verified, infer_over_libp2p, is_executable_shard_record,
+    load_or_generate_keypair, local_capability_advertisement, local_node_activity_snapshot,
+    model_serving_telemetry, run_model_distribution_node_with_readiness_and_registry,
+    seed_manifest_for_network, set_local_inference_active, set_local_llama_rpc_endpoint,
+    set_local_rpc_active, sha256_file, spawn_llama_rpc_server, stop_persistent_llama_server,
+    stop_persistent_rpc_tunnels,
 };
 use infernet_protocol::{
     LLAMA_RPC_TUNNEL_PROTOCOL, LlamaRpcEndpoint, ModelShardInfo, NodeAdvertisement,
@@ -94,7 +95,7 @@ struct UiState {
     active_model_acquisitions: Arc<Mutex<BTreeSet<String>>>,
     manual_peers: Mutex<Vec<NodeAdvertisement>>,
     peer_presence: Mutex<PeerPresence>,
-    execution_plan: Mutex<Option<execution_plan::RpcExecutionPlan>>,
+    execution_plan: Mutex<Option<execution_plan::WorkerExecutionPlan>>,
 }
 
 impl Default for UiState {
@@ -122,6 +123,23 @@ struct LocalIdentity {
     topic: String,
     listen: String,
     connect_addresses: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalNodeActivityView {
+    compute_active: bool,
+    compute_ready: bool,
+    compute_backend: String,
+    device_name: String,
+    total_memory_bytes: u64,
+    available_memory_bytes: u64,
+    sharing_active: bool,
+    bytes_served: u64,
+    chunks_served: u64,
+    last_served_unix_ms: Option<u64>,
+    current: Vec<LocalNodeActivityTask>,
+    journal: Vec<LocalNodeActivityEntry>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -170,6 +188,7 @@ struct PeerView {
 struct MachineView {
     peer_id: String,
     short_peer_id: String,
+    addresses: Vec<String>,
     machine_id: Option<String>,
     is_local: bool,
     connection_status: ConnectionStatus,
@@ -327,6 +346,48 @@ async fn get_local_identity(state: State<'_, UiState>) -> Result<LocalIdentity, 
 }
 
 #[tauri::command]
+fn get_local_node_activity() -> LocalNodeActivityView {
+    let capabilities = detect_node_capabilities();
+    let use_accelerator_memory =
+        capabilities.compute_backend != "cpu" && capabilities.total_accelerator_memory_bytes > 0;
+    let (total_memory_bytes, available_memory_bytes) = if use_accelerator_memory {
+        (
+            capabilities.total_accelerator_memory_bytes,
+            capabilities.available_accelerator_memory_bytes,
+        )
+    } else {
+        (
+            capabilities.total_ram_bytes,
+            capabilities.available_ram_bytes,
+        )
+    };
+    let compute_ready = capabilities
+        .llama_rpc
+        .as_ref()
+        .is_some_and(|endpoint| endpoint.ready);
+    let serving = model_serving_telemetry();
+    let sharing_active = serving
+        .last_activity_unix_ms
+        .is_some_and(|last| current_unix_ms_u64().saturating_sub(last) <= 5_000);
+    let activity = local_node_activity_snapshot();
+
+    LocalNodeActivityView {
+        compute_active: capabilities.active_sessions > 0,
+        compute_ready,
+        compute_backend: capabilities.compute_backend,
+        device_name: capabilities.device_name,
+        total_memory_bytes,
+        available_memory_bytes,
+        sharing_active,
+        bytes_served: serving.bytes_served,
+        chunks_served: serving.chunks_served,
+        last_served_unix_ms: serving.last_activity_unix_ms,
+        current: activity.current,
+        journal: activity.journal,
+    }
+}
+
+#[tauri::command]
 fn get_manual_peers(state: State<'_, UiState>) -> Result<Vec<String>, String> {
     manual_peer_addresses(&state)
 }
@@ -476,10 +537,7 @@ async fn run_demo_inference(
         return Err(message);
     }
 
-    let execution_route = registry
-        .route_for_model(&manifest)
-        .map_err(|error| error.to_string())?;
-    let rpc_plan = match leased_rpc_execution_plan(&state, &registry, &execution_route, &manifest) {
+    let worker_plan = match leased_worker_execution_plan(&state, &registry, &manifest) {
         Ok(plan) => plan,
         Err(message) => {
             emit_progress(
@@ -495,20 +553,17 @@ async fn run_demo_inference(
     emit_progress(
         &app,
         ProgressEvent::RouteDiscovered {
-            route: snapshot.route.clone(),
+            route: worker_plan.route.iter().map(route_hop_view).collect(),
         },
     );
     emit_progress(
         &app,
         ProgressEvent::ExecutionPlan {
-            participants: rpc_plan.participants.clone(),
+            participants: worker_plan.participants.clone(),
         },
     );
 
     let (mut config, local_peer_id) = discovery_config_from_state(&state)?;
-    config
-        .set_rpc_worker_peer_ids(rpc_plan.worker_peer_ids)
-        .map_err(|error| error.to_string())?;
     config.keypair = identity::Keypair::generate_ed25519();
     let mut local_advertisement = registry
         .advertisements()
@@ -518,7 +573,7 @@ async fn run_demo_inference(
     local_advertisement.addresses = local_connect_addresses(&local_peer_id);
     config.static_peers.push(local_advertisement);
     merge_static_peer_advertisements(&mut config.static_peers, registry.advertisements());
-    config.set_planned_route(execution_route);
+    config.set_planned_route(worker_plan.route.clone());
     let hidden_size = manifest.hidden_size;
     let result = match infer_over_libp2p(
         config,
@@ -580,22 +635,21 @@ async fn run_demo_inference(
     })
 }
 
-fn leased_rpc_execution_plan(
+fn leased_worker_execution_plan(
     state: &State<'_, UiState>,
     registry: &ShardRegistry,
-    route: &[RouteHop],
     manifest: &ModelManifest,
-) -> Result<execution_plan::RpcExecutionPlan, String> {
+) -> Result<execution_plan::WorkerExecutionPlan, String> {
     let mut lease = state
         .execution_plan
         .lock()
         .map_err(|_| "failed to lock distributed execution plan".to_owned())?;
     if let Some(plan) = lease.as_ref() {
-        if plan.remains_usable(registry, route) {
+        if plan.remains_usable(registry, manifest) {
             return Ok(plan.clone());
         }
     }
-    let plan = plan_rpc_execution(registry, route, manifest)?;
+    let plan = plan_worker_execution(registry, manifest)?;
     *lease = Some(plan.clone());
     Ok(plan)
 }
@@ -1366,6 +1420,25 @@ fn model_records_to_download_for_local_contribution(
         ));
     }
 
+    // Official Infernet workers execute different layer ranges from the same
+    // signed package. Every CUDA/Metal node keeps that verified package on its
+    // own disk; inference never redistributes weights between peers.
+    if model_id == OFFICIAL_CHAT_MODEL_ID
+        && plan.len() == 1
+        && plan[0].info.layers.start == 0
+        && compute_nodes.iter().any(|advertisement| {
+            advertisement.peer_id == local_peer_id
+                && advertisement
+                    .capabilities
+                    .as_ref()
+                    .is_some_and(|capabilities| {
+                        matches!(capabilities.compute_backend.as_str(), "cuda" | "metal")
+                    })
+        })
+    {
+        return Ok(missing_records);
+    }
+
     let config = |minimum_peer_count| CapacityPlanningConfig {
         kv_cache_bytes_per_layer: LAUNCH_KV_CACHE_BYTES_PER_LAYER,
         scratch_bytes_per_peer: RUNTIME_SCRATCH_BYTES_PER_PEER,
@@ -1553,20 +1626,8 @@ fn available_model_views(
 ) -> Vec<ModelView> {
     let installed_ids = installed_model_ids(cache_config);
     let manifest = ModelManifest::infernet_chat_v1();
-    let network_runnable = registry.is_some_and(|registry| {
-        registry.route_for_model(&manifest).is_ok_and(|route| {
-            let Some(coordinator) = route.first().map(|hop| hop.peer_id.as_str()) else {
-                return false;
-            };
-            registry.advertisements().iter().any(|advertisement| {
-                advertisement.peer_id != coordinator
-                    && advertisement
-                        .capabilities
-                        .as_ref()
-                        .is_some_and(rpc_endpoint_is_usable)
-            })
-        })
-    });
+    let network_runnable =
+        registry.is_some_and(|registry| plan_worker_execution(registry, &manifest).is_ok());
     vec![model_view_from_manifest(
         &manifest,
         installed_ids.contains(&manifest.model_id),
@@ -1929,10 +1990,10 @@ fn machine_views_from_presence(
                 let left_local = left.advertisement.peer_id == local_peer_id;
                 let right_local = right.advertisement.peer_id == local_peer_id;
                 let left_rpc = left.status.is_connected()
-                    && rpc_endpoint_is_usable(left_capabilities)
+                    && worker_is_usable(left_capabilities)
                     && left_capabilities.active_sessions < left_capabilities.max_sessions;
                 let right_rpc = right.status.is_connected()
-                    && rpc_endpoint_is_usable(right_capabilities)
+                    && worker_is_usable(right_capabilities)
                     && right_capabilities.active_sessions < right_capabilities.max_sessions;
 
                 right_local
@@ -1985,16 +2046,23 @@ fn machine_views_from_presence(
                         }))
                 })
                 .collect::<BTreeSet<_>>();
+            let addresses = aliases
+                .iter()
+                .flat_map(|alias| alias.advertisement.addresses.iter().cloned())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
             let rpc_ready = aliases.iter().any(|alias| {
                 let capabilities = alias.advertisement.capabilities.as_ref().unwrap();
                 alias.status.is_connected()
-                    && rpc_endpoint_is_usable(capabilities)
+                    && worker_is_usable(capabilities)
                     && capabilities.active_sessions < capabilities.max_sessions
             });
 
             Some(MachineView {
                 peer_id: advertisement.peer_id.clone(),
                 short_peer_id: short_peer_id(&advertisement.peer_id),
+                addresses,
                 machine_id: capabilities.machine_id.clone(),
                 is_local,
                 connection_status: if is_local {
@@ -2441,14 +2509,6 @@ async fn ensure_model_distribution_service(
     state: &State<'_, UiState>,
     cache_config: ShardCacheConfig,
 ) -> Result<(), String> {
-    if let Err(error) = ensure_llama_rpc_service(state, &cache_config).await {
-        // Model discovery and downloads remain useful when a development build
-        // does not contain the optional sidecar. Crucially, clearing the
-        // endpoint prevents this node from claiming compute it cannot serve.
-        clear_local_llama_rpc_endpoint();
-        eprintln!("llama.cpp RPC sidecar is unavailable: {error}");
-    }
-
     let keypair = state
         .keypair
         .lock()
@@ -3283,7 +3343,6 @@ pub fn run() {
                 .lock()
                 .expect("UI identity lock poisoned during startup") = keypair;
             let cache_config = cache_config_for_app(app.handle());
-            monitor_llama_rpc_service(Arc::clone(&app_handle.state::<UiState>().llama_rpc_service));
             tauri::async_runtime::spawn(async move {
                 let state = app_handle.state::<UiState>();
                 if let Err(error) = ensure_model_distribution_service(&state, cache_config).await {
@@ -3307,6 +3366,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_local_identity,
+            get_local_node_activity,
             get_manual_peers,
             add_manual_peer,
             clear_manual_peers,
@@ -3855,7 +3915,7 @@ mod tests {
     }
 
     #[test]
-    fn full_package_auto_host_is_the_3090_not_the_4060_or_small_mac() {
+    fn every_accelerated_worker_downloads_the_verified_full_package() {
         const GIB: u64 = 1024 * 1024 * 1024;
         let root = std::env::temp_dir().join(format!("infernet-ui-host-plan-{}", unix_ms()));
         let cache = ShardCache::new(ShardCacheConfig::new(root.clone())).unwrap();
@@ -3952,8 +4012,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(selected_3090.len(), 1);
-        assert!(selected_4060.is_empty());
-        assert!(selected_mac.is_empty());
+        assert_eq!(selected_4060.len(), 1);
+        assert_eq!(selected_mac.len(), 1);
 
         let _ = std::fs::remove_dir_all(root);
     }

@@ -1,18 +1,25 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import createGlobe from "cobe";
+import type { Marker } from "cobe";
 import {
   Activity,
   Box,
   CheckCircle2,
   ChevronDown,
+  Cpu,
   Download,
+  Globe,
   HardDrive,
   Laptop2,
+  Layers3,
+  MemoryStick,
   MessageSquare,
-  Network,
   PanelRightClose,
   RefreshCw,
   Send,
+  Server,
   Settings,
+  Zap,
 } from "lucide-react";
 import {
   addManualPeer,
@@ -20,6 +27,7 @@ import {
   emptySnapshot,
   getGridSnapshot,
   getLocalIdentity,
+  getLocalNodeActivity,
   getManualPeers,
   installOfficialModel,
   listenForProgress,
@@ -27,18 +35,16 @@ import {
   runDistributedInference,
 } from "./api";
 import type {
-  ExecutionParticipantView,
   GridSnapshot,
-  HopProgress,
   LocalIdentity,
+  LocalNodeActivitySnapshot,
   MachineView,
   ModelImportProgress,
   ModelView,
   ProgressEvent,
-  RouteHopView,
 } from "./types";
 
-type Page = "chat" | "models" | "downloads" | "settings";
+type Page = "chat" | "network" | "models" | "downloads" | "settings";
 type Message = { id: string; role: "user" | "assistant"; text: string };
 type TransferStatus = "active" | "complete" | "error";
 type TransferActivity = ModelImportProgress & {
@@ -47,27 +53,44 @@ type TransferActivity = ModelImportProgress & {
   startedAt: number;
   updatedAt: number;
 };
+type NodeJournalEntry = {
+  id: string;
+  kind: "completion" | "contribution" | "model" | "sharing" | "error";
+  title: string;
+  detail?: string;
+  occurredAt: number;
+};
 
 const DEFAULT_PROMPT = "";
 const INFERNET_CHAT_MODEL_ID = "infernet-chat-v1";
+const EMPTY_LOCAL_NODE_ACTIVITY: LocalNodeActivitySnapshot = {
+  computeActive: false,
+  computeReady: false,
+  computeBackend: "cpu",
+  deviceName: "This computer",
+  totalMemoryBytes: 0,
+  availableMemoryBytes: 0,
+  sharingActive: false,
+  bytesServed: 0,
+  chunksServed: 0,
+  lastServedUnixMs: null,
+  current: [],
+  journal: [],
+};
 
 export default function App() {
   const [page, setPage] = useState<Page>("chat");
-  const [developerMode, setDeveloperMode] = useState(false);
   const [activityOpen, setActivityOpen] = useState(false);
   const [identity, setIdentity] = useState<LocalIdentity | null>(null);
+  const [localNodeActivity, setLocalNodeActivity] = useState<LocalNodeActivitySnapshot>(
+    EMPTY_LOCAL_NODE_ACTIVITY,
+  );
+  const [localJournal, setLocalJournal] = useState<NodeJournalEntry[]>([]);
   const [snapshot, setSnapshot] = useState<GridSnapshot>(emptySnapshot);
   const [selectedModel, setSelectedModel] = useState("");
   const [prompt, setPrompt] = useState(DEFAULT_PROMPT);
   const [messages, setMessages] = useState<Message[]>([]);
-  const [status, setStatus] = useState("Starting");
   const [isRunning, setIsRunning] = useState(false);
-  const [runStartedAt, setRunStartedAt] = useState<number | null>(null);
-  const [lastRunDurationMs, setLastRunDurationMs] = useState<number | null>(null);
-  const [hops, setHops] = useState<HopProgress[]>([]);
-  const [route, setRoute] = useState<RouteHopView[]>([]);
-  const [executionPlan, setExecutionPlan] = useState<ExecutionParticipantView[]>([]);
-  const [executionConfirmed, setExecutionConfirmed] = useState(false);
   const [lastError, setLastError] = useState<string | null>(null);
   const [transferActivities, setTransferActivities] = useState<TransferActivity[]>([]);
   const [installingModelId, setInstallingModelId] = useState<string | null>(null);
@@ -80,66 +103,35 @@ export default function App() {
     () => officialModels.find((model) => model.modelId === selectedModel),
     [officialModels, selectedModel],
   );
-  const activeRoute = selectedModelView ? (route.length > 0 ? route : snapshot.route) : [];
   const activeTransfers = transferActivities.filter((activity) => activity.status === "active").length;
 
+  const appendJournalEntry = useCallback((entry: NodeJournalEntry) => {
+    setLocalJournal((current) => {
+      if (current.some((item) => item.id === entry.id)) return current;
+      return [...current, entry]
+        .sort((left, right) => left.occurredAt - right.occurredAt)
+        .slice(-50);
+    });
+  }, []);
+
   const applyProgressEvent = useCallback((event: ProgressEvent) => {
-    if (event.type === "routeDiscovered") {
-      setRoute(event.route);
-      setHops(
-        event.route.map((hop) => ({
-          key: hopKey(hop.peerId, hop.layerStart, hop.layerEnd),
-          peerId: hop.peerId,
-          shortPeerId: hop.shortPeerId,
-          layerStart: hop.layerStart,
-          layerEnd: hop.layerEnd,
-          activationSizeBytes: 0,
-          status: "pending",
-        })),
-      );
-      setStatus("Finding available compute");
+    if (event.type === "routeDiscovered" || event.type === "executionPlan") {
       setLastError(null);
-      return;
-    }
-
-    if (event.type === "executionPlan") {
-      setExecutionPlan(event.participants);
-      setExecutionConfirmed(false);
-      setStatus("Starting distributed model");
-      setLastError(null);
-      return;
-    }
-
-    if (event.type === "hopStarted") {
-      setHops((current) => upsertHop(current, event, "running"));
-      setStatus("Running model");
-      return;
-    }
-
-    if (event.type === "hopCompleted") {
-      setHops((current) => upsertHop(current, event, "complete"));
-      setStatus("Finishing response");
       return;
     }
 
     if (event.type === "finalOutput") {
-      setExecutionConfirmed(true);
-      setStatus("Ready");
       setIsRunning(false);
       return;
     }
 
     if (event.type === "error") {
-      setExecutionConfirmed(false);
-      setExecutionPlan([]);
       setLastError(event.message);
-      setStatus("Needs attention");
       setIsRunning(false);
     }
   }, []);
 
   const refreshSnapshot = useCallback(async (modelId?: string) => {
-    setStatus("Connecting");
     try {
       const nextSnapshot = await getGridSnapshot(4000, modelId);
       const nextOfficialModels = nextSnapshot.availableModels.filter(isOfficialInfernetModel);
@@ -149,21 +141,11 @@ export default function App() {
         : nextOfficialModels.find((model) => model.modelId === nextSnapshot.selectedModel)?.modelId
           || nextOfficialModels[0]?.modelId
           || "";
-      const nextModel = nextOfficialModels.find((model) => model.modelId === nextSelectedModel);
       setSnapshot(nextSnapshot);
-      setRoute(nextSelectedModel ? nextSnapshot.route : []);
       setLastError(nextSelectedModel ? nextSnapshot.missingRanges ?? null : null);
       setSelectedModel(nextSelectedModel);
-      setStatus(
-        nextOfficialModels.length === 0
-          ? "No models"
-          : nextModel?.runnable
-            ? "Ready"
-            : "Connected",
-      );
     } catch (error) {
       setLastError(String(error));
-      setStatus("Offline");
     }
   }, []);
 
@@ -172,11 +154,88 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    let disposed = false;
+    let initialized = false;
+    let previousComputeActive = false;
+    let previousSharingActive = false;
+    let previousBytesServed = 0;
+    let untrackedComputeStartedAt: number | null = null;
+    let sharingStartedAt: number | null = null;
+    let sharingStartedBytes = 0;
+
+    const refreshLocalActivity = async () => {
+      try {
+        const next = await getLocalNodeActivity();
+        if (disposed) return;
+
+        const now = Date.now();
+        const hasTrackedTask = next.current.length > 0;
+        if (hasTrackedTask) untrackedComputeStartedAt = null;
+        if (!initialized) {
+          initialized = true;
+          if (next.computeActive && !hasTrackedTask) untrackedComputeStartedAt = now;
+          if (next.sharingActive) {
+            sharingStartedAt = next.lastServedUnixMs ?? now;
+            sharingStartedBytes = next.bytesServed;
+          }
+        } else {
+          if (!previousComputeActive && next.computeActive && !hasTrackedTask) {
+            untrackedComputeStartedAt = now;
+          }
+          if (previousComputeActive && !next.computeActive && untrackedComputeStartedAt !== null) {
+            appendJournalEntry({
+              id: `compute-contribution-${untrackedComputeStartedAt}`,
+              kind: "contribution",
+              title: "You contributed compute",
+              detail: "Your node helped the network process a chat request.",
+              occurredAt: now,
+            });
+            untrackedComputeStartedAt = null;
+          }
+
+          if (!previousSharingActive && next.sharingActive) {
+            sharingStartedAt = next.lastServedUnixMs ?? now;
+            sharingStartedBytes = previousBytesServed;
+          }
+          if (previousSharingActive && !next.sharingActive && sharingStartedAt !== null) {
+            const sharedBytes = Math.max(0, next.bytesServed - sharingStartedBytes);
+            if (sharedBytes > 0) {
+              appendJournalEntry({
+                id: `model-sharing-${sharingStartedAt}`,
+                kind: "sharing",
+                title: "You shared Infernet Chat",
+                detail: `${formatBytes(sharedBytes)} sent to another node.`,
+                occurredAt: next.lastServedUnixMs ?? now,
+              });
+            }
+            sharingStartedAt = null;
+          }
+        }
+
+        previousComputeActive = next.computeActive;
+        previousSharingActive = next.sharingActive;
+        previousBytesServed = next.bytesServed;
+        setLocalNodeActivity(next);
+      } catch {
+        // Browser previews do not have the Tauri command; the network snapshot
+        // remains available as a quiet fallback for the HUD.
+      }
+    };
+
+    void refreshLocalActivity();
+    const interval = window.setInterval(refreshLocalActivity, 1000);
+    return () => {
+      disposed = true;
+      window.clearInterval(interval);
+    };
+  }, [appendJournalEntry]);
+
+  useEffect(() => {
     refreshSnapshot(selectedModel);
   }, [refreshSnapshot, selectedModel]);
 
   useEffect(() => {
-    if (!activityOpen && page !== "downloads") return;
+    if (!activityOpen && page !== "downloads" && page !== "network") return;
     let disposed = false;
     let inFlight = false;
     const refreshActivity = async () => {
@@ -186,7 +245,6 @@ export default function App() {
         const nextSnapshot = await getGridSnapshot(2500, selectedModel);
         if (!disposed) {
           setSnapshot(nextSnapshot);
-          if (!isRunning) setRoute(nextSnapshot.route);
         }
       } catch {
         // The primary refresh path owns user-visible connection errors.
@@ -194,12 +252,13 @@ export default function App() {
         inFlight = false;
       }
     };
+    void refreshActivity();
     const interval = window.setInterval(refreshActivity, 6000);
     return () => {
       disposed = true;
       window.clearInterval(interval);
     };
-  }, [activityOpen, isRunning, page, selectedModel]);
+  }, [activityOpen, page, selectedModel]);
 
   useEffect(() => {
     let disposed = false;
@@ -226,6 +285,24 @@ export default function App() {
         return;
       }
       setTransferActivities((current) => upsertTransferActivity(current, event));
+      const normalizedStage = event.stage.trim().toLowerCase();
+      if (normalizedStage === "ready") {
+        appendJournalEntry({
+          id: `model-ready-${event.modelId}`,
+          kind: "model",
+          title: "You prepared Infernet Chat",
+          detail: "The verified model is ready to use and share.",
+          occurredAt: Date.now(),
+        });
+      } else if (normalizedStage.includes("failed") || normalizedStage.includes("error")) {
+        appendJournalEntry({
+          id: `model-error-${event.modelId}-${Date.now()}`,
+          kind: "error",
+          title: "A model task couldn’t finish",
+          detail: friendlyActivityError(event.detail),
+          occurredAt: Date.now(),
+        });
+      }
     }).then((dispose) => {
       if (disposed) {
         dispose();
@@ -238,17 +315,12 @@ export default function App() {
       disposed = true;
       unlisten?.();
     };
-  }, []);
+  }, [appendJournalEntry]);
 
   function handleModelChange(modelId: string) {
     setSelectedModel(modelId);
     setPage("chat");
-    setRoute([]);
-    setHops([]);
-    setExecutionPlan([]);
-    setExecutionConfirmed(false);
     setLastError(null);
-    setStatus("Connecting");
   }
 
   async function handleInstallModel(modelId: string) {
@@ -256,12 +328,9 @@ export default function App() {
     setInstallingModelId(modelId);
     setActivityOpen(true);
     setLastError(null);
-    setStatus("Preparing model storage");
     try {
       const nextSnapshot = await installOfficialModel(modelId);
       setSnapshot(nextSnapshot);
-      setRoute(nextSnapshot.route);
-      setStatus("Ready");
     } catch (error) {
       const message = String(error);
       setTransferActivities((current) => upsertTransferActivity(current, {
@@ -272,7 +341,6 @@ export default function App() {
         totalBytes: null,
       }));
       setLastError(message);
-      setStatus("Needs attention");
     } finally {
       setInstallingModelId(null);
     }
@@ -286,12 +354,10 @@ export default function App() {
 
     if (!selectedModelView) {
       setLastError("Install Infernet Chat before sending a message.");
-      setStatus("No models");
       return;
     }
     if (!selectedModelView.runnable) {
       setLastError(selectedModelView.status);
-      setStatus("Model not ready");
       return;
     }
     setMessages((current) => [
@@ -300,13 +366,7 @@ export default function App() {
     ]);
     setPrompt("");
     setIsRunning(true);
-    const startedAt = Date.now();
-    setRunStartedAt(startedAt);
     setLastError(null);
-    setStatus("Finding available compute");
-    setHops([]);
-    setExecutionPlan([]);
-    setExecutionConfirmed(false);
 
     try {
       const output = (await runDistributedInference(userPrompt, selectedModel)).output;
@@ -315,36 +375,31 @@ export default function App() {
         ...current,
         { id: `assistant-${Date.now()}`, role: "assistant", text: output },
       ]);
-      setStatus("Ready");
     } catch (error) {
       const message = String(error);
-      setExecutionPlan([]);
-      setExecutionConfirmed(false);
       setLastError(message);
-      setStatus("Needs attention");
     } finally {
-      setLastRunDurationMs(Date.now() - startedAt);
-      setRunStartedAt(null);
       setIsRunning(false);
     }
   }
 
   return (
     <div className={activityOpen ? "app-shell activity-open" : "app-shell"}>
-      <Sidebar
-        page={page}
-        setPage={setPage}
-        developerMode={developerMode}
-        setDeveloperMode={setDeveloperMode}
-      />
+      <Sidebar page={page} setPage={setPage} />
 
       <main className="app-main">
         <AppHeader
           page={page}
           model={selectedModelView}
+          networkNodeCount={snapshot.machines.filter((machine) => machine.connectionStatus !== "unreachable").length}
+          networkReadyCount={snapshot.machines.filter((machine) => machine.rpcReady && machine.connectionStatus !== "unreachable").length}
           onRefresh={() => refreshSnapshot(selectedModel)}
           activityOpen={activityOpen}
-          hasActiveWork={isRunning || activeTransfers > 0}
+          hasActiveWork={
+            localNodeActivity.computeActive
+            || localNodeActivity.sharingActive
+            || activeTransfers > 0
+          }
           onToggleActivity={() => setActivityOpen((open) => !open)}
         />
 
@@ -375,15 +430,16 @@ export default function App() {
           <DownloadsPage
             snapshot={snapshot}
             transferActivities={transferActivities}
-            developerMode={developerMode}
           />
+        ) : null}
+
+        {page === "network" ? (
+          <NetworkPage snapshot={snapshot} />
         ) : null}
 
         {page === "settings" ? (
           <SettingsPage
             identity={identity}
-            developerMode={developerMode}
-            setDeveloperMode={setDeveloperMode}
             onNetworkChanged={() => refreshSnapshot(selectedModel)}
           />
         ) : null}
@@ -392,19 +448,9 @@ export default function App() {
       {activityOpen ? (
         <ActivitySidebar
           snapshot={snapshot}
-          model={selectedModelView}
-          route={activeRoute}
-          executionPlan={executionPlan}
-          executionConfirmed={executionConfirmed}
-          hops={hops}
           transferActivities={transferActivities}
-          status={status}
-          isRunning={isRunning}
-          runStartedAt={runStartedAt}
-          lastRunDurationMs={lastRunDurationMs}
-          lastError={lastError}
-          developerMode={developerMode}
-          identity={identity}
+          localNodeActivity={localNodeActivity}
+          localJournal={localJournal}
           onClose={() => setActivityOpen(false)}
         />
       ) : null}
@@ -415,41 +461,39 @@ export default function App() {
 function Sidebar({
   page,
   setPage,
-  developerMode,
-  setDeveloperMode,
 }: {
   page: Page;
   setPage: (page: Page) => void;
-  developerMode: boolean;
-  setDeveloperMode: (enabled: boolean) => void;
 }) {
   return (
     <aside className="sidebar">
       <div className="brand-block">
-        <div className="brand-mark">
-          <Network size={24} />
-        </div>
-        <div>
-          <div className="brand-name">Infernet</div>
-          <div className="brand-version">v0.2.0</div>
-        </div>
+        <svg
+          className="brand-logo"
+          viewBox="230 250 564 524"
+          role="img"
+          aria-label="Infernet"
+        >
+          <circle cx="512" cy="512" r="84" fill="currentColor" />
+          <circle cx="312" cy="332" r="62" fill="currentColor" />
+          <circle cx="712" cy="332" r="62" fill="currentColor" />
+          <circle cx="312" cy="692" r="62" fill="currentColor" />
+          <circle cx="712" cy="692" r="62" fill="currentColor" />
+          <path d="M366 360L458 478" stroke="currentColor" strokeWidth="44" strokeLinecap="round" />
+          <path d="M658 360L566 478" stroke="currentColor" strokeWidth="44" strokeLinecap="round" />
+          <path d="M366 664L458 546" stroke="currentColor" strokeWidth="44" strokeLinecap="round" />
+          <path d="M658 664L566 546" stroke="currentColor" strokeWidth="44" strokeLinecap="round" />
+          <path d="M374 332H650" stroke="currentColor" strokeWidth="38" strokeLinecap="round" />
+          <path d="M374 692H650" stroke="currentColor" strokeWidth="38" strokeLinecap="round" />
+        </svg>
       </div>
 
       <nav className="nav-list" aria-label="Primary">
         <NavButton icon={<MessageSquare size={18} />} label="Chat" active={page === "chat"} onClick={() => setPage("chat")} />
-        <NavButton icon={<Box size={18} />} label="Models" active={page === "models"} onClick={() => setPage("models")} />
-        <NavButton icon={<Download size={18} />} label="Downloads" active={page === "downloads"} onClick={() => setPage("downloads")} />
+        <NavButton icon={<Globe size={18} />} label="Network" active={page === "network"} onClick={() => setPage("network")} />
         <NavButton icon={<Settings size={18} />} label="Settings" active={page === "settings"} onClick={() => setPage("settings")} />
       </nav>
 
-      <label className="developer-toggle">
-        <span>Developer Mode</span>
-        <input
-          type="checkbox"
-          checked={developerMode}
-          onChange={(event) => setDeveloperMode(event.target.checked)}
-        />
-      </label>
     </aside>
   );
 }
@@ -476,6 +520,8 @@ function NavButton({
 function AppHeader({
   page,
   model,
+  networkNodeCount,
+  networkReadyCount,
   onRefresh,
   activityOpen,
   hasActiveWork,
@@ -483,6 +529,8 @@ function AppHeader({
 }: {
   page: Page;
   model?: ModelView;
+  networkNodeCount: number;
+  networkReadyCount: number;
   onRefresh: () => void;
   activityOpen: boolean;
   hasActiveWork: boolean;
@@ -493,13 +541,20 @@ function AppHeader({
       <div>
         <h1>{pageTitle(page)}</h1>
         <div className="header-meta">
-          <span>{model ? curatedModelName(model) : "No model selected"}</span>
+          <span>
+            {page === "network"
+              ? networkNodeCount > 0
+                ? `${networkNodeCount} node${networkNodeCount === 1 ? "" : "s"} visible · ${networkReadyCount} compute-ready`
+                : "Discovering network compute"
+              : model ? curatedModelName(model) : "No model selected"}
+          </span>
         </div>
       </div>
 
       <div className="header-actions">
         <button
           className={activityOpen ? "activity-toggle active" : "activity-toggle"}
+          aria-label="Activity"
           aria-expanded={activityOpen}
           aria-controls="activity-sidebar"
           onClick={onToggleActivity}
@@ -639,63 +694,110 @@ function ThinkingIndicator() {
 
 function ActivitySidebar({
   snapshot,
-  model,
-  route,
-  executionPlan,
-  executionConfirmed,
-  hops,
   transferActivities,
-  status,
-  isRunning,
-  runStartedAt,
-  lastRunDurationMs,
-  lastError,
-  developerMode,
-  identity,
+  localNodeActivity,
+  localJournal,
   onClose,
 }: {
   snapshot: GridSnapshot;
-  model?: ModelView;
-  route: RouteHopView[];
-  executionPlan: ExecutionParticipantView[];
-  executionConfirmed: boolean;
-  hops: HopProgress[];
   transferActivities: TransferActivity[];
-  status: string;
-  isRunning: boolean;
-  runStartedAt: number | null;
-  lastRunDurationMs: number | null;
-  lastError: string | null;
-  developerMode: boolean;
-  identity: LocalIdentity | null;
+  localNodeActivity: LocalNodeActivitySnapshot;
+  localJournal: NodeJournalEntry[];
   onClose: () => void;
 }) {
-  const elapsedMs = useElapsedTime(runStartedAt);
-  const peerIds = [...new Set(route.map((hop) => hop.peerId))];
-  const ranLocally = peerIds.length > 0 && peerIds.every((peerId) => peerId === snapshot.localPeerId);
-  const computeMs = hops.reduce((total, hop) => total + (hop.timingMs ?? 0), 0);
-  const activeTransfers = transferActivities.filter((activity) => activity.status === "active");
-  const recentTransfer = transferActivities.find((activity) => activity.status !== "active");
-  const modelHosts = snapshot.machines.filter(
-    (machine) => machine.hostedComponentCount > 0 && machine.connectionStatus !== "unreachable",
-  );
-  const location = executionPlan.length > 0
-    ? executionConfirmed
-      ? `${executionPlan.length} computers completed the last response`
-      : `Planned across ${executionPlan.length} computers`
-    : peerIds.length === 0
-    ? isRunning ? "Choosing a computer" : "Not used yet"
-    : ranLocally
-      ? "This computer"
-      : `${peerIds.length} network computer${peerIds.length === 1 ? "" : "s"}`;
-  const currentStatus = lastError ? "Needs attention" : status;
+  const localMachine = snapshot.machines.find((machine) => machine.isLocal);
+  const activeTransfer = transferActivities.find((activity) => activity.status === "active");
+  const currentTask = localNodeActivity.current[0];
+  const computeActive = localNodeActivity.computeActive || Boolean(localMachine?.activeSessions);
+  const computeReady = localNodeActivity.computeReady || Boolean(localMachine?.rpcReady);
+  const sharingActive = localNodeActivity.sharingActive || snapshot.distribution.currentUploads > 0;
+  const modelStored = snapshot.distribution.installedModels.includes(INFERNET_CHAT_MODEL_ID);
+  const deviceName = localNodeActivity.deviceName !== EMPTY_LOCAL_NODE_ACTIVITY.deviceName
+    ? localNodeActivity.deviceName
+    : localMachine?.deviceName ?? "This computer";
+  const computeBackend = localNodeActivity.computeBackend !== "cpu"
+    ? localNodeActivity.computeBackend
+    : localMachine?.computeBackend ?? localNodeActivity.computeBackend;
+  const availableMemoryBytes = localNodeActivity.totalMemoryBytes > 0
+    ? localNodeActivity.availableMemoryBytes
+    : localMachine?.availableMemoryBytes ?? 0;
+  const totalMemoryBytes = localNodeActivity.totalMemoryBytes > 0
+    ? localNodeActivity.totalMemoryBytes
+    : localMachine?.totalMemoryBytes ?? 0;
+  const isStarting = !localMachine && !snapshot.localPeerId;
+  const isWorking = Boolean(activeTransfer || currentTask || computeActive || sharingActive);
+  const currentWork = activeTransfer
+    ? {
+        title: humanTransferStage(activeTransfer.stage),
+        detail: transferStageDescription(activeTransfer.stage, activeTransfer.status),
+      }
+    : currentTask?.kind === "chatCompletion"
+      ? {
+          title: "Fulfilling a chat completion",
+          detail: "Your node is coordinating this response.",
+        }
+      : currentTask?.kind === "computeContribution" || computeActive
+        ? {
+            title: "Contributing compute",
+            detail: "Your node is processing work for the network.",
+          }
+        : sharingActive
+          ? {
+              title: "Sharing Infernet Chat",
+              detail: "Sending verified model data to another node.",
+            }
+          : isStarting
+            ? {
+                title: "Starting your node",
+                detail: "Bringing local services online.",
+              }
+            : computeReady
+              ? {
+                  title: "Ready to help",
+                  detail: "Standing by for work from the network.",
+                }
+              : {
+                  title: "Online",
+                  detail: "Connected to Infernet. Compute is not available right now.",
+                };
+  const runtimeJournal: NodeJournalEntry[] = localNodeActivity.journal.map((entry) => {
+    const duration = formatDuration(entry.completedAtUnixMs - entry.startedAtUnixMs);
+    if (entry.outcome === "error") {
+      return {
+        id: entry.id,
+        kind: "error",
+        title: entry.kind === "chatCompletion"
+          ? "A chat completion couldn’t finish"
+          : "A compute task couldn’t finish",
+        detail: duration === "—" ? undefined : `Your node worked for ${duration}.`,
+        occurredAt: entry.completedAtUnixMs,
+      };
+    }
+    return {
+      id: entry.id,
+      kind: entry.kind === "chatCompletion" ? "completion" : "contribution",
+      title: entry.kind === "chatCompletion"
+        ? "You fulfilled a chat completion"
+        : "You contributed compute",
+      detail: duration === "—"
+        ? undefined
+        : entry.kind === "chatCompletion"
+          ? `Completed in ${duration}.`
+          : `Your part finished in ${duration}.`,
+      occurredAt: entry.completedAtUnixMs,
+    };
+  });
+  const journal = [...runtimeJournal, ...localJournal]
+    .filter((entry, index, entries) => entries.findIndex((item) => item.id === entry.id) === index)
+    .sort((left, right) => left.occurredAt - right.occurredAt)
+    .slice(-50);
 
   return (
-    <aside className="activity-sidebar" id="activity-sidebar" aria-label="Activity">
+    <aside className="activity-sidebar" id="activity-sidebar" aria-label="Your node activity">
       <div className="activity-sidebar-header">
         <div>
-          <span>Activity</span>
-          <h2>What Infernet is doing</h2>
+          <span>Your node</span>
+          <h2>{deviceName}</h2>
         </div>
         <button className="icon-button" aria-label="Close activity" onClick={onClose}>
           <PanelRightClose size={18} />
@@ -703,135 +805,85 @@ function ActivitySidebar({
       </div>
 
       <div className="activity-sidebar-scroll">
-        <section className="activity-primary" aria-live="polite">
-          <div className="activity-status-line">
-            <span className={isRunning ? "activity-pulse active" : "activity-pulse"} />
+        <section className={isWorking ? "node-hud working" : "node-hud"} aria-live="polite">
+          <div className="node-current-work">
+            <span className={isWorking ? "activity-pulse active" : "activity-pulse"} />
             <div>
-              <strong>{currentStatus}</strong>
-              <span>{isRunning ? "Working on your response" : "Ready when you are"}</span>
+              <span className="node-now-label">Now</span>
+              <strong>{currentWork.title}</strong>
+              <p>{currentWork.detail}</p>
             </div>
           </div>
 
-          <dl className="activity-data-list">
-            <ActivityDataRow label="Model" value={model ? curatedModelName(model) : "None selected"} />
-            <ActivityDataRow label={isRunning ? "Running on" : "Available on"} value={location} />
+          {activeTransfer ? <MachineTransferProgress activity={activeTransfer} /> : null}
+
+          <dl className="node-facts">
             <ActivityDataRow
-              label={isRunning ? "Elapsed" : "Last response"}
-              value={formatDuration(isRunning ? elapsedMs : lastRunDurationMs)}
-            />
-            <ActivityDataRow label="Compute time" value={computeMs > 0 ? formatDuration(computeMs) : "—"} />
-            <ActivityDataRow
-              label="Other computers online"
-              value={String(snapshot.networkPeerCount)}
-            />
-            <ActivityDataRow
-              label="Distributed workers ready"
-              value={String(snapshot.machines.filter((machine) => machine.rpcReady).length)}
+              label="Compute"
+              value={computeActive
+                ? "In use"
+                : computeReady
+                  ? `${machineBackendLabel(computeBackend)} ready`
+                  : "Unavailable"}
             />
             <ActivityDataRow
-              label="Model availability"
-              value={modelHosts.length > 0
-                ? `Hosted by ${modelHosts.length} computer${modelHosts.length === 1 ? "" : "s"}`
-                : activeTransfers.length > 0
-                  ? "Downloading on this computer"
-                  : "Not hosted on the network"}
+              label="Memory"
+              value={totalMemoryBytes > 0
+                ? `${formatBytes(availableMemoryBytes)} free of ${formatBytes(totalMemoryBytes)}`
+                : "Checking"}
             />
+            <ActivityDataRow
+              label="Model"
+              value={activeTransfer
+                ? "Preparing locally"
+                : modelStored
+                  ? "Stored and shareable"
+                  : "Compute only"}
+            />
+            <ActivityDataRow label="Network" value={isStarting ? "Starting" : "Connected"} />
           </dl>
         </section>
 
-        {lastError ? (
-          <section className="activity-alert" role="alert">
-            <strong>What happened</strong>
-            <span>{friendlyActivityError(lastError)}</span>
-          </section>
-        ) : null}
-
-        <section className="activity-sidebar-section">
-          <div className="sidebar-section-heading">
-            <strong>Available compute</strong>
-            <span>{snapshot.machines.length} machine{snapshot.machines.length === 1 ? "" : "s"}</span>
+        <section className="node-journal" aria-labelledby="node-journal-title">
+          <div className="node-journal-heading">
+            <strong id="node-journal-title">Journal</strong>
+            <span>This session</span>
           </div>
-          {snapshot.machines.length === 0 ? (
-            <div className="activity-quiet inline">
-              <Laptop2 size={17} />
-              <span>Waiting for machine capacity reports.</span>
+          {journal.length === 0 ? (
+            <div className="node-journal-empty">
+              <Activity size={17} />
+              <span>Your node’s completed work will appear here.</span>
             </div>
           ) : (
-            <div className="machine-list">
-              {snapshot.machines.map((machine) => (
-                <MachineStatusCard
-                  machine={machine}
-                  route={route}
-                  executionPlan={executionPlan}
-                  executionConfirmed={executionConfirmed}
-                  isRunning={isRunning}
-                  localTransfer={machine.isLocal ? activeTransfers[0] : undefined}
-                  developerMode={developerMode}
-                  key={machine.machineId ?? machine.peerId}
-                />
+            <ol className="node-journal-list" aria-live="polite" aria-relevant="additions">
+              {journal.map((entry) => (
+                <li className={`node-journal-entry ${entry.kind}`} key={entry.id}>
+                  <span className="node-journal-marker" aria-hidden="true">
+                    <NodeJournalIcon kind={entry.kind} />
+                  </span>
+                  <div>
+                    <strong>{entry.title}</strong>
+                    {entry.detail ? <p>{entry.detail}</p> : null}
+                    <time dateTime={new Date(entry.occurredAt).toISOString()}>
+                      {formatJournalTime(entry.occurredAt)}
+                    </time>
+                  </div>
+                </li>
               ))}
-            </div>
+            </ol>
           )}
         </section>
-
-        {activeTransfers.length > 0 ? (
-          <section className="activity-sidebar-section">
-            <div className="sidebar-section-heading">
-              <strong>Preparing models</strong>
-              <span>{activeTransfers.length} active</span>
-            </div>
-            <div className="transfer-list">
-              {activeTransfers.slice(0, 3).map((activity) => (
-                <TransferActivityRow
-                  activity={activity}
-                  modelName={modelDisplayName(snapshot, activity.modelId)}
-                  developerMode={developerMode}
-                  key={activity.id}
-                />
-              ))}
-            </div>
-          </section>
-        ) : recentTransfer ? (
-          <section className="activity-sidebar-section">
-            <div className="sidebar-section-heading">
-              <strong>Latest model activity</strong>
-              <span>{formatRelativeTime(recentTransfer.updatedAt)}</span>
-            </div>
-            <TransferActivityRow
-              activity={recentTransfer}
-              modelName={modelDisplayName(snapshot, recentTransfer.modelId)}
-              developerMode={developerMode}
-            />
-          </section>
-        ) : (
-          <div className="activity-quiet">
-            <Laptop2 size={18} />
-            <span>Model preparation and response activity will appear here.</span>
-          </div>
-        )}
-
-        {developerMode ? (
-          <details className="technical-details">
-            <summary>Technical details</summary>
-            <div className="technical-detail-list">
-              <code>Local peer: {identity?.peerId ?? snapshot.localPeerId ?? "starting"}</code>
-              {lastError ? <code>Last error: {lastError}</code> : null}
-              {route.length === 0 ? <span>No execution route selected.</span> : route.map((hop) => {
-                const progress = hops.find((item) => item.key === hopKey(hop.peerId, hop.layerStart, hop.layerEnd));
-                return (
-                  <code key={`${hop.peerId}-${hop.layerStart}-${hop.layerEnd}`}>
-                    {hop.shortPeerId} · layers {hop.layerStart}:{hop.layerEnd}
-                    {progress?.activationSizeBytes ? ` · ${formatBytes(progress.activationSizeBytes)}` : ""}
-                    {progress?.timingMs ? ` · ${progress.timingMs} ms` : ""}
-                  </code>
-                );
-              })}
-            </div>
-          </details>
-        ) : null}
       </div>
     </aside>
   );
+}
+
+function NodeJournalIcon({ kind }: { kind: NodeJournalEntry["kind"] }) {
+  if (kind === "completion") return <MessageSquare size={13} />;
+  if (kind === "model") return <Download size={13} />;
+  if (kind === "sharing") return <Server size={13} />;
+  if (kind === "error") return <Activity size={13} />;
+  return <Zap size={13} />;
 }
 
 function ActivityDataRow({ label, value }: { label: string; value: string }) {
@@ -845,20 +897,10 @@ function ActivityDataRow({ label, value }: { label: string; value: string }) {
 
 function MachineStatusCard({
   machine,
-  route,
-  executionPlan,
-  executionConfirmed,
-  isRunning,
   localTransfer,
-  developerMode,
 }: {
   machine: MachineView;
-  route: RouteHopView[];
-  executionPlan: ExecutionParticipantView[];
-  executionConfirmed: boolean;
-  isRunning: boolean;
   localTransfer?: TransferActivity;
-  developerMode: boolean;
 }) {
   const reconnecting = machine.connectionStatus === "reconnecting";
   const unreachable = machine.connectionStatus === "unreachable";
@@ -899,14 +941,6 @@ function MachineStatusCard({
       : supportedBackend
         ? "No full model download needed. This computer receives only its assigned model data in memory during a request."
         : "This computer can discover the network, but it cannot run a distributed model segment.";
-  const executionRole = machineRoleLabel(
-    machine.peerId,
-    route,
-    executionPlan,
-    executionConfirmed,
-    isRunning,
-  );
-
   return (
     <div className="machine-row">
       <div className="machine-row-main">
@@ -946,12 +980,6 @@ function MachineStatusCard({
         </strong>
         <span>{machineLoadLabel(machine.activeSessions, machine.maxSessions, machine.queueDepth)}</span>
       </div>
-      {executionRole ? <span className="machine-role">{executionRole}</span> : null}
-      {developerMode ? (
-        <code>
-          {machine.peerId} · last seen {machine.lastSeenSeconds}s ago
-        </code>
-      ) : null}
     </div>
   );
 }
@@ -976,11 +1004,9 @@ function MachineTransferProgress({ activity }: { activity: TransferActivity }) {
 function TransferActivityRow({
   activity,
   modelName,
-  developerMode,
 }: {
   activity: TransferActivity;
   modelName: string;
-  developerMode: boolean;
 }) {
   const elapsedMs = useElapsedTime(activity.status === "active" ? activity.startedAt : null);
   const percent = activity.totalBytes && (activity.downloadedBytes > 0 || activity.status !== "active")
@@ -1012,9 +1038,536 @@ function TransferActivityRow({
           </small>
         </div>
       ) : null}
-      {developerMode ? <code>{activity.detail}</code> : null}
     </div>
   );
+}
+
+type NodeLocation = {
+  latitude: number;
+  longitude: number;
+  label: string;
+  source: "geoip" | "illustrative";
+};
+
+type GeoPoint = [longitude: number, latitude: number];
+
+function NetworkPage({ snapshot }: { snapshot: GridSnapshot }) {
+  const onlineMachines = snapshot.machines.filter(
+    (machine) => machine.connectionStatus === "connected",
+  );
+  const acceleratorMachines = onlineMachines.filter(
+    (machine) => machine.computeBackend === "cuda" || machine.computeBackend === "metal",
+  );
+  const readyWorkers = onlineMachines.filter((machine) => machine.rpcReady);
+  const modelHosts = onlineMachines.filter((machine) => machine.hostedComponentCount > 0);
+  const availableComputeBytes = acceleratorMachines.reduce(
+    (total, machine) => total + machine.availableMemoryBytes,
+    0,
+  );
+  const totalComputeBytes = acceleratorMachines.reduce(
+    (total, machine) => total + machine.totalMemoryBytes,
+    0,
+  );
+  const activeSessions = onlineMachines.reduce((total, machine) => total + machine.activeSessions, 0);
+  const sessionCapacity = onlineMachines.reduce((total, machine) => total + machine.maxSessions, 0);
+  const queuedRequests = onlineMachines.reduce((total, machine) => total + machine.queueDepth, 0);
+  const logicalCores = onlineMachines.reduce((total, machine) => total + machine.logicalCpuCores, 0);
+  const coveredLayers = snapshot.coverage.filter((segment) => segment.covered).length;
+  const coveragePercent = snapshot.coverage.length > 0
+    ? Math.round((coveredLayers / snapshot.coverage.length) * 100)
+    : 0;
+  const capacityFreePercent = totalComputeBytes > 0
+    ? Math.round((availableComputeBytes / totalComputeBytes) * 100)
+    : 0;
+  const backendSummaries = ["cuda", "metal", "cpu"].map((backend) => {
+    const machines = onlineMachines.filter((machine) => machine.computeBackend === backend);
+    return {
+      backend,
+      machines,
+      availableBytes: machines.reduce((total, machine) => total + machine.availableMemoryBytes, 0),
+      totalBytes: machines.reduce((total, machine) => total + machine.totalMemoryBytes, 0),
+    };
+  }).filter((summary) => summary.machines.length > 0);
+  const { locations, isLocating } = useNodeLocations(onlineMachines);
+  const locatedNodeCount = Object.values(locations).filter(
+    (location) => location.source === "geoip",
+  ).length;
+
+  return (
+    <section className="network-screen">
+      <div className="network-layout">
+        <NetworkGlobe
+          machines={onlineMachines}
+          locations={locations}
+          locatedNodeCount={locatedNodeCount}
+          isLocating={isLocating}
+        />
+
+        <section className="network-pulse" aria-labelledby="network-pulse-title">
+          <div className="network-kicker">
+            <i aria-hidden="true" />
+            <span>Live network</span>
+          </div>
+          <h2 id="network-pulse-title">
+            {onlineMachines.length > 1
+              ? "Compute, shared in real time"
+              : onlineMachines.length === 1
+                ? "This computer is on the network"
+                : "Waiting for the network"}
+          </h2>
+          <p>
+            {onlineMachines.length > 0
+              ? "A clear view of the capacity Infernet can use right now, without exposing precise device locations."
+              : "Online computers and their available capacity will appear here as Infernet discovers them."}
+          </p>
+
+          <dl className="network-capacity-ledger">
+            <div className="network-memory-fact">
+              <dt>
+                <MemoryStick size={17} />
+                <span>Available VRAM + unified memory</span>
+              </dt>
+              <dd>
+                <strong>{formatBytes(availableComputeBytes)}</strong>
+                <span>
+                  {totalComputeBytes > 0
+                    ? `${capacityFreePercent}% free of ${formatBytes(totalComputeBytes)}`
+                    : "Waiting for accelerator capacity"}
+                </span>
+              </dd>
+            </div>
+            <NetworkPulseRow
+              icon={<Server size={16} />}
+              label="Nodes online"
+              value={String(onlineMachines.length)}
+              detail={onlineMachines.length === 1 ? "This computer" : `${snapshot.networkPeerCount} remote`}
+            />
+            <NetworkPulseRow
+              icon={<Zap size={16} />}
+              label="Compute-ready"
+              value={String(readyWorkers.length)}
+              detail={`${Math.max(0, sessionCapacity - activeSessions)} session slot${Math.max(0, sessionCapacity - activeSessions) === 1 ? "" : "s"} free`}
+            />
+            <NetworkPulseRow
+              icon={<Layers3 size={16} />}
+              label="Model coverage"
+              value={snapshot.coverage.length > 0 ? `${coveragePercent}%` : "—"}
+              detail={snapshot.coverage.length > 0 ? `${coveredLayers} of ${snapshot.coverage.length} layers` : "No route selected"}
+            />
+          </dl>
+        </section>
+
+        <section className="network-capacity-breakdown" aria-labelledby="capacity-breakdown-title">
+          <div className="network-section-heading">
+            <div>
+              <span>Capacity</span>
+              <h3 id="capacity-breakdown-title">Compute by runtime</h3>
+            </div>
+            <small>{acceleratorMachines.length} accelerator node{acceleratorMachines.length === 1 ? "" : "s"}</small>
+          </div>
+
+          {backendSummaries.length > 0 ? (
+            <div className="network-backend-list">
+              {backendSummaries.map((summary) => {
+                const availablePercent = summary.totalBytes > 0
+                  ? Math.round((summary.availableBytes / summary.totalBytes) * 100)
+                  : 0;
+                return (
+                  <div className="network-backend-row" key={summary.backend}>
+                    <div className="network-backend-copy">
+                      <span className="machine-backend">{machineBackendLabel(summary.backend)}</span>
+                      <div>
+                        <strong>{summary.machines.length} node{summary.machines.length === 1 ? "" : "s"}</strong>
+                        <span>
+                          {formatBytes(summary.availableBytes)} {summary.backend === "cpu" ? "RAM" : "available"}
+                        </span>
+                      </div>
+                    </div>
+                    <div className="network-capacity-meter" aria-label={`${availablePercent}% available`}>
+                      <span style={{ width: `${availablePercent}%` }} />
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="network-empty-inline">
+              <Cpu size={18} />
+              <span>Capacity reports will appear as nodes connect.</span>
+            </div>
+          )}
+        </section>
+
+        <section className="network-facts" aria-labelledby="network-facts-title">
+          <div className="network-section-heading">
+            <div>
+              <span>Signals</span>
+              <h3 id="network-facts-title">What the network is doing</h3>
+            </div>
+          </div>
+          <dl className="network-fact-list">
+            <NetworkFactRow label="Active sessions" value={`${activeSessions} / ${sessionCapacity}`} />
+            <NetworkFactRow label="Requests waiting" value={queuedRequests.toLocaleString()} />
+            <NetworkFactRow label="Model hosts online" value={modelHosts.length.toLocaleString()} />
+            <NetworkFactRow label="CPU cores visible" value={logicalCores.toLocaleString()} />
+            <NetworkFactRow label="Shared by this computer" value={formatBytes(snapshot.distribution.bytesServed)} />
+            <NetworkFactRow label="Verified chunks served" value={snapshot.distribution.chunksServed.toLocaleString()} />
+          </dl>
+        </section>
+
+        <section className="network-node-directory" aria-labelledby="network-node-directory-title">
+          <div className="network-section-heading">
+            <div>
+              <span>Nodes</span>
+              <h3 id="network-node-directory-title">Visible computers</h3>
+            </div>
+            <small>{locatedNodeCount} IP-located</small>
+          </div>
+
+          {onlineMachines.length > 0 ? (
+            <div className="network-node-list">
+              {onlineMachines.map((machine) => (
+                <div className="network-node-row" key={networkMachineKey(machine)}>
+                  <i className={machine.rpcReady ? "ready" : "connected"} aria-hidden="true" />
+                  <div className="network-node-copy">
+                    <strong>{machine.isLocal ? "This computer" : machine.deviceName}</strong>
+                    <span>
+                      {locations[networkMachineKey(machine)]?.label ?? "Locating node"}
+                      {` · ${machineBackendLabel(machine.computeBackend)}`}
+                    </span>
+                  </div>
+                  <div className="network-node-capacity">
+                    <strong>{formatBytes(machine.availableMemoryBytes)}</strong>
+                    <span>{machine.unifiedMemory ? "unified memory free" : "available"}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="network-empty-inline">
+              <Globe size={18} />
+              <span>No computers are visible yet.</span>
+            </div>
+          )}
+        </section>
+      </div>
+    </section>
+  );
+}
+
+function NetworkPulseRow({
+  icon,
+  label,
+  value,
+  detail,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  value: string;
+  detail: string;
+}) {
+  return (
+    <div className="network-pulse-row">
+      <dt>{icon}<span>{label}</span></dt>
+      <dd><strong>{value}</strong><span>{detail}</span></dd>
+    </div>
+  );
+}
+
+function NetworkFactRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="network-fact-row">
+      <dt>{label}</dt>
+      <dd>{value}</dd>
+    </div>
+  );
+}
+
+function NetworkGlobe({
+  machines,
+  locations,
+  locatedNodeCount,
+  isLocating,
+}: {
+  machines: MachineView[];
+  locations: Record<string, NodeLocation>;
+  locatedNodeCount: number;
+  isLocating: boolean;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const markers = useMemo<Marker[]>(
+    () => machines.map((machine) => {
+      const location = locations[networkMachineKey(machine)] ?? illustrativeNodeLocation(machine);
+      return {
+        location: [location.latitude, location.longitude],
+        size: machine.rpcReady ? 0.055 : 0.038,
+        color: location.source === "geoip"
+          ? [0.96, 0.96, 0.96]
+          : [0.52, 0.52, 0.52],
+      };
+    }),
+    [locations, machines],
+  );
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+    const initialSize = canvas.offsetWidth || 520;
+    let phi = -0.55;
+    let frame = 0;
+    let lastTime = performance.now();
+    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const globe = createGlobe(canvas, {
+      devicePixelRatio: pixelRatio,
+      width: Math.round(initialSize * pixelRatio),
+      height: Math.round(initialSize * pixelRatio),
+      phi,
+      theta: 0.18,
+      dark: 1,
+      diffuse: 1.1,
+      mapSamples: 24000,
+      mapBrightness: 4.2,
+      mapBaseBrightness: 0.025,
+      baseColor: [0.32, 0.32, 0.32],
+      markerColor: [0.96, 0.96, 0.96],
+      glowColor: [0.12, 0.12, 0.12],
+      markers,
+      markerElevation: 0.035,
+      opacity: 0.76,
+      scale: 0.98,
+      context: { alpha: true, antialias: true },
+    });
+
+    const resizeObserver = new ResizeObserver((entries) => {
+      const size = entries[0]?.contentRect.width;
+      if (!size) return;
+      globe.update({
+        width: Math.round(size * pixelRatio),
+        height: Math.round(size * pixelRatio),
+      });
+    });
+    resizeObserver.observe(canvas);
+
+    const animate = (now: number) => {
+      const delta = Math.min(50, now - lastTime);
+      lastTime = now;
+      phi = (phi + (delta * Math.PI * 2) / 64000) % (Math.PI * 2);
+      globe.update({ phi });
+      frame = window.requestAnimationFrame(animate);
+    };
+    if (!reducedMotion) frame = window.requestAnimationFrame(animate);
+
+    return () => {
+      if (frame) window.cancelAnimationFrame(frame);
+      resizeObserver.disconnect();
+      globe.destroy();
+    };
+  }, [markers]);
+
+  return (
+    <figure className="network-globe-figure" aria-labelledby="network-globe-caption">
+      <div className="network-globe-frame">
+        <canvas ref={canvasRef} className="network-globe" aria-hidden="true" />
+      </div>
+      <figcaption id="network-globe-caption">
+        <div>
+          <i aria-hidden="true" />
+          <strong>{machines.length} live node{machines.length === 1 ? "" : "s"}</strong>
+        </div>
+        <span>
+          {isLocating
+            ? "Resolving public-IP regions"
+            : locatedNodeCount > 0
+              ? `${locatedNodeCount} approximate IP location${locatedNodeCount === 1 ? "" : "s"}; private and relayed nodes are anonymized`
+              : "Private and relayed nodes use anonymous positions"}
+        </span>
+      </figcaption>
+    </figure>
+  );
+}
+
+function useNodeLocations(machines: MachineView[]): {
+  locations: Record<string, NodeLocation>;
+  isLocating: boolean;
+} {
+  const [locations, setLocations] = useState<Record<string, NodeLocation>>(() =>
+    Object.fromEntries(machines.map((machine) => [networkMachineKey(machine), illustrativeNodeLocation(machine)])),
+  );
+  const [isLocating, setIsLocating] = useState(false);
+  const locationSignature = machines.map((machine) =>
+    `${networkMachineKey(machine)}:${machine.isLocal ? "local" : "remote"}:${machine.addresses.join(",")}`
+  ).join("|");
+
+  useEffect(() => {
+    const fallbackLocations = Object.fromEntries(
+      machines.map((machine) => [networkMachineKey(machine), illustrativeNodeLocation(machine)]),
+    );
+    setLocations(fallbackLocations);
+
+    const lookupTargets = machines.map((machine) => ({
+      machine,
+      ip: publicIpFromAddresses(machine.addresses),
+    })).filter((target) => target.ip || target.machine.isLocal);
+
+    if (lookupTargets.length === 0) {
+      setIsLocating(false);
+      return;
+    }
+
+    let disposed = false;
+    const controller = new AbortController();
+    setIsLocating(true);
+    Promise.all(lookupTargets.map(async ({ machine, ip }) => {
+      const location = await fetchGeoIpLocation(ip, controller.signal);
+      return { key: networkMachineKey(machine), location };
+    })).then((results) => {
+      if (disposed) return;
+      const resolved = results.reduce<Record<string, NodeLocation>>((next, result) => {
+        if (result.location) next[result.key] = result.location;
+        return next;
+      }, {});
+      setLocations((current) => ({ ...current, ...resolved }));
+    }).finally(() => {
+      if (!disposed) setIsLocating(false);
+    });
+
+    return () => {
+      disposed = true;
+      controller.abort();
+    };
+  }, [locationSignature]);
+
+  return { locations, isLocating };
+}
+
+async function fetchGeoIpLocation(ip: string | null, signal: AbortSignal): Promise<NodeLocation | null> {
+  const cacheKey = `infernet-geo-v1-${hashText(ip ?? "self").toString(16)}`;
+  try {
+    const cached = window.localStorage.getItem(cacheKey);
+    if (cached) {
+      const parsed = JSON.parse(cached) as NodeLocation & { cachedAt: number };
+      if (Date.now() - parsed.cachedAt < 7 * 24 * 60 * 60 * 1000) {
+        return parsed;
+      }
+    }
+  } catch {
+    // Location caching is an optimization; lookup still works without storage.
+  }
+
+  try {
+    const fields = "success,city,region,country,latitude,longitude";
+    const endpoint = ip
+      ? `https://ipwho.is/${encodeURIComponent(ip)}?fields=${fields}`
+      : `https://ipwho.is/?fields=${fields}`;
+    const response = await fetch(endpoint, { signal, referrerPolicy: "no-referrer" });
+    if (!response.ok) return null;
+    const data = await response.json() as {
+      success?: boolean;
+      city?: string;
+      region?: string;
+      country?: string;
+      latitude?: number;
+      longitude?: number;
+    };
+    if (
+      data.success !== true
+      || !Number.isFinite(data.latitude)
+      || !Number.isFinite(data.longitude)
+    ) {
+      return null;
+    }
+    const labelParts = [...new Set([data.city, data.region, data.country].filter(Boolean))];
+    const location: NodeLocation = {
+      latitude: data.latitude as number,
+      longitude: data.longitude as number,
+      label: labelParts.join(", ") || "Approximate public-IP region",
+      source: "geoip",
+    };
+    try {
+      window.localStorage.setItem(cacheKey, JSON.stringify({ ...location, cachedAt: Date.now() }));
+    } catch {
+      // Keep the in-memory result if persistent storage is unavailable.
+    }
+    return location;
+  } catch {
+    return null;
+  }
+}
+
+function publicIpFromAddresses(addresses: string[]): string | null {
+  for (const address of addresses) {
+    if (address.includes("/p2p-circuit")) continue;
+    const parts = address.split("/").filter(Boolean);
+    for (let index = 0; index < parts.length - 1; index += 1) {
+      if (parts[index] !== "ip4" && parts[index] !== "ip6") continue;
+      const ip = parts[index + 1];
+      if (isPublicIp(ip)) return ip;
+    }
+  }
+  return null;
+}
+
+function isPublicIp(ip: string): boolean {
+  if (ip.includes(".")) {
+    const octets = ip.split(".").map(Number);
+    if (octets.length !== 4 || octets.some((octet) => !Number.isInteger(octet) || octet < 0 || octet > 255)) {
+      return false;
+    }
+    const [a, b, c] = octets;
+    return !(
+      a === 0
+      || a === 10
+      || a === 127
+      || (a === 100 && b >= 64 && b <= 127)
+      || (a === 169 && b === 254)
+      || (a === 172 && b >= 16 && b <= 31)
+      || (a === 192 && b === 168)
+      || (a === 192 && b === 0 && (c === 0 || c === 2))
+      || (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100)))
+      || (a === 203 && b === 0 && c === 113)
+      || a >= 224
+    );
+  }
+
+  if (!ip.includes(":")) return false;
+  const normalized = ip.toLowerCase();
+  if (normalized.startsWith("::ffff:")) return isPublicIp(normalized.slice(7));
+  return !(
+    normalized === "::"
+    || normalized === "::1"
+    || normalized.startsWith("fc")
+    || normalized.startsWith("fd")
+    || /^fe[89ab]/.test(normalized)
+    || normalized.startsWith("ff")
+    || normalized.startsWith("2001:db8")
+  );
+}
+
+function illustrativeNodeLocation(machine: MachineView): NodeLocation {
+  const identity = networkMachineKey(machine);
+  const latitudeUnit = (hashText(`${identity}:latitude`) + 0.5) / 4294967296;
+  const longitudeUnit = (hashText(`${identity}:longitude`) + 0.5) / 4294967296;
+  return {
+    latitude: Math.asin(2 * latitudeUnit - 1) * (180 / Math.PI),
+    longitude: longitudeUnit * 360 - 180,
+    label: machine.isLocal ? "Private location · this computer" : "Private or relayed location",
+    source: "illustrative",
+  };
+}
+
+function networkMachineKey(machine: MachineView): string {
+  return machine.machineId?.trim() || machine.peerId;
+}
+
+function hashText(value: string): number {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
 }
 
 function ModelsPage({
@@ -1109,11 +1662,9 @@ function ModelsPage({
 function DownloadsPage({
   snapshot,
   transferActivities,
-  developerMode,
 }: {
   snapshot: GridSnapshot;
   transferActivities: TransferActivity[];
-  developerMode: boolean;
 }) {
   const distribution = snapshot.distribution;
   const activeTransfers = transferActivities.filter((activity) => activity.status === "active");
@@ -1148,7 +1699,6 @@ function DownloadsPage({
               <TransferActivityRow
                 activity={activity}
                 modelName={modelDisplayName(snapshot, activity.modelId)}
-                developerMode={developerMode}
                 key={activity.id}
               />
             ))}
@@ -1185,12 +1735,7 @@ function DownloadsPage({
             {snapshot.machines.map((machine) => (
               <MachineStatusCard
                 machine={machine}
-                route={[]}
-                executionPlan={[]}
-                executionConfirmed={false}
-                isRunning={false}
                 localTransfer={machine.isLocal ? activeModelTransfer : undefined}
-                developerMode={developerMode}
                 key={machine.machineId ?? machine.peerId}
               />
             ))}
@@ -1246,15 +1791,6 @@ function DownloadsPage({
                 <div className="local-model-copy">
                   <strong>{item.displayName}</strong>
                   <span>{item.quantization ? item.quantization.toUpperCase() : "Infernet model"} · Stored locally</span>
-                  {developerMode ? (
-                    <details className="model-technical-details">
-                      <summary>Technical details</summary>
-                      <code>
-                        {item.packageCount} package{item.packageCount === 1 ? "" : "s"} · layers {item.layerStart}:{item.layerEnd} · {item.version}
-                      </code>
-                      {item.checksums.map((checksum) => <code key={checksum}>{checksum}</code>)}
-                    </details>
-                  ) : null}
                 </div>
                 <div className="local-model-meta">
                   <strong>{formatBytes(item.sizeBytes)}</strong>
@@ -1279,7 +1815,6 @@ function DownloadsPage({
               <TransferActivityRow
                 activity={activity}
                 modelName={modelDisplayName(snapshot, activity.modelId)}
-                developerMode={developerMode}
                 key={activity.id}
               />
             ))}
@@ -1292,13 +1827,9 @@ function DownloadsPage({
 
 function SettingsPage({
   identity,
-  developerMode,
-  setDeveloperMode,
   onNetworkChanged,
 }: {
   identity: LocalIdentity | null;
-  developerMode: boolean;
-  setDeveloperMode: (enabled: boolean) => void;
   onNetworkChanged: () => void;
 }) {
   const [manualPeer, setManualPeer] = useState("");
@@ -1338,21 +1869,10 @@ function SettingsPage({
     <section className="settings-screen">
       <div className="section-heading">
         <h2>Settings</h2>
-        <p>Keep the app simple by default. Reveal technical details when needed.</p>
+        <p>Connection details and controls for this node.</p>
       </div>
 
       <div className="settings-list">
-        <label className="settings-row">
-          <div>
-            <strong>Developer Mode</strong>
-            <span>Show peer IDs, layer groups, protocol details, and route timing.</span>
-          </div>
-          <input
-            type="checkbox"
-            checked={developerMode}
-            onChange={(event) => setDeveloperMode(event.target.checked)}
-          />
-        </label>
         <div className="settings-row">
           <div>
             <strong>Local node</strong>
@@ -1405,29 +1925,6 @@ function ProgressBar({ progress, indeterminate = false }: { progress: number; in
       <span style={{ width: `${progress}%` }} />
     </div>
   );
-}
-
-function upsertHop(
-  current: HopProgress[],
-  event: Extract<ProgressEvent, { type: "hopStarted" | "hopCompleted" }>,
-  status: HopProgress["status"],
-): HopProgress[] {
-  const key = hopKey(event.peerId, event.layerStart, event.layerEnd);
-  const nextHop: HopProgress = {
-    key,
-    peerId: event.peerId,
-    shortPeerId: event.shortPeerId,
-    layerStart: event.layerStart,
-    layerEnd: event.layerEnd,
-    activationSizeBytes: event.activationSizeBytes,
-    status,
-    timingMs: event.type === "hopCompleted" ? event.timingMs : undefined,
-    activationChecksum: event.type === "hopCompleted" ? event.activationChecksum : undefined,
-  };
-
-  return current.some((hop) => hop.key === key)
-    ? current.map((hop) => (hop.key === key ? { ...hop, ...nextHop } : hop))
-    : [...current, nextHop];
 }
 
 function upsertTransferActivity(
@@ -1514,12 +2011,9 @@ function transferStatus(stage: string): TransferStatus {
   return "active";
 }
 
-function hopKey(peerId: string, layerStart: number, layerEnd: number): string {
-  return `${peerId}:${layerStart}:${layerEnd}`;
-}
-
 function pageTitle(page: Page): string {
   if (page === "chat") return "Chat";
+  if (page === "network") return "Network";
   if (page === "models") return "Models";
   if (page === "downloads") return "Downloads";
   return "Settings";
@@ -1568,6 +2062,13 @@ function formatRelativeTime(timestamp: number): string {
   return minutes === 1 ? "1 min ago" : `${minutes} min ago`;
 }
 
+function formatJournalTime(timestamp: number): string {
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(timestamp);
+}
+
 function machineBackendLabel(backend: string): string {
   if (backend === "cuda") return "CUDA";
   if (backend === "metal") return "Metal";
@@ -1582,34 +2083,6 @@ function machineLoadLabel(activeSessions: number, maxSessions: number, queueDept
     return `${activeSessions}/${maxSessions} sessions active`;
   }
   return "Ready";
-}
-
-function machineRoleLabel(
-  peerId: string,
-  route: RouteHopView[],
-  executionPlan: ExecutionParticipantView[],
-  executionConfirmed: boolean,
-  isRunning: boolean,
-): string | null {
-  const participant = executionPlan.find((item) => item.peerId === peerId);
-  if (participant?.role === "coordinator") {
-    return executionConfirmed
-      ? `Coordinated last response · ≈${participant.estimatedSharePercent}% share`
-      : `Planned coordinator · ≈${participant.estimatedSharePercent}% share`;
-  }
-  if (participant) {
-    return executionConfirmed
-      ? `Used in last response · ≈${participant.estimatedSharePercent}% share`
-      : `Planned worker · ≈${participant.estimatedSharePercent}% share`;
-  }
-  const assignment = route.find((hop) => hop.peerId === peerId);
-  if (assignment && isRunning) {
-    return `Working on layers ${assignment.layerStart + 1}–${assignment.layerEnd}`;
-  }
-  if (assignment) {
-    return `Assigned layers ${assignment.layerStart + 1}–${assignment.layerEnd}`;
-  }
-  return null;
 }
 
 function friendlyActivityError(error: string): string {
@@ -1635,7 +2108,7 @@ function friendlyActivityError(error: string): string {
   if (normalized.includes("offline") || normalized.includes("connect")) {
     return "Infernet could not reach the computer running this part of the model.";
   }
-  return "The model stopped unexpectedly. The technical error is available in Developer Mode.";
+  return "The model stopped unexpectedly. Try again, or restart Infernet if it keeps happening.";
 }
 
 function humanTransferStage(stage: string): string {

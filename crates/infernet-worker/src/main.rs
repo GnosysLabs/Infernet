@@ -24,7 +24,8 @@ use infernet_node::{
     stop_persistent_llama_server,
 };
 use infernet_protocol::{
-    LLAMA_RPC_TUNNEL_PROTOCOL, LlamaRpcEndpoint, ModelShardInfo, NodeAdvertisement, RouteHop,
+    ACTIVATION_PROTOCOL, LLAMA_RPC_TUNNEL_PROTOCOL, LlamaRpcEndpoint, ModelShardInfo,
+    NodeAdvertisement, RouteHop,
 };
 use infernet_router::ShardRegistry;
 use sha2::{Digest, Sha256};
@@ -323,7 +324,7 @@ async fn bootstrap(args: BootstrapArgs) -> Result<()> {
     println!("peer_id={peer_id}");
     println!("listen={}", args.p2p_listen);
     println!("model_protocol=/infernet/model/1");
-    println!("activation_protocol=/infernet/activation/1");
+    println!("activation_protocol={ACTIVATION_PROTOCOL}");
     println!("identity_file={}", args.identity_file.display());
     println!("cache={}", args.cache_dir.display());
     if let Some(domain) = args.public_domain.as_deref() {
@@ -442,7 +443,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
     println!("model={}", manifest.model_id);
     println!("runtime={}", manifest.runtime_kind.as_str());
     println!("layers={}:{}", owned_layers.start, owned_layers.end);
-    println!("activation_protocol=/infernet/activation/1");
+    println!("activation_protocol={ACTIVATION_PROTOCOL}");
 
     run_worker_node(
         discovery,

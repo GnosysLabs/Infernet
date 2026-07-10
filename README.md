@@ -44,18 +44,17 @@ The current implementation includes:
   packages for official models.
 - A local shard cache with verified checksums and executable-shard metadata.
 - P2P model shard transfer over `/infernet/model-blob/1`.
-- P2P activation forwarding over `/infernet/activation/1`.
+- Binary P2P activation forwarding over `/infernet/activation/2`.
 - Route construction from live peer advertisements.
-- A patched llama.cpp bridge that loads an executable Infernet package. Physical
-  contiguous layer-range execution remains experimental.
+- Persistent Infernet workers that load assigned contiguous layer ranges from
+  each node's verified local package and retain weights and KV state.
 
-The current runtime is correctness-first. It is not fast and it is not a
-finished product. The compatibility package keeps one complete model payload so
-the runtime can use the architecture's normal execution graph without storage
-amplification. Physical layer partitioning and routing remain experimental.
-Multi-token distributed KV-cache streaming, advanced scheduling, proofs of
-correct execution, privacy protections, and production NAT traversal are still
-future work.
+The compatibility package keeps one byte-exact model payload on each worker,
+without storage amplification. At inference time the scheduler assigns each
+worker only the layers its reported accelerator memory can hold. Model weights
+never cross the inference transport: only binary activation frames and sampled
+token state move between peers. Advanced scheduling, proofs of correct
+execution, and privacy protections remain future work.
 
 Infernet intentionally does not ship a fake bridge or fake peers by default. If
 the real runtime cannot build or load, that is treated as a real error.
@@ -148,7 +147,7 @@ immediately advertises it. That makes every downloader a seeder.
 Inference uses a separate libp2p request-response protocol:
 
 ```text
-/infernet/activation/1
+/infernet/activation/2
 ```
 
 The client builds a route from discovered executable shard descriptors. It sends
@@ -159,7 +158,9 @@ the first activation request to the first peer in that route. Each peer:
 3. records trace information
 4. forwards the activation to the next peer
 
-The final peer returns the response back through the request chain.
+The final peer samples one token and returns it through the request chain. The
+client passes that token through the same sticky route until generation ends;
+each worker keeps its local layer KV cache resident between passes.
 
 Trace events include:
 
@@ -334,9 +335,10 @@ The app lives in `infernet-ui` and uses Tauri, React, and TypeScript.
 The launch UI is chat-first:
 
 - Chat
-- Models (the official Infernet catalog)
-- Downloads
+- Network
 - Settings
+
+The official model catalog and storage flows appear contextually from Chat.
 
 The app no longer exposes "Local" and "AI Grid" modes. Infernet is always a
 network. Your computer is one node in that network.
@@ -346,18 +348,10 @@ network. Your computer is one node in that network.
 The chat screen is the primary interface. Network details are hidden until they
 matter.
 
-During inference, the app can show:
-
-- thinking state
-- peer count
-- route discovered
-- hop started
-- hop completed
-- activation size
-- timing
-- final output
-
-Developer/network details are available through the network activity view.
+Activity opens a first-person HUD for this computer. It shows what this node is
+doing now, whether its compute and model are ready, and an oldest-to-newest
+session journal of completed chat, compute, model, and sharing work. Aggregate
+capacity and the other nodes belong on the Network screen.
 
 ### Models
 
@@ -382,8 +376,8 @@ language:
 - whether this computer is making model components available to peers
 - recent model activity
 
-Checksums, layer ranges, package versions, and peer identifiers belong in
-developer details. Automatic replication and rebalancing are future work.
+Checksums, layer ranges, package versions, and peer identifiers stay out of the
+everyday product UI. Automatic replication and rebalancing are future work.
 
 ## Setup Requirements
 
