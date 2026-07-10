@@ -131,6 +131,11 @@ export default function App() {
   const [selectedModel, setSelectedModel] = useState("");
   const [prompt, setPrompt] = useState(DEFAULT_PROMPT);
   const [imagePrompt, setImagePrompt] = useState("");
+  const [imageGenerating, setImageGenerating] = useState(false);
+  const imageGeneratingRef = useRef(false);
+  const [imageGenerationStartedAt, setImageGenerationStartedAt] = useState<number | null>(null);
+  const [imageResult, setImageResult] = useState<GenerateImageResponse | null>(null);
+  const [imageGenerationError, setImageGenerationError] = useState<string | null>(null);
   const [runningThreadId, setRunningThreadId] = useState<string | null>(null);
   const runningThreadIdRef = useRef<string | null>(null);
   const [threadErrors, setThreadErrors] = useState<Record<string, string>>({});
@@ -555,8 +560,39 @@ export default function App() {
   function startNewImage() {
     setPrimaryMode("image");
     setPage("image");
+    if (imageGeneratingRef.current) return;
     setImagePrompt("");
+    setImageResult(null);
+    setImageGenerationError(null);
     setImageFocusRequest((request) => request + 1);
+  }
+
+  async function runImageGeneration() {
+    const cleanPrompt = imagePrompt.trim();
+    if (
+      !cleanPrompt
+      || imageGeneratingRef.current
+      || imageRuntimeStatus?.busy
+      || !imageRuntimeStatus?.runtimeAvailable
+      || !imageRuntimeStatus.verified
+    ) {
+      return;
+    }
+
+    imageGeneratingRef.current = true;
+    setImageGenerating(true);
+    setImageGenerationStartedAt(Date.now());
+    setImageGenerationError(null);
+    setImageResult(null);
+    try {
+      setImageResult(await generateImage(cleanPrompt));
+    } catch (error) {
+      setImageGenerationError(imageErrorMessage(error));
+    } finally {
+      imageGeneratingRef.current = false;
+      setImageGenerating(false);
+      getImageRuntimeStatus().then(setImageRuntimeStatus).catch(() => undefined);
+    }
   }
 
   async function removeThread(threadId: string) {
@@ -669,6 +705,7 @@ export default function App() {
         chatIsVisible={page === "chat"}
         primaryMode={primaryMode}
         runningThreadId={runningThreadId}
+        imageGenerationBusy={imageGenerating || Boolean(imageRuntimeStatus?.busy)}
         disabled={!chatHistoryReady || chatHistoryBusy}
         persistenceError={chatHistoryError}
         onCreateThread={createNewThread}
@@ -685,7 +722,9 @@ export default function App() {
           networkNodeCount={snapshot.machines.filter((machine) => machine.connectionStatus !== "unreachable").length}
           networkReadyCount={snapshot.machines.filter((machine) => machine.rpcReady && machine.connectionStatus !== "unreachable").length}
           hasActiveWork={
-            localNodeActivity.computeActive
+            imageGenerating
+            || imageRuntimeStatus?.busy
+            || localNodeActivity.computeActive
             || localNodeActivity.sharingActive
             || activeTransfers > 0
           }
@@ -712,6 +751,12 @@ export default function App() {
             prompt={imagePrompt}
             setPrompt={setImagePrompt}
             focusRequest={imageFocusRequest}
+            runtimeStatus={imageRuntimeStatus}
+            generating={imageGenerating}
+            generationStartedAt={imageGenerationStartedAt}
+            result={imageResult}
+            imageError={imageGenerationError}
+            runImageGeneration={runImageGeneration}
           />
         ) : null}
 
@@ -905,6 +950,7 @@ function Sidebar({
   chatIsVisible,
   primaryMode,
   runningThreadId,
+  imageGenerationBusy,
   disabled,
   persistenceError,
   onCreateThread,
@@ -918,6 +964,7 @@ function Sidebar({
   chatIsVisible: boolean;
   primaryMode: PrimaryMode;
   runningThreadId: string | null;
+  imageGenerationBusy: boolean;
   disabled: boolean;
   persistenceError: string | null;
   onCreateThread: () => Promise<void>;
@@ -988,12 +1035,13 @@ function Sidebar({
         </button>
         <button
           type="button"
-          className={primaryMode === "image" ? "active" : undefined}
+          className={`${primaryMode === "image" ? "active " : ""}${imageGenerationBusy ? "mode-image-working" : ""}`.trim() || undefined}
           aria-pressed={primaryMode === "image"}
-          title="Image"
+          aria-label={imageGenerationBusy ? "Image, generating" : "Image"}
+          title={imageGenerationBusy ? "Image generation in progress" : "Image"}
           onClick={() => onModeChange("image")}
         >
-          <ImageIcon size={16} />
+          {imageGenerationBusy ? <LoaderCircle size={16} /> : <ImageIcon size={16} />}
           <span>Image</span>
         </button>
       </div>
@@ -1001,9 +1049,9 @@ function Sidebar({
       <button
         className="new-thread-button"
         type="button"
-        aria-label={primaryMode === "chat" ? "New chat" : "New image"}
-        title={primaryMode === "chat" ? "New chat" : "New image"}
-        disabled={primaryMode === "chat" && disabled}
+        aria-label={primaryMode === "chat" ? "New chat" : imageGenerationBusy ? "Image generation in progress" : "New image"}
+        title={primaryMode === "chat" ? "New chat" : imageGenerationBusy ? "Wait for the current image to finish" : "New image"}
+        disabled={primaryMode === "chat" ? disabled : imageGenerationBusy}
         onClick={() => {
           if (primaryMode === "chat") {
             void onCreateThread();
@@ -1013,7 +1061,7 @@ function Sidebar({
         }}
       >
         <Plus size={17} />
-        <span>{primaryMode === "chat" ? "New chat" : "New image"}</span>
+        <span>{primaryMode === "chat" ? "New chat" : imageGenerationBusy ? "Image in progress" : "New image"}</span>
       </button>
 
       {primaryMode === "chat" ? (
@@ -1372,36 +1420,25 @@ function ImagePage({
   prompt,
   setPrompt,
   focusRequest,
+  runtimeStatus,
+  generating,
+  generationStartedAt,
+  result,
+  imageError,
+  runImageGeneration,
 }: {
   prompt: string;
   setPrompt: (value: string) => void;
   focusRequest: number;
+  runtimeStatus: ImageRuntimeStatus | null;
+  generating: boolean;
+  generationStartedAt: number | null;
+  result: GenerateImageResponse | null;
+  imageError: string | null;
+  runImageGeneration: () => Promise<void>;
 }) {
   const inputRef = useRef<HTMLTextAreaElement>(null);
-  const generationEpochRef = useRef(0);
-  const [runtimeStatus, setRuntimeStatus] = useState<ImageRuntimeStatus | null>(null);
-  const [runtimeLoading, setRuntimeLoading] = useState(true);
-  const [generating, setGenerating] = useState(false);
-  const [result, setResult] = useState<GenerateImageResponse | null>(null);
-  const [imageError, setImageError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let disposed = false;
-    setRuntimeLoading(true);
-    getImageRuntimeStatus()
-      .then((next) => {
-        if (!disposed) setRuntimeStatus(next);
-      })
-      .catch((error) => {
-        if (!disposed) setImageError(imageErrorMessage(error));
-      })
-      .finally(() => {
-        if (!disposed) setRuntimeLoading(false);
-      });
-    return () => {
-      disposed = true;
-    };
-  }, [focusRequest]);
+  const elapsedMs = useElapsedTime(generating ? generationStartedAt : null);
 
   useLayoutEffect(() => {
     const input = inputRef.current;
@@ -1425,9 +1462,6 @@ function ImagePage({
 
   useEffect(() => {
     if (focusRequest <= 0) return;
-    generationEpochRef.current += 1;
-    setResult(null);
-    setImageError(null);
     inputRef.current?.focus();
   }, [focusRequest]);
 
@@ -1435,31 +1469,9 @@ function ImagePage({
   const canGenerate = Boolean(
     runtimeStatus?.runtimeAvailable && runtimeStatus.verified && !operationBusy,
   );
-  const runtimeNote = runtimeLoading
-    ? "Checking the image runtime…"
-    : generating
-      ? "Generating a 1024 × 1024 image with the verified package."
-      : runtimeStatus?.status ?? "Infernet Image is unavailable.";
-
-  async function runImageGeneration() {
-    const cleanPrompt = prompt.trim();
-    if (!cleanPrompt || !canGenerate) return;
-    const generationEpoch = generationEpochRef.current;
-    setGenerating(true);
-    setImageError(null);
-    setResult(null);
-    try {
-      const next = await generateImage(cleanPrompt);
-      if (generationEpochRef.current === generationEpoch) setResult(next);
-    } catch (error) {
-      if (generationEpochRef.current === generationEpoch) {
-        setImageError(imageErrorMessage(error));
-      }
-    } finally {
-      setGenerating(false);
-      getImageRuntimeStatus().then(setRuntimeStatus).catch(() => undefined);
-    }
-  }
+  const runtimeNote = generating
+    ? `Generating a 1024 × 1024 image · ${formatDuration(elapsedMs)} elapsed`
+    : runtimeStatus?.status ?? "Infernet Image is unavailable.";
 
   return (
     <section className="image-screen" aria-busy={operationBusy}>
@@ -1504,10 +1516,15 @@ function ImagePage({
             <h2>{generating ? "Creating your image" : "What do you want to make?"}</h2>
             <p>
               {generating
-                ? "Infernet is running the verified Z‑Image Turbo edition. Keep the app open while it finishes."
+                ? "You can visit another screen. Come back here to follow progress while Infernet finishes."
                 : "Describe a scene, subject, or style. Infernet Image will use the official Z‑Image Turbo edition."}
             </p>
-
+            {generating ? (
+              <div className="image-generation-progress">
+                <ProgressBar progress={0} indeterminate />
+                <span>{formatDuration(elapsedMs)} elapsed</span>
+              </div>
+            ) : null}
           </div>
         )}
 
@@ -1526,6 +1543,7 @@ function ImagePage({
             rows={1}
             value={prompt}
             onChange={(event) => setPrompt(event.target.value)}
+            disabled={operationBusy}
             onKeyDown={(event) => {
               if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
                 event.preventDefault();

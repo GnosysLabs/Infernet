@@ -1506,7 +1506,8 @@ select:focus-visible {
 }
 
 .image-mode-mark.working svg,
-.image-generating svg {
+.image-generating svg,
+.mode-image-working svg {
   animation: image-generation-turn 1.4s linear infinite;
 }
 
@@ -1539,6 +1540,19 @@ select:focus-visible {
   color: var(--muted);
   font-size: 14px;
   line-height: 1.6;
+}
+
+.image-generation-progress {
+  width: min(420px, 100%);
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.image-generation-progress span {
+  color: var(--soft);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
 }
 
 .image-result {
