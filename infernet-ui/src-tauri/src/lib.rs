@@ -1,3 +1,4 @@
+mod chat_history;
 mod execution_plan;
 mod peer_presence;
 
@@ -12,6 +13,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use chat_history::{
+    ChatHistoryStore, append_chat_message, create_chat_thread, delete_chat_thread,
+    get_chat_history, select_chat_thread,
+};
 use execution_plan::{ExecutionParticipantView, plan_worker_execution, worker_is_usable};
 use futures::{StreamExt, channel::oneshot};
 use infernet_model::{
@@ -88,6 +93,7 @@ impl Drop for AdvertisedLlamaRpcServer {
 
 struct UiState {
     keypair: Mutex<identity::Keypair>,
+    chat_history: Mutex<Option<ChatHistoryStore>>,
     topic: String,
     model_distribution_service: Arc<Mutex<ModelDistributionServiceState>>,
     live_registry: Arc<Mutex<ShardRegistry>>,
@@ -102,6 +108,7 @@ impl Default for UiState {
     fn default() -> Self {
         Self {
             keypair: Mutex::new(identity::Keypair::generate_ed25519()),
+            chat_history: Mutex::new(None),
             topic: DEFAULT_TOPIC.to_owned(),
             model_distribution_service: Arc::new(Mutex::new(
                 ModelDistributionServiceState::Stopped,
@@ -3336,7 +3343,21 @@ pub fn run() {
         .manage(UiState::default())
         .setup(|app| {
             let app_handle = app.handle().clone();
-            let identity_path = app.path().app_data_dir()?.join("identity.key");
+            let app_data_dir = app.path().app_data_dir()?;
+            match ChatHistoryStore::open(app_data_dir.join("chat-history-v1.json")) {
+                Ok(chat_history) => {
+                    *app_handle
+                        .state::<UiState>()
+                        .chat_history
+                        .lock()
+                        .expect("UI chat history lock poisoned during startup") =
+                        Some(chat_history);
+                }
+                Err(error) => {
+                    eprintln!("failed to open chat history: {error}");
+                }
+            }
+            let identity_path = app_data_dir.join("identity.key");
             let keypair = load_or_generate_keypair(&identity_path)?;
             *app_handle
                 .state::<UiState>()
@@ -3376,6 +3397,11 @@ pub fn run() {
             get_manual_peers,
             add_manual_peer,
             clear_manual_peers,
+            get_chat_history,
+            create_chat_thread,
+            select_chat_thread,
+            append_chat_message,
+            delete_chat_thread,
             get_grid_snapshot,
             install_official_model,
             run_demo_inference

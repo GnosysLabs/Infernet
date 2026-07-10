@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import createGlobe from "cobe";
 import type { Marker } from "cobe";
+import ReactMarkdown from "react-markdown";
+import type { Components } from "react-markdown";
+import remarkGfm from "remark-gfm";
 import {
   Activity,
   Box,
@@ -13,9 +16,11 @@ import {
   MemoryStick,
   MessageSquare,
   PanelRightClose,
+  Plus,
   Send,
   Server,
   Settings,
+  Trash2,
   Zap,
 } from "lucide-react";
 import {
@@ -39,9 +44,10 @@ import type {
   ModelView,
   ProgressEvent,
 } from "./types";
+import type { ChatMessage, ChatThread } from "./chatHistory";
+import { usePersistentChatHistory } from "./usePersistentChatHistory";
 
 type Page = "chat" | "network" | "downloads" | "settings";
-type Message = { id: string; role: "user" | "assistant"; text: string };
 type TransferStatus = "active" | "complete" | "error";
 type TransferActivity = ModelImportProgress & {
   id: string;
@@ -60,6 +66,16 @@ type NodeJournalEntry = {
 const DEFAULT_PROMPT = "";
 const COMPOSER_MAX_HEIGHT = 160;
 const INFERNET_CHAT_MODEL_ID = "infernet-chat-v1";
+const MARKDOWN_COMPONENTS: Components = {
+  a: ({ node: _node, ...props }) => (
+    <a {...props} target="_blank" rel="noreferrer noopener" />
+  ),
+  table: ({ node: _node, ...props }) => (
+    <div className="markdown-table-wrap" role="region" aria-label="Scrollable table" tabIndex={0}>
+      <table {...props} />
+    </div>
+  ),
+};
 const EMPTY_LOCAL_NODE_ACTIVITY: LocalNodeActivitySnapshot = {
   computeActive: false,
   computeReady: false,
@@ -78,6 +94,16 @@ const EMPTY_LOCAL_NODE_ACTIVITY: LocalNodeActivitySnapshot = {
 export default function App() {
   const [page, setPage] = useState<Page>("chat");
   const [activityOpen, setActivityOpen] = useState(false);
+  const {
+    history: chatHistory,
+    ready: chatHistoryReady,
+    busy: chatHistoryBusy,
+    error: chatHistoryError,
+    createThread,
+    selectThread,
+    appendMessage,
+    deleteThread,
+  } = usePersistentChatHistory();
   const [identity, setIdentity] = useState<LocalIdentity | null>(null);
   const [localNodeActivity, setLocalNodeActivity] = useState<LocalNodeActivitySnapshot>(
     EMPTY_LOCAL_NODE_ACTIVITY,
@@ -86,11 +112,18 @@ export default function App() {
   const [snapshot, setSnapshot] = useState<GridSnapshot>(emptySnapshot);
   const [selectedModel, setSelectedModel] = useState("");
   const [prompt, setPrompt] = useState(DEFAULT_PROMPT);
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [isRunning, setIsRunning] = useState(false);
+  const [runningThreadId, setRunningThreadId] = useState<string | null>(null);
+  const runningThreadIdRef = useRef<string | null>(null);
+  const [threadErrors, setThreadErrors] = useState<Record<string, string>>({});
+  const [composerFocusRequest, setComposerFocusRequest] = useState(0);
   const [lastError, setLastError] = useState<string | null>(null);
   const [transferActivities, setTransferActivities] = useState<TransferActivity[]>([]);
   const [connectionGraceExpired, setConnectionGraceExpired] = useState(false);
+
+  const activeThread = chatHistory.threads.find(
+    (thread) => thread.id === chatHistory.activeThreadId,
+  ) ?? chatHistory.threads[0];
+  const isRunning = runningThreadId !== null;
 
   const officialModels = useMemo(
     () => snapshot.availableModels.filter(isOfficialInfernetModel),
@@ -114,20 +147,26 @@ export default function App() {
     });
   }, []);
 
+  const updateRunningThread = useCallback((threadId: string | null) => {
+    runningThreadIdRef.current = threadId;
+    setRunningThreadId(threadId);
+  }, []);
+
   const applyProgressEvent = useCallback((event: ProgressEvent) => {
     if (event.type === "routeDiscovered" || event.type === "executionPlan") {
       setLastError(null);
       return;
     }
 
-    if (event.type === "finalOutput") {
-      setIsRunning(false);
-      return;
-    }
+    if (event.type === "finalOutput") return;
 
     if (event.type === "error") {
-      setLastError(event.message);
-      setIsRunning(false);
+      const threadId = runningThreadIdRef.current;
+      if (threadId) {
+        setThreadErrors((current) => ({ ...current, [threadId]: event.message }));
+      } else {
+        setLastError(event.message);
+      }
     }
   }, []);
 
@@ -344,9 +383,48 @@ export default function App() {
     };
   }, [appendJournalEntry]);
 
+  async function createNewThread() {
+    if (!chatHistoryReady) return;
+    setPage("chat");
+    setPrompt("");
+    setLastError(null);
+    const nextHistory = await createThread();
+    if (nextHistory) {
+      setComposerFocusRequest((request) => request + 1);
+    }
+  }
+
+  async function openThread(threadId: string) {
+    if (!chatHistoryReady || threadId === chatHistory.activeThreadId) {
+      setPage("chat");
+      return;
+    }
+    setPage("chat");
+    setPrompt("");
+    setLastError(null);
+    await selectThread(threadId);
+  }
+
+  async function removeThread(threadId: string) {
+    if (!chatHistoryReady || threadId === runningThreadIdRef.current) return;
+    const wasActive = threadId === chatHistory.activeThreadId;
+    const nextHistory = await deleteThread(threadId);
+    if (!nextHistory) return;
+    setThreadErrors((current) => {
+      const next = { ...current };
+      delete next[threadId];
+      return next;
+    });
+    if (wasActive) {
+      setPrompt("");
+      setLastError(null);
+    }
+  }
+
   async function runInference() {
     const userPrompt = prompt.trim();
-    if (!userPrompt || isRunning) {
+    const threadId = activeThread?.id;
+    if (!userPrompt || !threadId || !chatHistoryReady || runningThreadIdRef.current) {
       return;
     }
 
@@ -358,36 +436,53 @@ export default function App() {
       setLastError(selectedModelView.status);
       return;
     }
-    setMessages((current) => [
-      ...current,
-      { id: `user-${Date.now()}`, role: "user", text: userPrompt },
-    ]);
+
+    updateRunningThread(threadId);
+    setThreadErrors((current) => {
+      const next = { ...current };
+      delete next[threadId];
+      return next;
+    });
+    const historyWithPrompt = await appendMessage(threadId, "user", userPrompt);
+    if (!historyWithPrompt) {
+      updateRunningThread(null);
+      return;
+    }
+
     setPrompt("");
-    setIsRunning(true);
     setLastError(null);
 
     try {
       const output = (await runDistributedInference(userPrompt, selectedModel)).output;
-
-      setMessages((current) => [
-        ...current,
-        { id: `assistant-${Date.now()}`, role: "assistant", text: output },
-      ]);
+      await appendMessage(threadId, "assistant", output);
     } catch (error) {
       const message = String(error);
-      setLastError(message);
+      setThreadErrors((current) => ({ ...current, [threadId]: message }));
     } finally {
-      setIsRunning(false);
+      if (runningThreadIdRef.current === threadId) {
+        updateRunningThread(null);
+      }
     }
   }
 
   return (
     <div className={activityOpen ? "app-shell activity-open" : "app-shell"}>
-      <Sidebar page={page} setPage={setPage} />
+      <Sidebar
+        threads={chatHistory.threads}
+        activeThreadId={chatHistory.activeThreadId}
+        chatIsVisible={page === "chat"}
+        runningThreadId={runningThreadId}
+        disabled={!chatHistoryReady || chatHistoryBusy}
+        persistenceError={chatHistoryError}
+        onCreateThread={createNewThread}
+        onOpenThread={openThread}
+        onDeleteThread={removeThread}
+      />
 
       <main className="app-main">
         <AppHeader
           page={page}
+          chatTitle={activeThread?.title ?? "New chat"}
           networkNodeCount={snapshot.machines.filter((machine) => machine.connectionStatus !== "unreachable").length}
           networkReadyCount={snapshot.machines.filter((machine) => machine.rpcReady && machine.connectionStatus !== "unreachable").length}
           activityOpen={activityOpen}
@@ -396,19 +491,22 @@ export default function App() {
             || localNodeActivity.sharingActive
             || activeTransfers > 0
           }
+          onNavigate={setPage}
           onToggleActivity={() => setActivityOpen((open) => !open)}
         />
 
         {page === "chat" ? (
           <ChatPage
-            messages={messages}
+            messages={activeThread?.messages ?? []}
             prompt={prompt}
             setPrompt={setPrompt}
             runInference={runInference}
-            isRunning={isRunning}
+            isRunning={runningThreadId === activeThread?.id}
+            sendBlocked={isRunning || !chatHistoryReady}
             model={selectedModelView}
             isEstablishingConnection={isEstablishingConnection}
-            lastError={lastError}
+            lastError={activeThread ? threadErrors[activeThread.id] ?? lastError : lastError}
+            focusRequest={composerFocusRequest}
           />
         ) : null}
 
@@ -445,83 +543,173 @@ export default function App() {
 }
 
 function Sidebar({
-  page,
-  setPage,
+  threads,
+  activeThreadId,
+  chatIsVisible,
+  runningThreadId,
+  disabled,
+  persistenceError,
+  onCreateThread,
+  onOpenThread,
+  onDeleteThread,
 }: {
-  page: Page;
-  setPage: (page: Page) => void;
+  threads: ChatThread[];
+  activeThreadId: string;
+  chatIsVisible: boolean;
+  runningThreadId: string | null;
+  disabled: boolean;
+  persistenceError: string | null;
+  onCreateThread: () => Promise<void>;
+  onOpenThread: (threadId: string) => Promise<void>;
+  onDeleteThread: (threadId: string) => Promise<void>;
 }) {
+  const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (confirmingDeleteId && !threads.some((thread) => thread.id === confirmingDeleteId)) {
+      setConfirmingDeleteId(null);
+    }
+  }, [confirmingDeleteId, threads]);
+
   return (
-    <aside className="sidebar">
-      <div className="brand-block">
-        <svg
-          className="brand-logo"
-          viewBox="230 250 564 524"
-          role="img"
-          aria-label="Infernet"
-        >
-          <circle cx="512" cy="512" r="84" fill="currentColor" />
-          <circle cx="312" cy="332" r="62" fill="currentColor" />
-          <circle cx="712" cy="332" r="62" fill="currentColor" />
-          <circle cx="312" cy="692" r="62" fill="currentColor" />
-          <circle cx="712" cy="692" r="62" fill="currentColor" />
-          <path d="M366 360L458 478" stroke="currentColor" strokeWidth="44" strokeLinecap="round" />
-          <path d="M658 360L566 478" stroke="currentColor" strokeWidth="44" strokeLinecap="round" />
-          <path d="M366 664L458 546" stroke="currentColor" strokeWidth="44" strokeLinecap="round" />
-          <path d="M658 664L566 546" stroke="currentColor" strokeWidth="44" strokeLinecap="round" />
-          <path d="M374 332H650" stroke="currentColor" strokeWidth="38" strokeLinecap="round" />
-          <path d="M374 692H650" stroke="currentColor" strokeWidth="38" strokeLinecap="round" />
-        </svg>
+    <aside className="sidebar" aria-label="Chat history">
+      <div className="sidebar-brand">
+        <div className="brand-block">
+          <svg
+            className="brand-logo"
+            viewBox="230 250 564 524"
+            role="img"
+            aria-label="Infernet"
+          >
+            <circle cx="512" cy="512" r="84" fill="currentColor" />
+            <circle cx="312" cy="332" r="62" fill="currentColor" />
+            <circle cx="712" cy="332" r="62" fill="currentColor" />
+            <circle cx="312" cy="692" r="62" fill="currentColor" />
+            <circle cx="712" cy="692" r="62" fill="currentColor" />
+            <path d="M366 360L458 478" stroke="currentColor" strokeWidth="44" strokeLinecap="round" />
+            <path d="M658 360L566 478" stroke="currentColor" strokeWidth="44" strokeLinecap="round" />
+            <path d="M366 664L458 546" stroke="currentColor" strokeWidth="44" strokeLinecap="round" />
+            <path d="M658 664L566 546" stroke="currentColor" strokeWidth="44" strokeLinecap="round" />
+            <path d="M374 332H650" stroke="currentColor" strokeWidth="38" strokeLinecap="round" />
+            <path d="M374 692H650" stroke="currentColor" strokeWidth="38" strokeLinecap="round" />
+          </svg>
+        </div>
+        <strong>Infernet</strong>
       </div>
 
-      <nav className="nav-list" aria-label="Primary">
-        <NavButton icon={<MessageSquare size={18} />} label="Chat" active={page === "chat"} onClick={() => setPage("chat")} />
-        <NavButton icon={<Globe size={18} />} label="Network" active={page === "network"} onClick={() => setPage("network")} />
-        <NavButton icon={<Settings size={18} />} label="Settings" active={page === "settings"} onClick={() => setPage("settings")} />
+      <button
+        className="new-thread-button"
+        type="button"
+        aria-label="New chat"
+        title="New chat"
+        disabled={disabled}
+        onClick={() => void onCreateThread()}
+      >
+        <Plus size={17} />
+        <span>New chat</span>
+      </button>
+
+      <div className="thread-list-heading">Chats</div>
+      <nav className="thread-nav" aria-label="Chat threads" aria-busy={disabled}>
+        <ul className="thread-list">
+          {threads.map((thread) => {
+            const active = thread.id === activeThreadId;
+            const isRunning = thread.id === runningThreadId;
+            const confirmingDelete = thread.id === confirmingDeleteId;
+
+            return (
+              <li
+                className={active ? "thread-list-item active" : "thread-list-item"}
+                key={thread.id}
+              >
+                {confirmingDelete ? (
+                  <div className="thread-delete-confirm" role="group" aria-label={`Delete ${thread.title}?`}>
+                    <span>Delete this chat?</span>
+                    <div>
+                      <button
+                        type="button"
+                        className="thread-confirm-cancel"
+                        onClick={() => setConfirmingDeleteId(null)}
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="button"
+                        className="thread-confirm-delete"
+                        autoFocus
+                        onClick={async () => {
+                          await onDeleteThread(thread.id);
+                          setConfirmingDeleteId(null);
+                        }}
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      className="thread-select-button"
+                      disabled={disabled}
+                      aria-current={active && chatIsVisible ? "page" : undefined}
+                      onClick={() => void onOpenThread(thread.id)}
+                    >
+                      <span>{thread.title}</span>
+                      {isRunning ? (
+                        <i className="thread-running-indicator" aria-label="Generating response" />
+                      ) : null}
+                    </button>
+                    <button
+                      type="button"
+                      className="thread-delete-button"
+                      disabled={disabled || isRunning}
+                      aria-label={isRunning
+                        ? `Wait for ${thread.title} to finish before deleting`
+                        : `Delete ${thread.title}`}
+                      title={isRunning ? "This chat is still responding" : `Delete ${thread.title}`}
+                      onClick={() => setConfirmingDeleteId(thread.id)}
+                    >
+                      <Trash2 size={15} />
+                    </button>
+                  </>
+                )}
+              </li>
+            );
+          })}
+        </ul>
       </nav>
 
+      {persistenceError ? (
+        <p className="sidebar-storage-error" role="alert">{persistenceError}</p>
+      ) : null}
     </aside>
-  );
-}
-
-function NavButton({
-  icon,
-  label,
-  active,
-  onClick,
-}: {
-  icon: React.ReactNode;
-  label: string;
-  active: boolean;
-  onClick: () => void;
-}) {
-  return (
-    <button className={active ? "nav-button active" : "nav-button"} onClick={onClick} aria-label={label}>
-      {icon}
-      <span>{label}</span>
-    </button>
   );
 }
 
 function AppHeader({
   page,
+  chatTitle,
   networkNodeCount,
   networkReadyCount,
   activityOpen,
   hasActiveWork,
+  onNavigate,
   onToggleActivity,
 }: {
   page: Page;
+  chatTitle: string;
   networkNodeCount: number;
   networkReadyCount: number;
   activityOpen: boolean;
   hasActiveWork: boolean;
+  onNavigate: (page: Page) => void;
   onToggleActivity: () => void;
 }) {
   return (
     <header className="app-header">
       <div>
-        <h1>{pageTitle(page)}</h1>
+        <h1>{pageTitle(page, chatTitle)}</h1>
         {page === "network" ? (
           <div className="header-meta">
             <span>
@@ -534,6 +722,18 @@ function AppHeader({
       </div>
 
       <div className="header-actions">
+        <HeaderIconButton
+          icon={<Globe size={17} />}
+          label="Network"
+          active={page === "network"}
+          onClick={() => onNavigate("network")}
+        />
+        <HeaderIconButton
+          icon={<Settings size={17} />}
+          label="Settings"
+          active={page === "settings"}
+          onClick={() => onNavigate("settings")}
+        />
         <button
           className={activityOpen ? "activity-toggle active" : "activity-toggle"}
           aria-label="Activity"
@@ -550,24 +750,53 @@ function AppHeader({
   );
 }
 
+function HeaderIconButton({
+  icon,
+  label,
+  active,
+  onClick,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      className={active ? "header-icon-button active" : "header-icon-button"}
+      type="button"
+      aria-label={label}
+      aria-current={active ? "page" : undefined}
+      title={label}
+      onClick={onClick}
+    >
+      {icon}
+    </button>
+  );
+}
+
 function ChatPage({
   messages,
   prompt,
   setPrompt,
   runInference,
   isRunning,
+  sendBlocked,
   model,
   isEstablishingConnection,
   lastError,
+  focusRequest,
 }: {
-  messages: Message[];
+  messages: ChatMessage[];
   prompt: string;
   setPrompt: (prompt: string) => void;
   runInference: () => void;
   isRunning: boolean;
+  sendBlocked: boolean;
   model?: ModelView;
   isEstablishingConnection: boolean;
   lastError: string | null;
+  focusRequest: number;
 }) {
   const conversationRef = useRef<HTMLDivElement>(null);
   const composerInputRef = useRef<HTMLTextAreaElement>(null);
@@ -601,6 +830,12 @@ function ChatPage({
     return () => observer.disconnect();
   }, []);
 
+  useEffect(() => {
+    if (focusRequest > 0 && canSend) {
+      composerInputRef.current?.focus();
+    }
+  }, [canSend, focusRequest]);
+
   return (
     <section className="chat-screen">
       <div className={isEmpty ? "conversation empty" : "conversation"} ref={conversationRef}>
@@ -614,7 +849,11 @@ function ChatPage({
 
           {messages.map((message) => (
             <div key={message.id} className={`message-row ${message.role}`}>
-              <div className="message-bubble">{message.text}</div>
+              <div className="message-bubble">
+                {message.role === "assistant" ? (
+                  <MarkdownMessage text={message.text} />
+                ) : message.text}
+              </div>
             </div>
           ))}
 
@@ -669,7 +908,12 @@ function ChatPage({
             disabled={!canSend}
             aria-label="Message Infernet"
           />
-          <button className="send-button" onClick={runInference} disabled={isRunning || !prompt.trim() || !canSend}>
+          <button
+            className="send-button"
+            aria-label="Send message"
+            onClick={runInference}
+            disabled={sendBlocked || !prompt.trim() || !canSend}
+          >
             {isRunning ? <Activity size={18} /> : <Send size={18} />}
             <span>Send</span>
           </button>
@@ -695,6 +939,21 @@ function ThinkingIndicator() {
         <i aria-hidden="true" />
         <i aria-hidden="true" />
       </div>
+    </div>
+  );
+}
+
+function MarkdownMessage({ text }: { text: string }) {
+  return (
+    <div className="markdown-message">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={MARKDOWN_COMPONENTS}
+        skipHtml
+        disallowedElements={["img"]}
+      >
+        {text}
+      </ReactMarkdown>
     </div>
   );
 }
@@ -1929,8 +2188,8 @@ function transferStatus(stage: string): TransferStatus {
   return "active";
 }
 
-function pageTitle(page: Page): string {
-  if (page === "chat") return "Chat";
+function pageTitle(page: Page, chatTitle = "Chat"): string {
+  if (page === "chat") return chatTitle;
   if (page === "network") return "Network";
   if (page === "downloads") return "Downloads";
   return "Settings";

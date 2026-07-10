@@ -1,5 +1,6 @@
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
+import type { ChatHistory, ChatMessage } from "./chatHistory";
 import type {
   GridSnapshot,
   LocalIdentity,
@@ -41,6 +42,30 @@ export async function getLocalIdentity(): Promise<LocalIdentity> {
 
 export async function getLocalNodeActivity(): Promise<LocalNodeActivitySnapshot> {
   return invoke<LocalNodeActivitySnapshot>("get_local_node_activity");
+}
+
+export async function getChatHistory(): Promise<ChatHistory> {
+  return invoke<ChatHistory>("get_chat_history");
+}
+
+export async function createPersistentChatThread(): Promise<ChatHistory> {
+  return invoke<ChatHistory>("create_chat_thread");
+}
+
+export async function selectPersistentChatThread(threadId: string): Promise<ChatHistory> {
+  return invoke<ChatHistory>("select_chat_thread", { threadId });
+}
+
+export async function appendPersistentChatMessage(
+  threadId: string,
+  role: ChatMessage["role"],
+  text: string,
+): Promise<ChatHistory> {
+  return invoke<ChatHistory>("append_chat_message", { threadId, role, text });
+}
+
+export async function deletePersistentChatThread(threadId: string): Promise<ChatHistory> {
+  return invoke<ChatHistory>("delete_chat_thread", { threadId });
 }
 
 export async function getManualPeers(): Promise<string[]> {
