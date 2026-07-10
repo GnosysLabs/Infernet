@@ -1,11 +1,12 @@
-use infernet_model::{LayerRange, ShardDescriptor};
+use infernet_model::{LayerRange, SeedShardManifest, ShardDescriptor};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub const PROTOCOL_VERSION: u32 = 1;
-pub const ACTIVATION_PROTOCOL: &str = "/infernet/activation/1";
+pub const ACTIVATION_PROTOCOL: &str = "/infernet/activation/2";
 pub const MODEL_PROTOCOL: &str = "/infernet/model/1";
 pub const MODEL_BLOB_PROTOCOL: &str = "/infernet/model-blob/1";
+pub const LLAMA_RPC_TUNNEL_PROTOCOL: &str = "/infernet/llama-rpc-tunnel/1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelShardInfo {
@@ -77,6 +78,8 @@ pub struct ModelBlobResponse {
     pub source_checksum: String,
     pub offset: u64,
     pub total_size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_manifest: Option<SeedShardManifest>,
     pub payload: Vec<u8>,
     pub error: Option<String>,
 }
@@ -97,6 +100,7 @@ impl ModelBlobResponse {
             source_checksum: request.source_checksum.clone(),
             offset: request.offset,
             total_size_bytes,
+            seed_manifest: None,
             payload,
             error: None,
         }
@@ -116,6 +120,7 @@ impl ModelBlobResponse {
             source_checksum: request.source_checksum.clone(),
             offset: request.offset,
             total_size_bytes: 0,
+            seed_manifest: None,
             payload: Vec::new(),
             error: Some(error.into()),
         }
@@ -124,8 +129,13 @@ impl ModelBlobResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LlamaRpcEndpoint {
-    /// Host accepted by llama.cpp's `--rpc host:port` convention.
+    /// Process-local host accepted by llama.cpp's `--rpc host:port`
+    /// convention. It is deliberately never advertised over the network.
+    #[serde(default, skip_serializing)]
     pub host: String,
+    /// Process-local port. It is deliberately never advertised over the
+    /// network; strangers connect through the authenticated libp2p tunnel.
+    #[serde(default, skip_serializing)]
     pub port: u16,
     /// ggml RPC wire protocol implemented by the endpoint.
     pub rpc_protocol_version: String,
@@ -135,6 +145,10 @@ pub struct LlamaRpcEndpoint {
     pub backend: String,
     /// True only after the configured RPC backend has become reachable.
     pub ready: bool,
+    /// Authenticated stream protocol exposed by this worker. New launch nodes
+    /// must advertise this instead of a raw TCP endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel_protocol: Option<String>,
 }
 
 impl LlamaRpcEndpoint {
@@ -208,6 +222,11 @@ pub struct PromptMetadata {
     pub demo_mode: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rpc_endpoints: Vec<String>,
+    /// Exact authenticated worker identities selected for llama.cpp RPC.
+    /// The coordinator converts these to process-local loopback proxies; raw
+    /// worker host/port pairs never cross the network.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rpc_worker_peer_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -219,6 +238,10 @@ pub struct ActivationRequest {
     pub current_hop_index: usize,
     pub hidden_size: usize,
     pub sequence_position: u32,
+    /// The token sampled by the final worker on the previous pipeline pass.
+    /// `None` marks the initial prompt-prefill pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_token_id: Option<i32>,
     pub activation: Vec<f32>,
     pub prompt: Option<PromptMetadata>,
     pub trace: Vec<TraceEvent>,
@@ -240,6 +263,7 @@ impl ActivationRequest {
             current_hop_index: 0,
             hidden_size,
             sequence_position: 0,
+            input_token_id: None,
             activation,
             prompt,
             trace: Vec::new(),
@@ -266,6 +290,14 @@ pub struct ActivationResponse {
     pub timing_ms: u64,
     pub trace: Vec<TraceEvent>,
     pub output_text: Option<String>,
+    /// Token selected by the final layer worker. The client sends this token
+    /// back through the same route while every worker keeps its KV cache hot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampled_token_id: Option<i32>,
+    #[serde(default)]
+    pub generation_complete: bool,
+    #[serde(default)]
+    pub next_sequence_position: u32,
     pub error: Option<String>,
 }
 
@@ -362,6 +394,9 @@ impl ActivationResponse {
             timing_ms,
             trace: request.trace,
             output_text,
+            sampled_token_id: None,
+            generation_complete: false,
+            next_sequence_position: 0,
             error: None,
         }
     }
@@ -382,6 +417,9 @@ impl ActivationResponse {
             timing_ms: 0,
             trace,
             output_text: None,
+            sampled_token_id: None,
+            generation_complete: false,
+            next_sequence_position: 0,
             error: Some(error.into()),
         }
     }
@@ -407,6 +445,7 @@ mod tests {
                 prompt: "hello infernet".to_owned(),
                 demo_mode: true,
                 rpc_endpoints: vec!["192.0.2.10:50052".to_owned()],
+                rpc_worker_peer_ids: Vec::new(),
             }),
         );
         request.trace.push(TraceEvent {
@@ -429,7 +468,7 @@ mod tests {
 
         assert_eq!(decoded_response, response);
         assert_eq!(decoded_response.protocol_version, PROTOCOL_VERSION);
-        assert_eq!(ACTIVATION_PROTOCOL, "/infernet/activation/1");
+        assert_eq!(ACTIVATION_PROTOCOL, "/infernet/activation/2");
     }
 
     #[test]
@@ -505,6 +544,7 @@ mod tests {
                 runtime_abi: "infernet-llama-rpc-v1".to_owned(),
                 backend: "cuda".to_owned(),
                 ready: true,
+                tunnel_protocol: Some(LLAMA_RPC_TUNNEL_PROTOCOL.to_owned()),
             }),
         };
         let advertisement = NodeAdvertisement {
@@ -520,16 +560,27 @@ mod tests {
         };
 
         let bytes = serde_json::to_vec(&advertisement).unwrap();
+        let encoded: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let advertised_rpc = &encoded["capabilities"]["llama_rpc"];
+        assert!(advertised_rpc.get("host").is_none());
+        assert!(advertised_rpc.get("port").is_none());
         let decoded: NodeAdvertisement = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(decoded, advertisement);
+        let mut expected = advertisement.clone();
+        let expected_rpc = expected
+            .capabilities
+            .as_mut()
+            .and_then(|capabilities| capabilities.llama_rpc.as_mut())
+            .unwrap();
+        expected_rpc.host.clear();
+        expected_rpc.port = 0;
+        assert_eq!(decoded, expected);
         assert_eq!(
             decoded
                 .capabilities
                 .as_ref()
                 .and_then(|capabilities| capabilities.llama_rpc.as_ref())
-                .map(LlamaRpcEndpoint::llama_cpp_endpoint)
-                .as_deref(),
-            Some("192.0.2.10:50052")
+                .and_then(|endpoint| endpoint.tunnel_protocol.as_deref()),
+            Some(LLAMA_RPC_TUNNEL_PROTOCOL)
         );
 
         let mut without_capabilities = advertisement;
@@ -563,8 +614,10 @@ mod tests {
         let prompt_json = r#"{"prompt":"hello","demo_mode":false}"#;
         let prompt: PromptMetadata = serde_json::from_str(prompt_json).unwrap();
         assert!(prompt.rpc_endpoints.is_empty());
+        assert!(prompt.rpc_worker_peer_ids.is_empty());
 
         let value = serde_json::to_value(prompt).unwrap();
         assert!(value.get("rpc_endpoints").is_none());
+        assert!(value.get("rpc_worker_peer_ids").is_none());
     }
 }

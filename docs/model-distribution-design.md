@@ -9,7 +9,7 @@ Infernet now has three separate protocol families:
 - Peer discovery: mDNS plus shard advertisements over gossipsub.
 - Model distribution metadata: `/infernet/model/1`.
 - Model source transfer: `/infernet/model-blob/1`.
-- Distributed inference: `/infernet/activation/1`.
+- Distributed inference: `/infernet/activation/2`.
 
 Model transfer is independent from activation forwarding. Inference must not
 assume required model shards are already local. A node can discover, download,

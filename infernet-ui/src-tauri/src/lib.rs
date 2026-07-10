@@ -1,4 +1,5 @@
 mod execution_plan;
+mod peer_presence;
 
 #[cfg(test)]
 use std::path::Path;
@@ -11,32 +12,39 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use execution_plan::{ExecutionParticipantView, plan_rpc_execution, rpc_endpoint_is_usable};
-use futures::channel::oneshot;
+use execution_plan::{ExecutionParticipantView, plan_worker_execution, worker_is_usable};
+use futures::{StreamExt, channel::oneshot};
 use infernet_model::{
     LayerRange, ModelManifest, OfficialComponentKind, OfficialModelRelease, RuntimeKind,
     SeedShardManifest, ShardDescriptor,
 };
 use infernet_node::{
     DiscoveryConfig, INFERNET_LLAMA_RPC_RUNTIME_ABI, LLAMA_RPC_DEFAULT_PORT,
-    LLAMA_RPC_PROTOCOL_VERSION, LlamaRpcServer, LlamaRpcServerConfig, PAYLOAD_KIND_FULL_MODEL,
-    PAYLOAD_KIND_GGUF_SHARD, PAYLOAD_KIND_INFERNET_SHARD, ShardCache, ShardCacheConfig,
-    clear_local_llama_rpc_endpoint, detect_node_capabilities, discover_for, empty_advertisement,
-    enrich_local_advertisement, fetch_model_shard_over_libp2p, find_llama_rpc_server_binary,
-    infer_over_libp2p, is_executable_shard_record, local_capability_advertisement,
-    run_model_distribution_node_with_readiness, seed_manifest_for_network,
-    set_local_inference_active, set_local_llama_rpc_endpoint, set_local_rpc_active,
-    spawn_llama_rpc_server, stop_persistent_llama_server,
+    LLAMA_RPC_PROTOCOL_VERSION, LlamaRpcServer, LlamaRpcServerConfig, LocalNodeActivityEntry,
+    LocalNodeActivityTask, PAYLOAD_KIND_FULL_MODEL, PAYLOAD_KIND_GGUF_SHARD,
+    PAYLOAD_KIND_INFERNET_SHARD, ShardCache, ShardCacheConfig, clear_local_llama_rpc_endpoint,
+    detect_node_capabilities, empty_advertisement, enrich_local_advertisement,
+    fetch_model_shard_over_libp2p_with_progress, find_llama_rpc_server_binary,
+    import_seed_model_from_file_consuming_verified, infer_over_libp2p, is_executable_shard_record,
+    load_or_generate_keypair, local_capability_advertisement, local_node_activity_snapshot,
+    model_serving_telemetry, run_model_distribution_node_with_readiness_and_registry,
+    seed_manifest_for_network, set_local_inference_active, set_local_llama_rpc_endpoint,
+    set_local_rpc_active, sha256_file, spawn_llama_rpc_server, stop_persistent_llama_server,
+    stop_persistent_rpc_tunnels,
 };
 use infernet_protocol::{
-    LlamaRpcEndpoint, ModelShardInfo, NodeAdvertisement, PROTOCOL_VERSION, RouteHop, TraceEvent,
+    LLAMA_RPC_TUNNEL_PROTOCOL, LlamaRpcEndpoint, ModelShardInfo, NodeAdvertisement,
+    PROTOCOL_VERSION, RouteHop, TraceEvent,
 };
 use infernet_router::{
     CapacityPlanningConfig, FixedModelComponent, ShardRegistry, plan_fixed_components,
 };
-use libp2p::{Multiaddr, PeerId, identity};
+use libp2p::{Multiaddr, PeerId, identity, multiaddr::Protocol};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
+use tokio::io::AsyncWriteExt;
+
+use peer_presence::{ConnectionStatus, PeerPresence, PresenceRecord, PresenceSnapshot};
 
 const DEFAULT_TOPIC: &str = "infernet/grid-demo/1";
 const DEFAULT_DISCOVERY_TIMEOUT_MS: u64 = 4_000;
@@ -47,6 +55,10 @@ const OFFICIAL_CHAT_MODEL_ID: &str = "infernet-chat-v1";
 const LAUNCH_KV_CACHE_BYTES_PER_LAYER: u64 = 32 * 1024 * 1024;
 const RUNTIME_SCRATCH_BYTES_PER_PEER: u64 = 768 * 1024 * 1024;
 const CAPACITY_SAFETY_BYTES: u64 = 1024 * 1024 * 1024;
+// The transport delivers 4 MiB chunks. Forward every completed chunk so the
+// desktop progress bar reflects the live transfer instead of appearing frozen
+// until another 64 MiB has accumulated.
+const MODEL_PROGRESS_EMIT_BYTES: u64 = 4 * 1024 * 1024;
 const DEFAULT_BOOTSTRAP_PEERS: &[&str] = &[
     "12D3KooWRJrnpHPQTWdThpDGZMwRCHhEBL4JCAxFMwYMfFavxa2h@/ip4/217.77.11.197/tcp/9777/p2p/12D3KooWRJrnpHPQTWdThpDGZMwRCHhEBL4JCAxFMwYMfFavxa2h",
     "12D3KooWRJrnpHPQTWdThpDGZMwRCHhEBL4JCAxFMwYMfFavxa2h@/dns4/infernet.gnosyslabs.xyz/tcp/9777/p2p/12D3KooWRJrnpHPQTWdThpDGZMwRCHhEBL4JCAxFMwYMfFavxa2h",
@@ -78,11 +90,12 @@ struct UiState {
     keypair: Mutex<identity::Keypair>,
     topic: String,
     model_distribution_service: Arc<Mutex<ModelDistributionServiceState>>,
+    live_registry: Arc<Mutex<ShardRegistry>>,
     llama_rpc_service: Arc<Mutex<LlamaRpcServiceState>>,
     active_model_acquisitions: Arc<Mutex<BTreeSet<String>>>,
     manual_peers: Mutex<Vec<NodeAdvertisement>>,
-    last_registry: Mutex<Option<ShardRegistry>>,
-    execution_plan: Mutex<Option<execution_plan::RpcExecutionPlan>>,
+    peer_presence: Mutex<PeerPresence>,
+    execution_plan: Mutex<Option<execution_plan::WorkerExecutionPlan>>,
 }
 
 impl Default for UiState {
@@ -93,10 +106,11 @@ impl Default for UiState {
             model_distribution_service: Arc::new(Mutex::new(
                 ModelDistributionServiceState::Stopped,
             )),
+            live_registry: Arc::new(Mutex::new(ShardRegistry::new())),
             llama_rpc_service: Arc::new(Mutex::new(LlamaRpcServiceState::Stopped)),
             active_model_acquisitions: Arc::new(Mutex::new(BTreeSet::new())),
             manual_peers: Mutex::new(Vec::new()),
-            last_registry: Mutex::new(None),
+            peer_presence: Mutex::new(PeerPresence::default()),
             execution_plan: Mutex::new(None),
         }
     }
@@ -109,6 +123,23 @@ struct LocalIdentity {
     topic: String,
     listen: String,
     connect_addresses: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalNodeActivityView {
+    compute_active: bool,
+    compute_ready: bool,
+    compute_backend: String,
+    device_name: String,
+    total_memory_bytes: u64,
+    available_memory_bytes: u64,
+    sharing_active: bool,
+    bytes_served: u64,
+    chunks_served: u64,
+    last_served_unix_ms: Option<u64>,
+    current: Vec<LocalNodeActivityTask>,
+    journal: Vec<LocalNodeActivityEntry>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -157,7 +188,11 @@ struct PeerView {
 struct MachineView {
     peer_id: String,
     short_peer_id: String,
+    addresses: Vec<String>,
+    machine_id: Option<String>,
     is_local: bool,
+    connection_status: ConnectionStatus,
+    last_seen_seconds: u64,
     compute_backend: String,
     device_name: String,
     logical_cpu_cores: u32,
@@ -231,6 +266,9 @@ struct DistributionSnapshot {
     max_storage_bytes: u64,
     current_uploads: usize,
     current_downloads: usize,
+    bytes_served: u64,
+    chunks_served: u64,
+    last_served_unix_ms: Option<u64>,
     replication_health: Vec<ReplicationHealthView>,
 }
 
@@ -308,6 +346,48 @@ async fn get_local_identity(state: State<'_, UiState>) -> Result<LocalIdentity, 
 }
 
 #[tauri::command]
+fn get_local_node_activity() -> LocalNodeActivityView {
+    let capabilities = detect_node_capabilities();
+    let use_accelerator_memory =
+        capabilities.compute_backend != "cpu" && capabilities.total_accelerator_memory_bytes > 0;
+    let (total_memory_bytes, available_memory_bytes) = if use_accelerator_memory {
+        (
+            capabilities.total_accelerator_memory_bytes,
+            capabilities.available_accelerator_memory_bytes,
+        )
+    } else {
+        (
+            capabilities.total_ram_bytes,
+            capabilities.available_ram_bytes,
+        )
+    };
+    let compute_ready = capabilities
+        .llama_rpc
+        .as_ref()
+        .is_some_and(|endpoint| endpoint.ready);
+    let serving = model_serving_telemetry();
+    let sharing_active = serving
+        .last_activity_unix_ms
+        .is_some_and(|last| current_unix_ms_u64().saturating_sub(last) <= 5_000);
+    let activity = local_node_activity_snapshot();
+
+    LocalNodeActivityView {
+        compute_active: capabilities.active_sessions > 0,
+        compute_ready,
+        compute_backend: capabilities.compute_backend,
+        device_name: capabilities.device_name,
+        total_memory_bytes,
+        available_memory_bytes,
+        sharing_active,
+        bytes_served: serving.bytes_served,
+        chunks_served: serving.chunks_served,
+        last_served_unix_ms: serving.last_activity_unix_ms,
+        current: activity.current,
+        journal: activity.journal,
+    }
+}
+
+#[tauri::command]
 fn get_manual_peers(state: State<'_, UiState>) -> Result<Vec<String>, String> {
     manual_peer_addresses(&state)
 }
@@ -362,18 +442,56 @@ async fn install_official_model(
 ) -> Result<GridSnapshot, String> {
     let cache_config = cache_config_for_app(&app);
     ensure_model_distribution_service(&state, cache_config.clone()).await?;
-    let (registry, _, _) =
+    let (registry, _, _, _) =
         discover_registry(&app, &state, &cache_config, DEFAULT_DISCOVERY_TIMEOUT_MS).await?;
     let manifest = manifest_for_model(Some(&model_id), &cache_config, Some(&registry))
         .map_err(|error| error.to_string())?;
-    if advertised_model_record_plan(&registry, &manifest.model_id).is_empty() {
-        return Err(
-            "The verified Infernet Chat release is not being seeded by an online machine yet."
-                .to_owned(),
+    if let Err(https_error) =
+        acquire_official_model_over_https(&app, &cache_config, &manifest).await
+    {
+        eprintln!("official HTTPS model acquisition failed: {https_error}");
+        let p2p_plan = advertised_model_record_plan(&registry, &manifest.model_id);
+        if p2p_plan.is_empty() {
+            emit_model_import_progress(
+                &app,
+                &manifest.model_id,
+                "Download failed",
+                format!("HTTPS failed and no P2P seed is online: {https_error}"),
+                0,
+                None,
+            );
+            return Err(format!(
+                "The official model download failed, and no P2P seed is online: {https_error}"
+            ));
+        }
+        let release = OfficialModelRelease::infernet_chat_v1_compatibility();
+        let full_layers =
+            LayerRange::new(0, manifest.layer_count).map_err(|error| error.to_string())?;
+        let (_, total_bytes) = release
+            .components
+            .iter()
+            .find(|component| component.layers == Some(full_layers))
+            .map(|component| (component.sha256.as_str(), component.size_bytes))
+            .ok_or_else(|| "official release has no downloadable component".to_owned())?;
+        let (partial_path, _) =
+            official_release_download_paths(&cache_config, &release, full_layers);
+        let downloaded_bytes = std::fs::metadata(partial_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        emit_model_import_progress(
+            &app,
+            &manifest.model_id,
+            "Downloading shard",
+            format!(
+                "layers {}:{} · P2P fallback",
+                full_layers.start, full_layers.end
+            ),
+            downloaded_bytes,
+            Some(total_bytes),
         );
+        acquire_advertised_model_records(&app, &state, &cache_config, &manifest, &registry, true)
+            .await?;
     }
-    acquire_advertised_model_records(&app, &state, &cache_config, &manifest, &registry, true)
-        .await?;
     collect_snapshot(
         &app,
         &state,
@@ -392,7 +510,8 @@ async fn run_demo_inference(
 ) -> Result<RunDemoResponse, String> {
     let cache_config = cache_config_for_app(&app);
     ensure_model_distribution_service(&state, cache_config.clone()).await?;
-    let (registry, _, _) =
+    ensure_llama_rpc_service(&state, &cache_config).await?;
+    let (registry, _, _, _) =
         discover_registry(&app, &state, &cache_config, DEFAULT_DISCOVERY_TIMEOUT_MS).await?;
     let manifest = manifest_for_model(model_id.as_deref(), &cache_config, Some(&registry))
         .map_err(|error| error.to_string())?;
@@ -419,10 +538,7 @@ async fn run_demo_inference(
         return Err(message);
     }
 
-    let execution_route = registry
-        .route_for_model(&manifest)
-        .map_err(|error| error.to_string())?;
-    let rpc_plan = match leased_rpc_execution_plan(&state, &registry, &execution_route, &manifest) {
+    let worker_plan = match leased_worker_execution_plan(&state, &registry, &manifest) {
         Ok(plan) => plan,
         Err(message) => {
             emit_progress(
@@ -438,20 +554,17 @@ async fn run_demo_inference(
     emit_progress(
         &app,
         ProgressEvent::RouteDiscovered {
-            route: snapshot.route.clone(),
+            route: worker_plan.route.iter().map(route_hop_view).collect(),
         },
     );
     emit_progress(
         &app,
         ProgressEvent::ExecutionPlan {
-            participants: rpc_plan.participants.clone(),
+            participants: worker_plan.participants.clone(),
         },
     );
 
     let (mut config, local_peer_id) = discovery_config_from_state(&state)?;
-    config
-        .set_trusted_rpc_endpoints(rpc_plan.endpoints)
-        .map_err(|error| error.to_string())?;
     config.keypair = identity::Keypair::generate_ed25519();
     let mut local_advertisement = registry
         .advertisements()
@@ -461,7 +574,7 @@ async fn run_demo_inference(
     local_advertisement.addresses = local_connect_addresses(&local_peer_id);
     config.static_peers.push(local_advertisement);
     merge_static_peer_advertisements(&mut config.static_peers, registry.advertisements());
-    config.set_planned_route(execution_route);
+    config.set_planned_route(worker_plan.route.clone());
     let hidden_size = manifest.hidden_size;
     let result = match infer_over_libp2p(
         config,
@@ -523,22 +636,21 @@ async fn run_demo_inference(
     })
 }
 
-fn leased_rpc_execution_plan(
+fn leased_worker_execution_plan(
     state: &State<'_, UiState>,
     registry: &ShardRegistry,
-    route: &[RouteHop],
     manifest: &ModelManifest,
-) -> Result<execution_plan::RpcExecutionPlan, String> {
+) -> Result<execution_plan::WorkerExecutionPlan, String> {
     let mut lease = state
         .execution_plan
         .lock()
         .map_err(|_| "failed to lock distributed execution plan".to_owned())?;
     if let Some(plan) = lease.as_ref() {
-        if plan.remains_usable(registry, route) {
+        if plan.remains_usable(registry, manifest) {
             return Ok(plan.clone());
         }
     }
-    let plan = plan_rpc_execution(registry, route, manifest)?;
+    let plan = plan_worker_execution(registry, manifest)?;
     *lease = Some(plan.clone());
     Ok(plan)
 }
@@ -550,7 +662,7 @@ async fn collect_snapshot(
     model_id: Option<&str>,
 ) -> Result<GridSnapshot, String> {
     let cache_config = cache_config_for_app(app);
-    let (registry, local_peer_id, topic) =
+    let (registry, local_peer_id, topic, presence) =
         discover_registry(app, state, &cache_config, discovery_timeout_ms).await?;
     let manifest = match manifest_for_model(model_id, &cache_config, Some(&registry)) {
         Ok(manifest) => manifest,
@@ -561,6 +673,7 @@ async fn collect_snapshot(
                     topic,
                     &cache_config,
                     &registry,
+                    &presence,
                 ));
             }
             return Err(error.to_string());
@@ -574,6 +687,7 @@ async fn collect_snapshot(
         &manifest,
         &registry,
         &cache_config,
+        &presence,
     ))
 }
 
@@ -581,54 +695,52 @@ async fn discover_registry(
     _app: &AppHandle,
     state: &State<'_, UiState>,
     cache_config: &ShardCacheConfig,
-    discovery_timeout_ms: u64,
-) -> Result<(ShardRegistry, String, String), String> {
-    let (mut config, local_peer_id) = discovery_config_from_state(state)?;
-    let topic = config.topic.clone();
-    config.advertisement = Some(local_node_advertisement(
+    _discovery_timeout_ms: u64,
+) -> Result<(ShardRegistry, String, String, PresenceSnapshot), String> {
+    let (local_peer_id, topic) = identity_from_state(state)?;
+    let mut registry = state
+        .live_registry
+        .lock()
+        .map_err(|_| "failed to lock live peer registry".to_owned())?
+        .clone();
+    registry.upsert(local_node_advertisement(
         cache_config,
         local_peer_id.clone(),
     ));
-    let mut registry = discover_for(config, Duration::from_millis(discovery_timeout_ms))
-        .await
-        .map_err(|error| error.to_string())?;
-    let fresh_peer_ids = registry
+    let fresh_registry = trusted_launch_registry(registry, &local_peer_id);
+    // Static bootstrap/manual descriptors are inserted before discovery, so
+    // their mere presence is not proof that a machine is online. Only a
+    // current capability or executable model report refreshes last-seen.
+    let observed_advertisements = fresh_registry
         .advertisements()
         .into_iter()
-        .map(|advertisement| advertisement.peer_id)
-        .collect::<BTreeSet<_>>();
-    if let Ok(last_registry) = state.last_registry.lock() {
-        if let Some(last_registry) = last_registry.as_ref() {
-            for mut previous in last_registry.advertisements() {
-                if fresh_peer_ids.contains(&previous.peer_id) {
-                    // Preserve cached component availability without replacing a
-                    // fresh machine report with old memory/load telemetry.
-                    previous.available_ram_bytes = None;
-                    previous.available_vram_bytes = None;
-                    previous.latency_hint_ms = None;
-                    previous.capabilities = None;
-                    registry.merge(previous);
-                }
-            }
-        }
-    }
-    registry = trusted_launch_registry(registry);
-    if let Ok(mut last_registry) = state.last_registry.lock() {
-        if registry
-            .advertisements()
-            .iter()
-            .any(advertisement_has_capacity)
-        {
-            *last_registry = Some(registry.clone());
-        }
-    }
+        .filter(advertisement_has_capacity)
+        .collect::<Vec<_>>();
+    let presence = state
+        .peer_presence
+        .lock()
+        .map_err(|_| "failed to lock peer presence state".to_owned())?
+        .observe(observed_advertisements);
+    let mut routable_registry = ShardRegistry::new();
+    routable_registry.extend(presence.routable_advertisements());
 
-    Ok((registry, local_peer_id, topic))
+    Ok((routable_registry, local_peer_id, topic, presence))
 }
 
-fn trusted_launch_registry(registry: ShardRegistry) -> ShardRegistry {
+fn trusted_launch_registry(registry: ShardRegistry, local_peer_id: &str) -> ShardRegistry {
     let mut trusted = ShardRegistry::new();
     for mut advertisement in registry.advertisements() {
+        if advertisement.peer_id != local_peer_id {
+            advertisement
+                .addresses
+                .retain(|address| remote_route_address_is_usable(address));
+            advertisement.addresses.sort_by_key(|address| {
+                let is_tcp_circuit = address.contains("/tcp/") && address.contains("/p2p-circuit/");
+                let is_circuit = address.contains("/p2p-circuit/");
+                (!is_tcp_circuit, !is_circuit, address.clone())
+            });
+            advertisement.addresses.dedup();
+        }
         let trusted_records = advertisement
             .model_shards
             .iter()
@@ -663,6 +775,284 @@ fn trusted_launch_registry(registry: ShardRegistry) -> ShardRegistry {
         trusted.upsert(advertisement);
     }
     trusted
+}
+
+fn remote_route_address_is_usable(address: &str) -> bool {
+    let Ok(address) = address.parse::<Multiaddr>() else {
+        return false;
+    };
+    !address.iter().any(|protocol| match protocol {
+        Protocol::Ip4(host) => host.is_loopback() || host.is_unspecified(),
+        Protocol::Ip6(host) => host.is_loopback() || host.is_unspecified(),
+        _ => false,
+    })
+}
+
+fn official_release_download_url(release: &OfficialModelRelease) -> String {
+    format!(
+        "https://huggingface.co/{}/resolve/{}/{}",
+        release.upstream.repository, release.upstream.revision, release.upstream.artifact
+    )
+}
+
+fn official_release_download_paths(
+    cache_config: &ShardCacheConfig,
+    release: &OfficialModelRelease,
+    layers: LayerRange,
+) -> (PathBuf, PathBuf) {
+    let checksum_prefix =
+        &release.upstream.source_sha256[..release.upstream.source_sha256.len().min(16)];
+    let base = format!(
+        "{}-{}-{}-{}",
+        sanitize_download_path_segment(&release.model_id),
+        layers.start,
+        layers.end,
+        checksum_prefix
+    );
+    let temp_dir = cache_config.root.join("tmp");
+    (
+        temp_dir.join(format!("{base}.gguf.partial")),
+        temp_dir.join(format!("{base}.gguf")),
+    )
+}
+
+fn sanitize_download_path_segment(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric()
+                || character == '-'
+                || character == '_'
+                || character == '.'
+            {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn content_range_start(value: &str) -> Option<u64> {
+    value
+        .strip_prefix("bytes ")?
+        .split_once('-')?
+        .0
+        .parse()
+        .ok()
+}
+
+async fn acquire_official_model_over_https(
+    app: &AppHandle,
+    cache_config: &ShardCacheConfig,
+    manifest: &ModelManifest,
+) -> anyhow::Result<()> {
+    let release = OfficialModelRelease::infernet_chat_v1_compatibility();
+    release.validate_for_model(manifest)?;
+    let full_layers = LayerRange::new(0, manifest.layer_count)?;
+    let component = release
+        .components
+        .iter()
+        .find(|component| {
+            component.kind == OfficialComponentKind::Transformer
+                && component.layers == Some(full_layers)
+        })
+        .ok_or_else(|| anyhow::anyhow!("official release has no full-model component"))?;
+    let cache = ShardCache::new(cache_config.clone())?;
+    if cache
+        .find(
+            &manifest.model_id,
+            full_layers,
+            Some(&component.sha256),
+            Some(&release.version),
+        )?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    let (partial_path, completed_path) =
+        official_release_download_paths(cache_config, &release, full_layers);
+    let temp_dir = partial_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("official download has no temporary directory"))?;
+    tokio::fs::create_dir_all(temp_dir).await?;
+
+    if tokio::fs::metadata(&completed_path)
+        .await
+        .is_ok_and(|metadata| metadata.len() != component.size_bytes)
+    {
+        tokio::fs::remove_file(&completed_path).await?;
+    }
+
+    let mut downloaded_bytes = tokio::fs::metadata(&completed_path)
+        .await
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    if downloaded_bytes == 0 {
+        downloaded_bytes = tokio::fs::metadata(&partial_path)
+            .await
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+    }
+    if downloaded_bytes > component.size_bytes {
+        tokio::fs::remove_file(&partial_path).await?;
+        downloaded_bytes = 0;
+    }
+
+    let progress_detail = format!(
+        "layers {}:{} · Hugging Face",
+        full_layers.start, full_layers.end
+    );
+    emit_model_import_progress(
+        app,
+        &manifest.model_id,
+        "Downloading shard",
+        progress_detail.clone(),
+        downloaded_bytes,
+        Some(component.size_bytes),
+    );
+
+    if downloaded_bytes < component.size_bytes {
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(20))
+            .user_agent(concat!("infernet/", env!("CARGO_PKG_VERSION")))
+            .build()?;
+        let mut request = client.get(official_release_download_url(&release));
+        if downloaded_bytes > 0 {
+            request = request.header(reqwest::header::RANGE, format!("bytes={downloaded_bytes}-"));
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE
+            && downloaded_bytes == component.size_bytes
+        {
+            // The partial file completed before the previous process exited.
+        } else if !status.is_success() {
+            return Err(anyhow::anyhow!(
+                "Hugging Face returned HTTP {}",
+                status.as_u16()
+            ));
+        } else {
+            let append = downloaded_bytes > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT;
+            if append {
+                let range_start = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_RANGE)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(content_range_start);
+                if range_start != Some(downloaded_bytes) {
+                    return Err(anyhow::anyhow!(
+                        "Hugging Face returned an invalid resume range"
+                    ));
+                }
+            } else if downloaded_bytes > 0 {
+                // The origin ignored Range. Restart safely instead of appending
+                // a complete response to the existing partial file.
+                downloaded_bytes = 0;
+            }
+
+            let mut options = tokio::fs::OpenOptions::new();
+            options.create(true).write(true);
+            if append {
+                options.append(true);
+            } else {
+                options.truncate(true);
+            }
+            let mut file = options.open(&partial_path).await?;
+            let mut stream = response.bytes_stream();
+            let mut last_progress_emit = downloaded_bytes;
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                let next_downloaded = downloaded_bytes
+                    .checked_add(chunk.len() as u64)
+                    .ok_or_else(|| anyhow::anyhow!("official model download size overflow"))?;
+                if next_downloaded > component.size_bytes {
+                    return Err(anyhow::anyhow!(
+                        "Hugging Face download exceeded the pinned model size"
+                    ));
+                }
+                file.write_all(&chunk).await?;
+                downloaded_bytes = next_downloaded;
+                if downloaded_bytes == component.size_bytes
+                    || downloaded_bytes.saturating_sub(last_progress_emit)
+                        >= MODEL_PROGRESS_EMIT_BYTES
+                {
+                    emit_model_import_progress(
+                        app,
+                        &manifest.model_id,
+                        "Downloading shard",
+                        progress_detail.clone(),
+                        downloaded_bytes,
+                        Some(component.size_bytes),
+                    );
+                    last_progress_emit = downloaded_bytes;
+                }
+            }
+            file.flush().await?;
+        }
+    }
+
+    if downloaded_bytes != component.size_bytes {
+        return Err(anyhow::anyhow!(
+            "Hugging Face download ended at {} of {} bytes",
+            downloaded_bytes,
+            component.size_bytes
+        ));
+    }
+
+    if !tokio::fs::try_exists(&completed_path).await? {
+        tokio::fs::rename(&partial_path, &completed_path).await?;
+    }
+    emit_model_import_progress(
+        app,
+        &manifest.model_id,
+        "Verifying download",
+        "Checking the official model checksum",
+        component.size_bytes,
+        Some(component.size_bytes),
+    );
+
+    let checksum_path = completed_path.clone();
+    let actual_checksum =
+        tokio::task::spawn_blocking(move || sha256_file(&checksum_path)).await??;
+    if actual_checksum != component.sha256 {
+        let _ = tokio::fs::remove_file(&completed_path).await;
+        return Err(anyhow::anyhow!(
+            "official model checksum mismatch; expected {}, got {}",
+            component.sha256,
+            actual_checksum
+        ));
+    }
+
+    let import_cache_config = cache_config.clone();
+    let import_manifest = manifest.clone();
+    let import_version = release.version.clone();
+    let import_checksum = actual_checksum.clone();
+    tokio::task::spawn_blocking(move || {
+        let cache = ShardCache::new(import_cache_config)?;
+        import_seed_model_from_file_consuming_verified(
+            &cache,
+            &completed_path,
+            &import_manifest,
+            import_version,
+            import_checksum,
+        )
+    })
+    .await??;
+
+    emit_model_import_progress(
+        app,
+        &manifest.model_id,
+        "Shard ready",
+        format!(
+            "layers {}:{} · verified HTTPS",
+            full_layers.start, full_layers.end
+        ),
+        component.size_bytes,
+        Some(component.size_bytes),
+    );
+    Ok(())
 }
 
 async fn acquire_advertised_model_records(
@@ -740,7 +1130,22 @@ async fn acquire_advertised_model_records(
         );
         let (mut config, _) = discovery_config_from_state(state)?;
         config.static_peers = static_peers.clone();
-        fetch_model_shard_over_libp2p(
+        remove_relay_servers_from_download_targets(&mut config);
+        prefer_tcp_circuit_addresses_for_downloads(&mut config);
+        // The persistent desktop node already owns the machine's stable
+        // relay reservation. A one-shot download using the same PeerId creates
+        // a competing reservation and can wait forever for readiness. Give
+        // each transfer swarm its own short-lived authenticated identity.
+        config.keypair = identity::Keypair::generate_ed25519();
+        config.advertisement = None;
+        let progress_app = app.clone();
+        let progress_model_id = manifest.model_id.clone();
+        let progress_detail = format!(
+            "layers {}:{}",
+            record.info.layers.start, record.info.layers.end
+        );
+        let mut last_progress_emit = 0_u64;
+        fetch_model_shard_over_libp2p_with_progress(
             config,
             cache_config.clone(),
             manifest.model_id.clone(),
@@ -748,6 +1153,22 @@ async fn acquire_advertised_model_records(
             Some(record.info.checksum.clone()),
             Some(record.info.version.clone()),
             Duration::from_millis(model_shard_fetch_timeout_ms(record.info.size_bytes)),
+            move |downloaded, total| {
+                if downloaded == total
+                    || downloaded == 0
+                    || downloaded.saturating_sub(last_progress_emit) >= MODEL_PROGRESS_EMIT_BYTES
+                {
+                    emit_model_import_progress(
+                        &progress_app,
+                        &progress_model_id,
+                        "Downloading shard",
+                        progress_detail.clone(),
+                        downloaded,
+                        Some(total),
+                    );
+                    last_progress_emit = downloaded;
+                }
+            },
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -783,16 +1204,6 @@ fn spawn_background_model_record_acquisition(
     if plan.is_empty() {
         return Ok(());
     }
-    if plan.len() == 1
-        && plan[0].info.layers.start == 0
-        && plan[0].info.layers.end == manifest.layer_count
-    {
-        // A compatibility package is the entire model, not a small shard.
-        // Never start a multi-gigabyte download merely because a snapshot was
-        // viewed; foreground inference remains the explicit acquisition path.
-        return Ok(());
-    }
-
     let missing_ranges = missing_ranges_from_layer_ranges(
         manifest.layer_count,
         plan.iter().map(|record| record.info.layers),
@@ -802,14 +1213,25 @@ fn spawn_background_model_record_acquisition(
     }
 
     let local_peer_id = identity_from_state(state)?.0;
-    let plan = model_records_to_download_for_local_contribution(
+    let plan = match model_records_to_download_for_local_contribution(
         &cache,
         &manifest.model_id,
         &local_peer_id,
         &registry.advertisements(),
         plan,
-    )
-    .map_err(|error| error.to_string())?;
+    ) {
+        Ok(plan) => plan,
+        Err(error) => {
+            // Capacity can legitimately be incomplete while machines are
+            // still joining. A snapshot must remain usable; the next refresh
+            // retries placement after new capability reports arrive.
+            eprintln!(
+                "model host placement for {} is not ready: {error}",
+                manifest.model_id
+            );
+            return Ok(());
+        }
+    };
     if plan.is_empty() {
         return Ok(());
     }
@@ -829,6 +1251,10 @@ fn spawn_background_model_record_acquisition(
     merge_static_peer_advertisements(&mut static_peers, registry.advertisements());
     let (mut config, _) = discovery_config_from_state(state)?;
     config.static_peers = static_peers;
+    remove_relay_servers_from_download_targets(&mut config);
+    prefer_tcp_circuit_addresses_for_downloads(&mut config);
+    config.keypair = identity::Keypair::generate_ed25519();
+    config.advertisement = None;
 
     let app = app.clone();
     let cache_config = cache_config.clone();
@@ -862,7 +1288,14 @@ fn spawn_background_model_record_acquisition(
                     0,
                     Some(record.info.size_bytes),
                 );
-                fetch_model_shard_over_libp2p(
+                let progress_app = app.clone();
+                let progress_model_id = manifest.model_id.clone();
+                let progress_detail = format!(
+                    "layers {}:{}",
+                    record.info.layers.start, record.info.layers.end
+                );
+                let mut last_progress_emit = 0_u64;
+                fetch_model_shard_over_libp2p_with_progress(
                     config.clone(),
                     cache_config.clone(),
                     manifest.model_id.clone(),
@@ -870,6 +1303,23 @@ fn spawn_background_model_record_acquisition(
                     Some(record.info.checksum.clone()),
                     Some(record.info.version.clone()),
                     Duration::from_millis(model_shard_fetch_timeout_ms(record.info.size_bytes)),
+                    move |downloaded, total| {
+                        if downloaded == total
+                            || downloaded == 0
+                            || downloaded.saturating_sub(last_progress_emit)
+                                >= MODEL_PROGRESS_EMIT_BYTES
+                        {
+                            emit_model_import_progress(
+                                &progress_app,
+                                &progress_model_id,
+                                "Downloading shard",
+                                progress_detail.clone(),
+                                downloaded,
+                                Some(total),
+                            );
+                            last_progress_emit = downloaded;
+                        }
+                    },
                 )
                 .await?;
                 emit_model_import_progress(
@@ -971,6 +1421,25 @@ fn model_records_to_download_for_local_contribution(
         ));
     }
 
+    // Official Infernet workers execute different layer ranges from the same
+    // signed package. Every CUDA/Metal node keeps that verified package on its
+    // own disk; inference never redistributes weights between peers.
+    if model_id == OFFICIAL_CHAT_MODEL_ID
+        && plan.len() == 1
+        && plan[0].info.layers.start == 0
+        && compute_nodes.iter().any(|advertisement| {
+            advertisement.peer_id == local_peer_id
+                && advertisement
+                    .capabilities
+                    .as_ref()
+                    .is_some_and(|capabilities| {
+                        matches!(capabilities.compute_backend.as_str(), "cuda" | "metal")
+                    })
+        })
+    {
+        return Ok(missing_records);
+    }
+
     let config = |minimum_peer_count| CapacityPlanningConfig {
         kv_cache_bytes_per_layer: LAUNCH_KV_CACHE_BYTES_PER_LAYER,
         scratch_bytes_per_peer: RUNTIME_SCRATCH_BYTES_PER_PEER,
@@ -1065,10 +1534,10 @@ fn snapshot_from_registry(
     manifest: &ModelManifest,
     registry: &ShardRegistry,
     cache_config: &ShardCacheConfig,
+    presence: &PresenceSnapshot,
 ) -> GridSnapshot {
     let all_advertisements =
         advertisements_with_local_node(registry.advertisements(), cache_config, &local_peer_id);
-    let network_peer_count = remote_network_peer_count(&local_peer_id, &all_advertisements);
     let advertisements =
         ui_visible_advertisements(all_advertisements.clone(), Some(&manifest.model_id));
     let route_result = registry.route_for_model(manifest);
@@ -1076,7 +1545,8 @@ fn snapshot_from_registry(
         Ok(route) => (route, None),
         Err(error) => (Vec::new(), Some(error.to_string())),
     };
-    let machines = machine_views(&all_advertisements, &local_peer_id);
+    let machines = machine_views_from_presence(presence.records(), &local_peer_id);
+    let network_peer_count = connected_remote_machine_count(&machines);
 
     GridSnapshot {
         local_peer_id,
@@ -1102,12 +1572,13 @@ fn empty_snapshot(
     topic: String,
     cache_config: &ShardCacheConfig,
     registry: &ShardRegistry,
+    presence: &PresenceSnapshot,
 ) -> GridSnapshot {
     let all_advertisements =
         advertisements_with_local_node(registry.advertisements(), cache_config, &local_peer_id);
-    let network_peer_count = remote_network_peer_count(&local_peer_id, &all_advertisements);
     let advertisements = ui_visible_advertisements(all_advertisements.clone(), None);
-    let machines = machine_views(&all_advertisements, &local_peer_id);
+    let machines = machine_views_from_presence(presence.records(), &local_peer_id);
+    let network_peer_count = connected_remote_machine_count(&machines);
     GridSnapshot {
         local_peer_id,
         topic,
@@ -1156,20 +1627,8 @@ fn available_model_views(
 ) -> Vec<ModelView> {
     let installed_ids = installed_model_ids(cache_config);
     let manifest = ModelManifest::infernet_chat_v1();
-    let network_runnable = registry.is_some_and(|registry| {
-        registry.route_for_model(&manifest).is_ok_and(|route| {
-            let Some(coordinator) = route.first().map(|hop| hop.peer_id.as_str()) else {
-                return false;
-            };
-            registry.advertisements().iter().any(|advertisement| {
-                advertisement.peer_id != coordinator
-                    && advertisement
-                        .capabilities
-                        .as_ref()
-                        .is_some_and(rpc_endpoint_is_usable)
-            })
-        })
-    });
+    let network_runnable =
+        registry.is_some_and(|registry| plan_worker_execution(registry, &manifest).is_ok());
     vec![model_view_from_manifest(
         &manifest,
         installed_ids.contains(&manifest.model_id),
@@ -1262,6 +1721,7 @@ fn ui_visible_advertisements(
         .collect()
 }
 
+#[cfg(test)]
 fn remote_network_peer_count(local_peer_id: &str, advertisements: &[NodeAdvertisement]) -> usize {
     let bootstrap_peer_ids = default_bootstrap_peer_ids();
     advertisements
@@ -1269,7 +1729,19 @@ fn remote_network_peer_count(local_peer_id: &str, advertisements: &[NodeAdvertis
         .filter(|advertisement| advertisement.peer_id != local_peer_id)
         .filter(|advertisement| !bootstrap_peer_ids.contains(&advertisement.peer_id))
         .filter(|advertisement| advertisement_has_capacity(advertisement))
-        .count()
+        .map(machine_identity_key)
+        .collect::<BTreeSet<_>>()
+        .len()
+}
+
+fn machine_identity_key(advertisement: &NodeAdvertisement) -> String {
+    advertisement
+        .capabilities
+        .as_ref()
+        .and_then(|capabilities| capabilities.machine_id.as_deref())
+        .filter(|machine_id| !machine_id.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("peer:{}", advertisement.peer_id))
 }
 
 fn advertisement_has_capacity(advertisement: &NodeAdvertisement) -> bool {
@@ -1349,6 +1821,7 @@ fn official_info_matches_release(info: &ModelShardInfo) -> bool {
         })
 }
 
+#[cfg(test)]
 fn default_bootstrap_peer_ids() -> Vec<String> {
     DEFAULT_BOOTSTRAP_PEERS
         .iter()
@@ -1480,11 +1953,74 @@ fn advertisements_with_local_node(
     advertisements
 }
 
+#[cfg(test)]
 fn machine_views(advertisements: &[NodeAdvertisement], local_peer_id: &str) -> Vec<MachineView> {
-    let mut views = advertisements
+    let records = advertisements
         .iter()
-        .filter_map(|advertisement| {
+        .cloned()
+        .map(|advertisement| PresenceRecord {
+            advertisement,
+            status: ConnectionStatus::Connected,
+            last_seen_age: Duration::ZERO,
+        })
+        .collect::<Vec<_>>();
+    machine_views_from_presence(&records, local_peer_id)
+}
+
+fn machine_views_from_presence(
+    records: &[PresenceRecord],
+    local_peer_id: &str,
+) -> Vec<MachineView> {
+    let mut by_machine = BTreeMap::<String, Vec<&PresenceRecord>>::new();
+    for record in records
+        .iter()
+        .filter(|record| record.advertisement.capabilities.is_some())
+    {
+        by_machine
+            .entry(machine_identity_key(&record.advertisement))
+            .or_default()
+            .push(record);
+    }
+
+    let mut views = by_machine
+        .into_values()
+        .filter_map(|mut aliases| {
+            aliases.sort_by(|left, right| {
+                let left_capabilities = left.advertisement.capabilities.as_ref().unwrap();
+                let right_capabilities = right.advertisement.capabilities.as_ref().unwrap();
+                let left_local = left.advertisement.peer_id == local_peer_id;
+                let right_local = right.advertisement.peer_id == local_peer_id;
+                let left_rpc = left.status.is_connected()
+                    && worker_is_usable(left_capabilities)
+                    && left_capabilities.active_sessions < left_capabilities.max_sessions;
+                let right_rpc = right.status.is_connected()
+                    && worker_is_usable(right_capabilities)
+                    && right_capabilities.active_sessions < right_capabilities.max_sessions;
+
+                right_local
+                    .cmp(&left_local)
+                    .then_with(|| right.status.priority().cmp(&left.status.priority()))
+                    .then_with(|| right_rpc.cmp(&left_rpc))
+                    .then_with(|| left.last_seen_age.cmp(&right.last_seen_age))
+                    .then_with(|| left.advertisement.peer_id.cmp(&right.advertisement.peer_id))
+            });
+
+            let primary = aliases.first()?;
+            let advertisement = &primary.advertisement;
             let capabilities = advertisement.capabilities.as_ref()?;
+            let is_local = aliases
+                .iter()
+                .any(|alias| alias.advertisement.peer_id == local_peer_id);
+            let connection_status = aliases
+                .iter()
+                .map(|alias| alias.status)
+                .max_by_key(|status| status.priority())
+                .unwrap_or(ConnectionStatus::Unreachable);
+            let last_seen_age = aliases
+                .iter()
+                .map(|alias| alias.last_seen_age)
+                .min()
+                .unwrap_or_default();
             let use_accelerator_memory = capabilities.compute_backend != "cpu"
                 && capabilities.total_accelerator_memory_bytes > 0;
             let (total_memory_bytes, available_memory_bytes) = if use_accelerator_memory {
@@ -1498,20 +2034,44 @@ fn machine_views(advertisements: &[NodeAdvertisement], local_peer_id: &str) -> V
                     capabilities.available_ram_bytes,
                 )
             };
-            let hosted_components =
-                advertisement
-                    .hosted_shards
-                    .iter()
-                    .map(|shard| (shard.model_id.clone(), shard.layers.start, shard.layers.end))
-                    .chain(advertisement.model_shards.iter().map(|shard| {
-                        (shard.model_id.clone(), shard.layers.start, shard.layers.end)
-                    }))
-                    .collect::<BTreeSet<_>>();
+            let hosted_components = aliases
+                .iter()
+                .flat_map(|alias| {
+                    alias
+                        .advertisement
+                        .hosted_shards
+                        .iter()
+                        .map(|shard| (shard.model_id.clone(), shard.layers.start, shard.layers.end))
+                        .chain(alias.advertisement.model_shards.iter().map(|shard| {
+                            (shard.model_id.clone(), shard.layers.start, shard.layers.end)
+                        }))
+                })
+                .collect::<BTreeSet<_>>();
+            let addresses = aliases
+                .iter()
+                .flat_map(|alias| alias.advertisement.addresses.iter().cloned())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let rpc_ready = aliases.iter().any(|alias| {
+                let capabilities = alias.advertisement.capabilities.as_ref().unwrap();
+                alias.status.is_connected()
+                    && worker_is_usable(capabilities)
+                    && capabilities.active_sessions < capabilities.max_sessions
+            });
 
             Some(MachineView {
                 peer_id: advertisement.peer_id.clone(),
                 short_peer_id: short_peer_id(&advertisement.peer_id),
-                is_local: advertisement.peer_id == local_peer_id,
+                addresses,
+                machine_id: capabilities.machine_id.clone(),
+                is_local,
+                connection_status: if is_local {
+                    ConnectionStatus::Connected
+                } else {
+                    connection_status
+                },
+                last_seen_seconds: if is_local { 0 } else { last_seen_age.as_secs() },
                 compute_backend: capabilities.compute_backend.clone(),
                 device_name: capabilities.device_name.clone(),
                 logical_cpu_cores: capabilities.logical_cpu_cores,
@@ -1524,8 +2084,7 @@ fn machine_views(advertisements: &[NodeAdvertisement], local_peer_id: &str) -> V
                 measured_prefill_tokens_per_second: capabilities.measured_prefill_tokens_per_second,
                 measured_decode_tokens_per_second: capabilities.measured_decode_tokens_per_second,
                 hosted_component_count: hosted_components.len(),
-                rpc_ready: rpc_endpoint_is_usable(capabilities)
-                    && capabilities.active_sessions < capabilities.max_sessions,
+                rpc_ready,
             })
         })
         .collect::<Vec<_>>();
@@ -1537,8 +2096,14 @@ fn machine_views(advertisements: &[NodeAdvertisement], local_peer_id: &str) -> V
             .then_with(|| left.device_name.cmp(&right.device_name))
             .then_with(|| left.peer_id.cmp(&right.peer_id))
     });
-    views.dedup_by(|left, right| left.peer_id == right.peer_id);
     views
+}
+
+fn connected_remote_machine_count(machines: &[MachineView]) -> usize {
+    machines
+        .iter()
+        .filter(|machine| !machine.is_local && machine.connection_status.is_connected())
+        .count()
 }
 
 fn advertised_model_record_plan(
@@ -1673,6 +2238,10 @@ fn build_distribution_snapshot(
     cache_config: &ShardCacheConfig,
     advertisements: &[NodeAdvertisement],
 ) -> DistributionSnapshot {
+    let serving = model_serving_telemetry();
+    let serving_recently = serving
+        .last_activity_unix_ms
+        .is_some_and(|last| current_unix_ms_u64().saturating_sub(last) <= 5_000);
     let cache = ShardCache::new(cache_config.clone());
     let (installed_shards, storage_used_bytes, max_storage_bytes) = match cache {
         Ok(cache) => {
@@ -1734,11 +2303,11 @@ fn build_distribution_snapshot(
         installed_shards,
         storage_used_bytes,
         max_storage_bytes,
-        current_uploads: advertisements
-            .iter()
-            .map(|advertisement| advertisement.model_shards.len())
-            .sum(),
+        current_uploads: usize::from(serving_recently),
         current_downloads: 0,
+        bytes_served: serving.bytes_served,
+        chunks_served: serving.chunks_served,
+        last_served_unix_ms: serving.last_activity_unix_ms,
         replication_health: replicas
             .into_iter()
             .map(
@@ -1752,6 +2321,13 @@ fn build_distribution_snapshot(
             )
             .collect(),
     }
+}
+
+fn current_unix_ms_u64() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
 }
 
 fn local_cache_advertisement(
@@ -1934,14 +2510,6 @@ async fn ensure_model_distribution_service(
     state: &State<'_, UiState>,
     cache_config: ShardCacheConfig,
 ) -> Result<(), String> {
-    if let Err(error) = ensure_llama_rpc_service(state, &cache_config).await {
-        // Model discovery and downloads remain useful when a development build
-        // does not contain the optional sidecar. Crucially, clearing the
-        // endpoint prevents this node from claiming compute it cannot serve.
-        clear_local_llama_rpc_endpoint();
-        eprintln!("llama.cpp RPC sidecar is unavailable: {error}");
-    }
-
     let keypair = state
         .keypair
         .lock()
@@ -1952,6 +2520,11 @@ async fn ensure_model_distribution_service(
     discovery.keypair = keypair;
     discovery.p2p_listen = format!("/ip4/0.0.0.0/tcp/{UI_LISTEN_PORT}");
     discovery.static_peers = configured_static_peers(state)?;
+    discovery.relay_peers = default_relay_peer_addresses()?;
+    // Desktop discovery is public-bootstrap based. Broadcasting the node over
+    // mDNS makes legacy LAN builds repeatedly connect and fail modern
+    // Identify/Ping negotiation, producing noisy errors and needless sockets.
+    discovery.enable_mdns = false;
     discovery.advertisement = Some(local_node_advertisement(&cache_config, local_peer_id));
 
     let (waiter_sender, waiter_receiver) = oneshot::channel();
@@ -1976,6 +2549,7 @@ async fn ensure_model_distribution_service(
     if should_start {
         spawn_model_distribution_service(
             Arc::clone(&state.model_distribution_service),
+            Arc::clone(&state.live_registry),
             discovery,
             cache_config,
         );
@@ -2077,7 +2651,9 @@ fn llama_rpc_configuration(
         "ggml-rpc-server was not found; rebuild the bundled llama.cpp runtime with GGML_RPC=ON"
             .to_owned()
     })?;
-    let host = configured_private_rpc_host()?;
+    // ggml-rpc-server is unauthenticated. It is process-local only; remote
+    // workers reach it through the authenticated libp2p tunnel.
+    let host = Ipv4Addr::LOCALHOST;
     let requested_port = configured_rpc_port()?;
     let port = available_rpc_port(host, requested_port)?;
     let cache_dir = infernet_runtime_dir(cache_config).join("llama-rpc");
@@ -2097,6 +2673,7 @@ fn llama_rpc_configuration(
         runtime_abi: INFERNET_LLAMA_RPC_RUNTIME_ABI.to_owned(),
         backend: backend.clone(),
         ready: true,
+        tunnel_protocol: Some(LLAMA_RPC_TUNNEL_PROTOCOL.to_owned()),
     };
     let config = LlamaRpcServerConfig {
         binary,
@@ -2132,13 +2709,12 @@ fn configured_private_rpc_host() -> Result<Ipv4Addr, String> {
     }
 
     preferred_lan_ipv4().ok_or_else(|| {
-        "no private LAN/Tailscale IPv4 address is available for the llama.cpp RPC sidecar"
-            .to_owned()
+        "no private IPv4 address is available for the llama.cpp RPC sidecar".to_owned()
     })
 }
 
 fn validate_private_rpc_host(host: Ipv4Addr) -> Result<Ipv4Addr, String> {
-    if is_private_or_tailscale_ipv4(host) {
+    if is_private_or_cgnat_ipv4(host) {
         Ok(host)
     } else {
         Err(format!(
@@ -2147,7 +2723,7 @@ fn validate_private_rpc_host(host: Ipv4Addr) -> Result<Ipv4Addr, String> {
     }
 }
 
-fn is_private_or_tailscale_ipv4(host: Ipv4Addr) -> bool {
+fn is_private_or_cgnat_ipv4(host: Ipv4Addr) -> bool {
     let [first, second, _, _] = host.octets();
     first == 10
         || (first == 172 && (16..=31).contains(&second))
@@ -2157,7 +2733,7 @@ fn is_private_or_tailscale_ipv4(host: Ipv4Addr) -> bool {
 
 fn preferred_lan_ipv4() -> Option<Ipv4Addr> {
     match preferred_lan_ip()? {
-        IpAddr::V4(host) if is_private_or_tailscale_ipv4(host) => Some(host),
+        IpAddr::V4(host) if is_private_or_cgnat_ipv4(host) => Some(host),
         _ => None,
     }
 }
@@ -2285,13 +2861,24 @@ fn monitor_llama_rpc_service(service_state: Arc<Mutex<LlamaRpcServiceState>>) {
 
 fn spawn_model_distribution_service(
     service_state: Arc<Mutex<ModelDistributionServiceState>>,
+    live_registry: Arc<Mutex<ShardRegistry>>,
     discovery: DiscoveryConfig,
     cache_config: ShardCacheConfig,
 ) {
     tauri::async_runtime::spawn(async move {
         let (readiness_sender, readiness_receiver) = oneshot::channel();
+        let registry_observer = Arc::new(move |registry: ShardRegistry| {
+            *live_registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = registry;
+        });
         let mut service_task = Some(tauri::async_runtime::spawn(
-            run_model_distribution_node_with_readiness(discovery, cache_config, readiness_sender),
+            run_model_distribution_node_with_readiness_and_registry(
+                discovery,
+                cache_config,
+                readiness_sender,
+                registry_observer,
+            ),
         ));
 
         let startup_result = match tokio::time::timeout(Duration::from_secs(10), readiness_receiver)
@@ -2504,6 +3091,45 @@ fn default_bootstrap_peers() -> Result<Vec<NodeAdvertisement>, String> {
     Ok(peers)
 }
 
+fn default_relay_peer_addresses() -> Result<Vec<String>, String> {
+    Ok(default_bootstrap_peers()?
+        .into_iter()
+        .flat_map(|advertisement| advertisement.addresses)
+        .collect())
+}
+
+fn remove_relay_servers_from_download_targets(config: &mut DiscoveryConfig) {
+    let relay_peer_ids = config
+        .relay_peers
+        .iter()
+        .filter_map(|address| address.parse::<Multiaddr>().ok())
+        .filter_map(|address| match address.iter().last() {
+            Some(Protocol::P2p(peer_id)) => Some(peer_id.to_string()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    config
+        .static_peers
+        .retain(|advertisement| !relay_peer_ids.contains(&advertisement.peer_id));
+}
+
+fn prefer_tcp_circuit_addresses_for_downloads(config: &mut DiscoveryConfig) {
+    for advertisement in &mut config.static_peers {
+        let mut circuit_addresses = advertisement
+            .addresses
+            .iter()
+            .filter(|address| address.contains("/tcp/") && address.contains("/p2p-circuit/"))
+            .cloned()
+            .collect::<Vec<_>>();
+        if circuit_addresses.is_empty() {
+            continue;
+        }
+        circuit_addresses.sort_by_key(|address| !address.starts_with("/ip4/"));
+        circuit_addresses.dedup();
+        advertisement.addresses = circuit_addresses;
+    }
+}
+
 fn peer_address_labels(advertisement: &NodeAdvertisement) -> Vec<String> {
     advertisement
         .addresses
@@ -2513,17 +3139,41 @@ fn peer_address_labels(advertisement: &NodeAdvertisement) -> Vec<String> {
 }
 
 fn local_connect_addresses(peer_id: &str) -> Vec<String> {
-    let mut addresses = Vec::new();
-    if let Some(ip) = preferred_lan_ip() {
-        addresses.push(format!(
-            "/{}/{}/tcp/{}/p2p/{}",
-            ip_protocol(ip),
-            ip,
-            UI_LISTEN_PORT,
-            peer_id
-        ));
+    let mut private_ips = private_interface_ipv4s();
+    if private_ips.is_empty() {
+        private_ips.extend(preferred_lan_ipv4());
     }
-    addresses.push(format!("/ip4/127.0.0.1/tcp/{UI_LISTEN_PORT}/p2p/{peer_id}"));
+    let mut addresses = private_ips
+        .into_iter()
+        .map(|ip| format!("/ip4/{ip}/tcp/{UI_LISTEN_PORT}/p2p/{peer_id}"))
+        .collect::<Vec<_>>();
+    // Loopback is useful only when the machine has no private interface. It
+    // must not be advertised alongside real addresses to remote peers.
+    if addresses.is_empty() {
+        addresses.push(format!("/ip4/127.0.0.1/tcp/{UI_LISTEN_PORT}/p2p/{peer_id}"));
+    }
+    addresses.sort();
+    addresses.dedup();
+    addresses
+}
+
+fn private_interface_ipv4s() -> Vec<Ipv4Addr> {
+    let candidates = if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|interface| interface.is_oper_up())
+        .filter_map(|interface| match interface.ip() {
+            IpAddr::V4(ip) => Some(ip),
+            IpAddr::V6(_) => None,
+        });
+    filter_private_interface_ipv4s(candidates)
+}
+
+fn filter_private_interface_ipv4s(candidates: impl IntoIterator<Item = Ipv4Addr>) -> Vec<Ipv4Addr> {
+    let mut addresses = candidates
+        .into_iter()
+        .filter(|address| is_private_or_cgnat_ipv4(*address))
+        .collect::<Vec<_>>();
     addresses.sort();
     addresses.dedup();
     addresses
@@ -2534,13 +3184,6 @@ fn preferred_lan_ip() -> Option<IpAddr> {
     socket.connect("8.8.8.8:80").ok()?;
     let ip = socket.local_addr().ok()?.ip();
     (!ip.is_loopback()).then_some(ip)
-}
-
-fn ip_protocol(ip: IpAddr) -> &'static str {
-    match ip {
-        IpAddr::V4(_) => "ip4",
-        IpAddr::V6(_) => "ip6",
-    }
 }
 
 fn manifest_for_model(
@@ -2616,12 +3259,26 @@ fn emit_model_import_progress(
     downloaded_bytes: u64,
     total_bytes: Option<u64>,
 ) {
+    let model_id = model_id.into();
+    let stage = stage.into();
+    let detail = detail.into();
+    if let Some(total_bytes) = total_bytes {
+        let percent = if total_bytes == 0 {
+            0
+        } else {
+            downloaded_bytes.saturating_mul(100) / total_bytes
+        };
+        println!(
+            "model_download_progress model_id={} stage={} downloaded_bytes={} total_bytes={} percent={}",
+            model_id, stage, downloaded_bytes, total_bytes, percent
+        );
+    }
     let _ = app.emit(
         "infernet-model-import-progress",
         ModelImportProgress {
-            model_id: model_id.into(),
-            stage: stage.into(),
-            detail: detail.into(),
+            model_id,
+            stage,
+            detail,
             downloaded_bytes,
             total_bytes,
         },
@@ -2640,6 +3297,11 @@ fn discovery_config_from_state(
     let mut config = DiscoveryConfig::new(state.topic.clone());
     config.keypair = keypair;
     config.static_peers = configured_static_peers(state)?;
+    config.relay_peers = default_relay_peer_addresses()?;
+    // One-shot fetch/inference swarms already have explicit peer and relay
+    // addresses. Disabling mDNS prevents Windows interface/socket tasks from
+    // accumulating when those short-lived swarms are dropped.
+    config.enable_mdns = false;
     config.advertisement = Some(local_capability_advertisement(
         local_peer_id.clone(),
         String::new(),
@@ -2674,12 +3336,23 @@ pub fn run() {
         .manage(UiState::default())
         .setup(|app| {
             let app_handle = app.handle().clone();
+            let identity_path = app.path().app_data_dir()?.join("identity.key");
+            let keypair = load_or_generate_keypair(&identity_path)?;
+            *app_handle
+                .state::<UiState>()
+                .keypair
+                .lock()
+                .expect("UI identity lock poisoned during startup") = keypair;
             let cache_config = cache_config_for_app(app.handle());
-            monitor_llama_rpc_service(Arc::clone(&app_handle.state::<UiState>().llama_rpc_service));
             tauri::async_runtime::spawn(async move {
                 let state = app_handle.state::<UiState>();
-                if let Err(error) = ensure_model_distribution_service(&state, cache_config).await {
+                if let Err(error) =
+                    ensure_model_distribution_service(&state, cache_config.clone()).await
+                {
                     eprintln!("failed to start model distribution service: {error}");
+                }
+                if let Err(error) = ensure_llama_rpc_service(&state, &cache_config).await {
+                    eprintln!("failed to start llama.cpp RPC service: {error}");
                 }
             });
             Ok(())
@@ -2687,6 +3360,7 @@ pub fn run() {
         .on_window_event(|window, event| {
             if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
                 stop_persistent_llama_server();
+                stop_persistent_rpc_tunnels();
                 let state = window.state::<UiState>();
                 if let Ok(mut service) = state.llama_rpc_service.lock() {
                     *service = LlamaRpcServiceState::Stopped;
@@ -2698,6 +3372,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_local_identity,
+            get_local_node_activity,
             get_manual_peers,
             add_manual_peer,
             clear_manual_peers,
@@ -2715,15 +3390,38 @@ mod tests {
 
     #[test]
     fn rpc_binding_rejects_public_loopback_and_wildcard_addresses() {
-        assert!(is_private_or_tailscale_ipv4(Ipv4Addr::new(10, 1, 2, 3)));
-        assert!(is_private_or_tailscale_ipv4(Ipv4Addr::new(100, 100, 2, 3)));
-        assert!(!is_private_or_tailscale_ipv4(Ipv4Addr::UNSPECIFIED));
-        assert!(!is_private_or_tailscale_ipv4(Ipv4Addr::LOCALHOST));
-        assert!(!is_private_or_tailscale_ipv4(Ipv4Addr::new(8, 8, 8, 8)));
+        assert!(is_private_or_cgnat_ipv4(Ipv4Addr::new(10, 1, 2, 3)));
+        assert!(is_private_or_cgnat_ipv4(Ipv4Addr::new(100, 100, 2, 3)));
+        assert!(!is_private_or_cgnat_ipv4(Ipv4Addr::UNSPECIFIED));
+        assert!(!is_private_or_cgnat_ipv4(Ipv4Addr::LOCALHOST));
+        assert!(!is_private_or_cgnat_ipv4(Ipv4Addr::new(8, 8, 8, 8)));
         assert!(validate_private_rpc_host(Ipv4Addr::new(192, 168, 1, 2)).is_ok());
         assert!(validate_private_rpc_host(Ipv4Addr::new(217, 77, 11, 197)).is_err());
         assert!(rpc_backend_for_device("metal", Some("CPU")).is_err());
         assert!(rpc_backend_for_device("cpu", Some("Vulkan0")).is_err());
+    }
+
+    #[test]
+    fn connect_addresses_include_only_unique_private_ipv4_interfaces() {
+        let addresses = filter_private_interface_ipv4s([
+            Ipv4Addr::new(192, 168, 1, 20),
+            Ipv4Addr::new(10, 0, 0, 7),
+            Ipv4Addr::new(100, 76, 1, 2),
+            Ipv4Addr::new(192, 168, 1, 20),
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::new(169, 254, 10, 20),
+            Ipv4Addr::new(8, 8, 8, 8),
+        ]);
+
+        assert_eq!(
+            addresses,
+            vec![
+                Ipv4Addr::new(10, 0, 0, 7),
+                Ipv4Addr::new(100, 76, 1, 2),
+                Ipv4Addr::new(192, 168, 1, 20),
+            ]
+        );
     }
 
     #[test]
@@ -2841,6 +3539,24 @@ mod tests {
     }
 
     #[test]
+    fn two_peer_identities_for_one_physical_machine_render_once() {
+        let mut lan = local_capability_advertisement("peer-lan".to_owned(), String::new());
+        let mut secondary =
+            local_capability_advertisement("peer-secondary".to_owned(), String::new());
+        lan.capabilities.as_mut().unwrap().machine_id = Some("machine-a".to_owned());
+        secondary.capabilities.as_mut().unwrap().machine_id = Some("machine-a".to_owned());
+
+        let machines = machine_views(&[lan.clone(), secondary.clone()], "local-peer");
+
+        assert_eq!(machines.len(), 1);
+        assert_eq!(machines[0].machine_id.as_deref(), Some("machine-a"));
+        assert_eq!(
+            remote_network_peer_count("local-peer", &[lan, secondary]),
+            1
+        );
+    }
+
+    #[test]
     fn available_models_ignore_orphan_model_shards() {
         let root = std::env::temp_dir().join(format!("infernet-ui-orphan-{}", unix_ms()));
         let cache_config = ShardCacheConfig::new(root.clone());
@@ -2929,7 +3645,7 @@ mod tests {
         registry.upsert(valid);
         registry.upsert(forged);
         registry.upsert(too_small);
-        let trusted = trusted_launch_registry(registry);
+        let trusted = trusted_launch_registry(registry, "local-peer");
         let advertisements = trusted.advertisements();
         let route = trusted.route_for_model(&model).unwrap();
 
@@ -3202,5 +3918,181 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn every_accelerated_worker_downloads_the_verified_full_package() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let root = std::env::temp_dir().join(format!("infernet-ui-host-plan-{}", unix_ms()));
+        let cache = ShardCache::new(ShardCacheConfig::new(root.clone())).unwrap();
+        let layers = LayerRange::new(0, 46).unwrap();
+        let package = AdvertisedModelRecord {
+            info: ModelShardInfo {
+                model_id: OFFICIAL_CHAT_MODEL_ID.to_owned(),
+                layers,
+                checksum: "full-package".to_owned(),
+                size_bytes: 14_439_361_440,
+                version: "1.0.0-compat.1".to_owned(),
+                protocol_version: PROTOCOL_VERSION,
+            },
+        };
+
+        let machine = |peer_id: &str,
+                       machine_id: &str,
+                       backend: &str,
+                       device: &str,
+                       total_accelerator_memory_bytes: u64,
+                       available_accelerator_memory_bytes: u64,
+                       unified_memory: bool| {
+            let mut advertisement =
+                local_capability_advertisement(peer_id.to_owned(), String::new());
+            let capabilities = advertisement.capabilities.as_mut().unwrap();
+            capabilities.machine_id = Some(machine_id.to_owned());
+            capabilities.compute_backend = backend.to_owned();
+            capabilities.device_name = device.to_owned();
+            capabilities.total_ram_bytes = if unified_memory { 16 * GIB } else { 32 * GIB };
+            capabilities.available_ram_bytes = if unified_memory { 12 * GIB } else { 24 * GIB };
+            capabilities.total_accelerator_memory_bytes = total_accelerator_memory_bytes;
+            capabilities.available_accelerator_memory_bytes = available_accelerator_memory_bytes;
+            capabilities.unified_memory = unified_memory;
+            capabilities.max_sessions = 1;
+            capabilities.active_sessions = 0;
+            advertisement.available_ram_bytes = Some(capabilities.available_ram_bytes);
+            advertisement.available_vram_bytes =
+                Some(capabilities.available_accelerator_memory_bytes);
+            advertisement
+        };
+        let advertisements = vec![
+            machine(
+                "peer-3090",
+                "machine-3090",
+                "cuda",
+                "NVIDIA GeForce RTX 3090",
+                24 * GIB,
+                23 * GIB,
+                false,
+            ),
+            machine(
+                "peer-4060",
+                "machine-4060",
+                "cuda",
+                "NVIDIA GeForce RTX 4060",
+                8 * GIB,
+                7 * GIB,
+                false,
+            ),
+            machine(
+                "peer-mac",
+                "machine-mac",
+                "metal",
+                "Apple M5",
+                16 * GIB,
+                12 * GIB,
+                true,
+            ),
+        ];
+
+        let selected_3090 = model_records_to_download_for_local_contribution(
+            &cache,
+            OFFICIAL_CHAT_MODEL_ID,
+            "peer-3090",
+            &advertisements,
+            vec![package.clone()],
+        )
+        .unwrap();
+        let selected_4060 = model_records_to_download_for_local_contribution(
+            &cache,
+            OFFICIAL_CHAT_MODEL_ID,
+            "peer-4060",
+            &advertisements,
+            vec![package.clone()],
+        )
+        .unwrap();
+        let selected_mac = model_records_to_download_for_local_contribution(
+            &cache,
+            OFFICIAL_CHAT_MODEL_ID,
+            "peer-mac",
+            &advertisements,
+            vec![package],
+        )
+        .unwrap();
+
+        assert_eq!(selected_3090.len(), 1);
+        assert_eq!(selected_4060.len(), 1);
+        assert_eq!(selected_mac.len(), 1);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn download_targets_exclude_the_relay_server() {
+        let relay_key = identity::Keypair::generate_ed25519();
+        let relay_peer_id = relay_key.public().to_peer_id();
+        let mut config = DiscoveryConfig::new("infernet/test");
+        config.relay_peers = vec![format!("/ip4/217.77.11.197/tcp/9777/p2p/{relay_peer_id}")];
+        config.static_peers = vec![
+            empty_advertisement(
+                relay_peer_id.to_string(),
+                format!("/ip4/217.77.11.197/udp/9777/quic-v1/p2p/{relay_peer_id}"),
+            ),
+            {
+                let mut seed = empty_advertisement(
+                    "model-seed".to_owned(),
+                    "/ip4/10.0.0.2/tcp/9777".to_owned(),
+                );
+                seed.addresses.push(
+                    "/ip4/217.77.11.197/udp/9777/quic-v1/p2p/relay/p2p-circuit/p2p/model-seed"
+                        .to_owned(),
+                );
+                seed.addresses.push(
+                    "/ip4/217.77.11.197/tcp/9777/p2p/relay/p2p-circuit/p2p/model-seed".to_owned(),
+                );
+                seed
+            },
+        ];
+
+        remove_relay_servers_from_download_targets(&mut config);
+        prefer_tcp_circuit_addresses_for_downloads(&mut config);
+
+        assert_eq!(config.static_peers.len(), 1);
+        assert_eq!(config.static_peers[0].peer_id, "model-seed");
+        assert_eq!(config.static_peers[0].addresses.len(), 1);
+        assert!(config.static_peers[0].addresses[0].contains("/tcp/"));
+        assert!(config.static_peers[0].addresses[0].contains("/p2p-circuit/"));
+    }
+
+    #[test]
+    fn official_https_download_is_revision_pinned_and_resumable_by_p2p() {
+        let release = OfficialModelRelease::infernet_chat_v1_compatibility();
+        let layers = LayerRange::new(0, 30).unwrap();
+        let cache = ShardCacheConfig::new("/tmp/infernet-official-download-test");
+        let (partial, completed) = official_release_download_paths(&cache, &release, layers);
+
+        assert_eq!(
+            official_release_download_url(&release),
+            "https://huggingface.co/google/gemma-4-26B-A4B-it-qat-q4_0-gguf/resolve/dfc00409adc70be497fee9c90bfe76b3ee130f2e/gemma-4-26B_q4_0-it.gguf"
+        );
+        assert!(partial.ends_with("tmp/infernet-chat-v1-0-30-4c856523d61d7792.gguf.partial"));
+        assert!(completed.ends_with("tmp/infernet-chat-v1-0-30-4c856523d61d7792.gguf"));
+        assert_eq!(
+            content_range_start("bytes 4194304-8388607/14439361440"),
+            Some(4_194_304)
+        );
+        assert_eq!(content_range_start("invalid"), None);
+    }
+
+    #[test]
+    fn remote_routes_reject_loopback_but_keep_public_circuits() {
+        let relay = identity::Keypair::generate_ed25519().public().to_peer_id();
+        let target = identity::Keypair::generate_ed25519().public().to_peer_id();
+        assert!(!remote_route_address_is_usable(&format!(
+            "/ip4/127.0.0.1/tcp/9777/p2p/{target}"
+        )));
+        assert!(!remote_route_address_is_usable(&format!(
+            "/ip4/0.0.0.0/tcp/9777/p2p/{target}"
+        )));
+        assert!(remote_route_address_is_usable(&format!(
+            "/ip4/217.77.11.197/tcp/9777/p2p/{relay}/p2p-circuit/p2p/{target}"
+        )));
     }
 }

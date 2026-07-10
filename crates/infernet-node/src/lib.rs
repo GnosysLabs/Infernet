@@ -2,18 +2,21 @@ pub mod capabilities;
 pub mod llama_server_runtime;
 pub mod model_distribution;
 pub mod rpc_runtime;
+pub mod rpc_tunnel;
 
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::mem;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{fs, io};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -36,10 +39,14 @@ use infernet_runtime::{DemoRuntime, LayerRuntime, activation_checksum};
 use libp2p::{
     Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
     core::{connection::ConnectedPoint, transport::ListenerId},
-    gossipsub, identity, mdns,
+    dcutr, gossipsub, identify, identity, mdns,
     multiaddr::Protocol,
-    noise, request_response,
-    swarm::{NetworkBehaviour, SwarmEvent},
+    noise, ping, relay, request_response,
+    swarm::{
+        NetworkBehaviour, SwarmEvent,
+        behaviour::toggle::Toggle,
+        dial_opts::{DialOpts, PeerCondition},
+    },
     tcp, yamux,
 };
 pub use model_distribution::{
@@ -59,8 +66,9 @@ use tokio::time::{Instant, interval, sleep};
 
 pub use capabilities::{
     PINNED_GGML_RPC_PROTOCOL_VERSION, clear_local_llama_rpc_endpoint,
-    configured_llama_rpc_endpoint, detect_node_capabilities, set_local_inference_active,
-    set_local_llama_rpc_endpoint, set_local_rpc_active, validate_llama_rpc_endpoint,
+    configured_llama_rpc_endpoint, detect_node_capabilities, local_llama_rpc_target,
+    set_local_inference_active, set_local_llama_rpc_endpoint, set_local_rpc_active,
+    validate_llama_rpc_endpoint,
 };
 pub use llama_server_runtime::{
     LlamaServerCompletion, LlamaServerConfig, complete_with_persistent_llama_server,
@@ -70,8 +78,13 @@ pub use rpc_runtime::{
     INFERNET_LLAMA_RPC_RUNTIME_ABI, LLAMA_RPC_DEFAULT_PORT, LLAMA_RPC_PROTOCOL_VERSION,
     LlamaRpcServer, LlamaRpcServerConfig, find_llama_rpc_server_binary, spawn_llama_rpc_server,
 };
+pub use rpc_tunnel::{
+    RPC_TUNNEL_PROTOCOL, RpcTunnelAdmission, RpcTunnelAdmissionLimits, RpcTunnelProxy,
+    RpcTunnelProxyConfig, RpcTunnelTicket, RpcTunnelWorker, RpcTunnelWorkerConfig,
+};
 
 pub type ModelDistributionReadiness = oneshot::Sender<std::result::Result<String, String>>;
+pub type ModelDistributionRegistryObserver = Arc<dyn Fn(ShardRegistry) + Send + Sync>;
 
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
@@ -93,10 +106,24 @@ pub struct DiscoveryConfig {
     pub publish_interval: Duration,
     pub advertise_listen_addresses: bool,
     pub dial_discovered_peers: bool,
+    /// Enable local mDNS discovery. Long-lived desktop services generally
+    /// enable it; one-shot fetch/infer swarms may disable it to avoid spawning
+    /// short-lived interface watchers.
+    pub enable_mdns: bool,
     pub relay_advertisements: bool,
+    /// Run a Circuit Relay v2 hop service. This is intended for explicitly
+    /// deployed public bootstrap nodes, never ordinary desktop nodes.
+    pub relay_server: bool,
+    /// Public relay server multiaddresses. Each address must end in the
+    /// relay's `/p2p/<peer-id>` component. A reservation is maintained on
+    /// every configured relay while direct TCP/QUIC paths remain enabled.
+    pub relay_peers: Vec<String>,
     /// Explicitly trusted llama.cpp RPC backends selected by the caller for
     /// this request. These are validated again before they cross the network.
     pub rpc_endpoints: Vec<String>,
+    /// Authenticated worker identities selected for RPC-over-libp2p. The
+    /// coordinator creates loopback proxies for these peers.
+    pub rpc_worker_peer_ids: Vec<String>,
     /// Exact route selected alongside `rpc_endpoints`. This prevents a second
     /// discovery pass from switching coordinators after the RPC plan is built.
     pub planned_route: Option<Vec<RouteHop>>,
@@ -113,8 +140,12 @@ impl DiscoveryConfig {
             publish_interval: Duration::from_millis(750),
             advertise_listen_addresses: true,
             dial_discovered_peers: true,
+            enable_mdns: true,
             relay_advertisements: false,
+            relay_server: false,
+            relay_peers: Vec::new(),
             rpc_endpoints: Vec::new(),
+            rpc_worker_peer_ids: Vec::new(),
             planned_route: None,
         }
     }
@@ -129,6 +160,31 @@ impl DiscoveryConfig {
     ) -> Result<()> {
         self.rpc_endpoints =
             normalize_trusted_rpc_endpoints(&endpoints.into_iter().collect::<Vec<_>>())?;
+        Ok(())
+    }
+
+    pub fn set_rpc_worker_peer_ids(
+        &mut self,
+        peers: impl IntoIterator<Item = String>,
+    ) -> Result<()> {
+        let mut normalized = Vec::new();
+        let mut seen = HashSet::new();
+        for peer in peers {
+            let peer = peer.trim();
+            peer.parse::<PeerId>()
+                .with_context(|| format!("invalid RPC worker peer id {peer}"))?;
+            if seen.insert(peer.to_owned()) {
+                normalized.push(peer.to_owned());
+            }
+        }
+        if normalized.len() > MAX_TRUSTED_RPC_ENDPOINTS {
+            bail!(
+                "distributed RPC requested {} workers; maximum is {}",
+                normalized.len(),
+                MAX_TRUSTED_RPC_ENDPOINTS
+            );
+        }
+        self.rpc_worker_peer_ids = normalized;
         Ok(())
     }
 
@@ -192,9 +248,295 @@ pub struct ModelSourceFetchResult {
     pub size_bytes: u64,
 }
 
+/// Process-wide counters for model bytes accepted by the libp2p response
+/// behaviour for serving to peers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ModelServingTelemetry {
+    pub bytes_served: u64,
+    pub chunks_served: u64,
+    pub last_activity_unix_ms: Option<u64>,
+}
+
+/// A point-in-time view of work performed by this node process.
+///
+/// `current` is ordered by start time. `journal` is bounded and ordered from
+/// oldest to newest completion.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalNodeActivitySnapshot {
+    pub current: Vec<LocalNodeActivityTask>,
+    pub journal: Vec<LocalNodeActivityEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalNodeActivityTask {
+    pub id: String,
+    pub trace_id: String,
+    pub kind: LocalNodeActivityKind,
+    pub started_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalNodeActivityEntry {
+    pub id: String,
+    pub trace_id: String,
+    pub kind: LocalNodeActivityKind,
+    pub outcome: LocalNodeActivityOutcome,
+    pub started_at_unix_ms: u64,
+    pub completed_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LocalNodeActivityKind {
+    ChatCompletion,
+    ComputeContribution,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LocalNodeActivityOutcome {
+    Success,
+    Error,
+}
+
+const LOCAL_NODE_ACTIVITY_JOURNAL_LIMIT: usize = 50;
+
+#[derive(Default)]
+struct LocalNodeActivityState {
+    current: Vec<LocalNodeActivityTask>,
+    journal: Vec<LocalNodeActivityEntry>,
+}
+
+impl LocalNodeActivityState {
+    fn snapshot(&self) -> LocalNodeActivitySnapshot {
+        LocalNodeActivitySnapshot {
+            current: self.current.clone(),
+            journal: self.journal.clone(),
+        }
+    }
+
+    fn start(&mut self, mut task: LocalNodeActivityTask) {
+        if self
+            .current
+            .iter()
+            .any(|current| current.trace_id == task.trace_id)
+        {
+            return;
+        }
+        if let Some(index) = self
+            .journal
+            .iter()
+            .position(|entry| entry.trace_id == task.trace_id)
+        {
+            let previous = self.journal.remove(index);
+            task.started_at_unix_ms = task.started_at_unix_ms.min(previous.started_at_unix_ms);
+        }
+        self.current.push(task);
+    }
+
+    fn finish(
+        &mut self,
+        id: &str,
+        completed_kind: Option<LocalNodeActivityKind>,
+        outcome: LocalNodeActivityOutcome,
+        completed_at_unix_ms: u64,
+    ) {
+        let Some(index) = self.current.iter().position(|task| task.id == id) else {
+            return;
+        };
+        let task = self.current.remove(index);
+        self.journal.push(LocalNodeActivityEntry {
+            id: task.trace_id.clone(),
+            trace_id: task.trace_id,
+            kind: completed_kind.unwrap_or(task.kind),
+            outcome,
+            started_at_unix_ms: task.started_at_unix_ms,
+            completed_at_unix_ms: completed_at_unix_ms.max(task.started_at_unix_ms),
+        });
+        let excess = self
+            .journal
+            .len()
+            .saturating_sub(LOCAL_NODE_ACTIVITY_JOURNAL_LIMIT);
+        if excess > 0 {
+            self.journal.drain(..excess);
+        }
+    }
+}
+
+static LOCAL_NODE_ACTIVITY: OnceLock<Mutex<LocalNodeActivityState>> = OnceLock::new();
+
+/// Returns the authoritative process-local activation activity snapshot.
+pub fn local_node_activity_snapshot() -> LocalNodeActivitySnapshot {
+    LOCAL_NODE_ACTIVITY
+        .get_or_init(|| Mutex::new(LocalNodeActivityState::default()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .snapshot()
+}
+
+fn start_local_node_activity(
+    job_id: uuid::Uuid,
+    trace_id: uuid::Uuid,
+    kind: LocalNodeActivityKind,
+) {
+    LOCAL_NODE_ACTIVITY
+        .get_or_init(|| Mutex::new(LocalNodeActivityState::default()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .start(LocalNodeActivityTask {
+            id: job_id.to_string(),
+            trace_id: trace_id.to_string(),
+            kind,
+            started_at_unix_ms: model_serving_now_unix_ms(),
+        });
+}
+
+fn finish_local_node_activity(job_id: uuid::Uuid, activation: &LocalActivationOutcome) {
+    let (completed_kind, outcome) = match activation {
+        LocalActivationOutcome::Response(response) => (
+            None,
+            if response.error.is_some() {
+                LocalNodeActivityOutcome::Error
+            } else {
+                LocalNodeActivityOutcome::Success
+            },
+        ),
+        LocalActivationOutcome::Forward(_) => (
+            Some(LocalNodeActivityKind::ComputeContribution),
+            LocalNodeActivityOutcome::Success,
+        ),
+    };
+    LOCAL_NODE_ACTIVITY
+        .get_or_init(|| Mutex::new(LocalNodeActivityState::default()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .finish(
+            &job_id.to_string(),
+            completed_kind,
+            outcome,
+            model_serving_now_unix_ms(),
+        );
+}
+
+struct ModelServingTelemetryCounters {
+    bytes_served: AtomicU64,
+    chunks_served: AtomicU64,
+    last_activity_unix_ms: AtomicU64,
+}
+
+impl ModelServingTelemetryCounters {
+    const fn new() -> Self {
+        Self {
+            bytes_served: AtomicU64::new(0),
+            chunks_served: AtomicU64::new(0),
+            last_activity_unix_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn record_chunk(&self, bytes: u64, activity_unix_ms: u64) {
+        if bytes == 0 {
+            return;
+        }
+        self.bytes_served.fetch_add(bytes, Ordering::Relaxed);
+        self.chunks_served.fetch_add(1, Ordering::Relaxed);
+        self.last_activity_unix_ms
+            .store(activity_unix_ms, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> ModelServingTelemetry {
+        let last_activity_unix_ms = self.last_activity_unix_ms.load(Ordering::Relaxed);
+        ModelServingTelemetry {
+            bytes_served: self.bytes_served.load(Ordering::Relaxed),
+            chunks_served: self.chunks_served.load(Ordering::Relaxed),
+            last_activity_unix_ms: (last_activity_unix_ms != 0).then_some(last_activity_unix_ms),
+        }
+    }
+}
+
+static MODEL_SERVING_TELEMETRY: ModelServingTelemetryCounters =
+    ModelServingTelemetryCounters::new();
+
+struct PersistentRpcTunnelSet {
+    worker_peer_ids: Vec<String>,
+    endpoints: Vec<String>,
+    _proxies: Vec<RpcTunnelProxy>,
+}
+
+static PERSISTENT_RPC_TUNNELS: OnceLock<Mutex<Option<PersistentRpcTunnelSet>>> = OnceLock::new();
+
+/// Returns process-wide model serving totals. The counters are monotonic for
+/// the lifetime of the process and include both full-source and shard chunks.
+pub fn model_serving_telemetry() -> ModelServingTelemetry {
+    MODEL_SERVING_TELEMETRY.snapshot()
+}
+
+async fn ensure_persistent_rpc_tunnels(
+    control: libp2p_stream::Control,
+    worker_peer_ids: &[String],
+) -> Result<Vec<String>> {
+    let state = PERSISTENT_RPC_TUNNELS.get_or_init(|| Mutex::new(None));
+    if let Some(existing) = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .filter(|existing| existing.worker_peer_ids == worker_peer_ids)
+    {
+        return Ok(existing.endpoints.clone());
+    }
+
+    let mut proxies = Vec::with_capacity(worker_peer_ids.len());
+    let mut endpoints = Vec::with_capacity(worker_peer_ids.len());
+    for peer_id in worker_peer_ids {
+        let peer = peer_id
+            .parse::<PeerId>()
+            .with_context(|| format!("invalid selected RPC worker peer id {peer_id}"))?;
+        let proxy = RpcTunnelProxy::bind(
+            control.clone(),
+            RpcTunnelProxyConfig::new(peer, RpcTunnelTicket::default()),
+        )
+        .await
+        .with_context(|| format!("failed to start RPC tunnel proxy for worker {peer_id}"))?;
+        endpoints.push(proxy.llama_cpp_endpoint());
+        proxies.push(proxy);
+    }
+
+    *state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PersistentRpcTunnelSet {
+        worker_peer_ids: worker_peer_ids.to_vec(),
+        endpoints: endpoints.clone(),
+        _proxies: proxies,
+    });
+    Ok(endpoints)
+}
+
+pub fn stop_persistent_rpc_tunnels() {
+    if let Some(state) = PERSISTENT_RPC_TUNNELS.get() {
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+}
+
+fn model_serving_now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
 const MODEL_BLOB_CHUNK_BYTES: u32 = 4 * 1024 * 1024;
 const MODEL_BLOB_HEADER_MAX_BYTES: usize = 64 * 1024;
 const MODEL_FETCH_PEER_RETRY_COOLDOWN: Duration = Duration::from_secs(5);
+const IDENTIFY_PROTOCOL: &str = "/infernet/identify/1";
+const IDENTIFY_AGENT: &str = concat!("infernet/", env!("CARGO_PKG_VERSION"));
+const PUBLIC_RELAY_RESERVATION_DURATION: Duration = Duration::from_secs(2 * 60 * 60);
+const PUBLIC_RELAY_CIRCUIT_DURATION: Duration = Duration::from_secs(2 * 60 * 60);
+const PUBLIC_RELAY_MAX_CIRCUIT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const LLAMA_BRIDGE_EXECUTION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const LLAMA_BRIDGE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const LLAMA_BRIDGE_MAX_LIBRARY_THREADS: usize = 4;
@@ -213,15 +555,228 @@ impl Drop for RemoveFileOnDrop {
 
 #[derive(NetworkBehaviour)]
 struct GridBehaviour {
+    relay_client: relay::client::Behaviour,
+    relay_server: Toggle<relay::Behaviour>,
+    dcutr: dcutr::Behaviour,
+    identify: identify::Behaviour,
+    ping: ping::Behaviour,
     gossipsub: gossipsub::Behaviour,
-    mdns: mdns::tokio::Behaviour,
-    activation: request_response::json::Behaviour<ActivationRequest, ActivationResponse>,
+    mdns: Toggle<mdns::tokio::Behaviour>,
+    activation: request_response::Behaviour<ActivationCodec>,
     model: request_response::json::Behaviour<ModelShardRequest, ModelShardResponse>,
     blob: request_response::Behaviour<ModelBlobCodec>,
+    rpc_tunnel: libp2p_stream::Behaviour,
 }
 
 #[derive(Debug, Clone, Default)]
 struct ModelBlobCodec;
+
+#[derive(Debug, Clone, Default)]
+struct ActivationCodec;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ActivationRequestHeader {
+    protocol_version: u32,
+    trace_id: uuid::Uuid,
+    model_id: String,
+    route: Vec<RouteHop>,
+    current_hop_index: usize,
+    hidden_size: usize,
+    sequence_position: u32,
+    input_token_id: Option<i32>,
+    prompt: Option<PromptMetadata>,
+    trace: Vec<TraceEvent>,
+    activation_f32_count: u32,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ActivationResponseHeader {
+    protocol_version: u32,
+    trace_id: uuid::Uuid,
+    peer_id: String,
+    processed_layer_start: u32,
+    processed_layer_end: u32,
+    timing_ms: u64,
+    trace: Vec<TraceEvent>,
+    output_text: Option<String>,
+    sampled_token_id: Option<i32>,
+    generation_complete: bool,
+    next_sequence_position: u32,
+    error: Option<String>,
+    activation_f32_count: u32,
+}
+
+const ACTIVATION_HEADER_MAX_BYTES: usize = 1024 * 1024;
+const ACTIVATION_PAYLOAD_MAX_BYTES: usize = 128 * 1024 * 1024;
+
+#[async_trait]
+impl request_response::Codec for ActivationCodec {
+    type Protocol = StreamProtocol;
+    type Request = ActivationRequest;
+    type Response = ActivationResponse;
+
+    async fn read_request<T>(
+        &mut self,
+        _protocol: &Self::Protocol,
+        io: &mut T,
+    ) -> io::Result<Self::Request>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        let header: ActivationRequestHeader =
+            serde_json::from_slice(&read_blob_frame(io, ACTIVATION_HEADER_MAX_BYTES).await?)
+                .map_err(invalid_data)?;
+        let activation = read_f32_frame(io, header.activation_f32_count).await?;
+        Ok(ActivationRequest {
+            protocol_version: header.protocol_version,
+            trace_id: header.trace_id,
+            model_id: header.model_id,
+            route: header.route,
+            current_hop_index: header.current_hop_index,
+            hidden_size: header.hidden_size,
+            sequence_position: header.sequence_position,
+            input_token_id: header.input_token_id,
+            activation,
+            prompt: header.prompt,
+            trace: header.trace,
+        })
+    }
+
+    async fn read_response<T>(
+        &mut self,
+        _protocol: &Self::Protocol,
+        io: &mut T,
+    ) -> io::Result<Self::Response>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        let header: ActivationResponseHeader =
+            serde_json::from_slice(&read_blob_frame(io, ACTIVATION_HEADER_MAX_BYTES).await?)
+                .map_err(invalid_data)?;
+        let output_activation = read_f32_frame(io, header.activation_f32_count).await?;
+        Ok(ActivationResponse {
+            protocol_version: header.protocol_version,
+            trace_id: header.trace_id,
+            peer_id: header.peer_id,
+            processed_layer_start: header.processed_layer_start,
+            processed_layer_end: header.processed_layer_end,
+            output_activation,
+            timing_ms: header.timing_ms,
+            trace: header.trace,
+            output_text: header.output_text,
+            sampled_token_id: header.sampled_token_id,
+            generation_complete: header.generation_complete,
+            next_sequence_position: header.next_sequence_position,
+            error: header.error,
+        })
+    }
+
+    async fn write_request<T>(
+        &mut self,
+        _protocol: &Self::Protocol,
+        io: &mut T,
+        req: Self::Request,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        let activation_f32_count = checked_activation_count(req.activation.len())?;
+        let header = ActivationRequestHeader {
+            protocol_version: req.protocol_version,
+            trace_id: req.trace_id,
+            model_id: req.model_id,
+            route: req.route,
+            current_hop_index: req.current_hop_index,
+            hidden_size: req.hidden_size,
+            sequence_position: req.sequence_position,
+            input_token_id: req.input_token_id,
+            prompt: req.prompt,
+            trace: req.trace,
+            activation_f32_count,
+        };
+        write_blob_frame(io, &serde_json::to_vec(&header).map_err(invalid_data)?).await?;
+        write_f32_frame(io, &req.activation).await?;
+        io.close().await
+    }
+
+    async fn write_response<T>(
+        &mut self,
+        _protocol: &Self::Protocol,
+        io: &mut T,
+        res: Self::Response,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        let activation_f32_count = checked_activation_count(res.output_activation.len())?;
+        let header = ActivationResponseHeader {
+            protocol_version: res.protocol_version,
+            trace_id: res.trace_id,
+            peer_id: res.peer_id,
+            processed_layer_start: res.processed_layer_start,
+            processed_layer_end: res.processed_layer_end,
+            timing_ms: res.timing_ms,
+            trace: res.trace,
+            output_text: res.output_text,
+            sampled_token_id: res.sampled_token_id,
+            generation_complete: res.generation_complete,
+            next_sequence_position: res.next_sequence_position,
+            error: res.error,
+            activation_f32_count,
+        };
+        write_blob_frame(io, &serde_json::to_vec(&header).map_err(invalid_data)?).await?;
+        write_f32_frame(io, &res.output_activation).await?;
+        io.close().await
+    }
+}
+
+fn checked_activation_count(count: usize) -> io::Result<u32> {
+    let bytes = count
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "activation byte size overflow")
+        })?;
+    if bytes > ACTIVATION_PAYLOAD_MAX_BYTES || count > u32::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("activation payload is too large: {bytes} bytes"),
+        ));
+    }
+    Ok(count as u32)
+}
+
+async fn read_f32_frame<T>(io: &mut T, count: u32) -> io::Result<Vec<f32>>
+where
+    T: AsyncRead + Unpin + Send,
+{
+    let byte_len = (count as usize)
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "activation size overflow"))?;
+    if byte_len > ACTIVATION_PAYLOAD_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("activation payload is too large: {byte_len} bytes"),
+        ));
+    }
+    let mut bytes = vec![0_u8; byte_len];
+    io.read_exact(&mut bytes).await?;
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect())
+}
+
+async fn write_f32_frame<T>(io: &mut T, values: &[f32]) -> io::Result<()>
+where
+    T: AsyncWrite + Unpin + Send,
+{
+    checked_activation_count(values.len())?;
+    let mut bytes = Vec::with_capacity(values.len() * 4);
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    io.write_all(&bytes).await
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ModelBlobResponseHeader {
@@ -233,6 +788,7 @@ struct ModelBlobResponseHeader {
     source_checksum: String,
     offset: u64,
     total_size_bytes: u64,
+    seed_manifest: Option<SeedShardManifest>,
     payload_len: u32,
     error: Option<String>,
 }
@@ -290,6 +846,7 @@ impl request_response::Codec for ModelBlobCodec {
             source_checksum: header.source_checksum,
             offset: header.offset,
             total_size_bytes: header.total_size_bytes,
+            seed_manifest: header.seed_manifest,
             payload,
             error: header.error,
         })
@@ -337,6 +894,7 @@ impl request_response::Codec for ModelBlobCodec {
             source_checksum: res.source_checksum,
             offset: res.offset,
             total_size_bytes: res.total_size_bytes,
+            seed_manifest: res.seed_manifest,
             payload_len: res.payload.len() as u32,
             error: res.error,
         };
@@ -485,9 +1043,17 @@ pub async fn run_worker_node(mut discovery: DiscoveryConfig, worker: WorkerConfi
     let mut registry = ShardRegistry::new();
     registry.extend(discovery.static_peers.clone());
 
-    let mut swarm = build_grid_swarm(discovery.keypair.clone(), &topic)?;
-    add_static_peer_addresses(&mut swarm, &discovery.static_peers);
-    listen_on(&mut swarm, &discovery.p2p_listen)?;
+    let mut swarm = build_grid_swarm(
+        discovery.keypair.clone(),
+        &topic,
+        discovery.relay_server,
+        discovery.enable_mdns,
+    )?;
+    // Reserve relay circuits before dialing the same bootstrap as a static
+    // peer. Starting the static dial first races libp2p's relay listener and
+    // can permanently leave this node without a circuit address.
+    start_grid_listeners(&mut swarm, &discovery)?;
+    add_static_peer_addresses(&mut swarm, &discovery.static_peers, &discovery.relay_peers);
     let shard_cache = worker
         .shard_cache
         .clone()
@@ -501,7 +1067,7 @@ pub async fn run_worker_node(mut discovery: DiscoveryConfig, worker: WorkerConfi
     loop {
         tokio::select! {
             _ = static_peer_dial_interval.tick(), if !discovery.static_peers.is_empty() => {
-                add_static_peer_addresses(&mut swarm, &discovery.static_peers);
+                add_static_peer_addresses(&mut swarm, &discovery.static_peers, &discovery.relay_peers);
             }
             _ = publish_interval.tick(), if discovery.advertisement.is_some() => {
                 refresh_advertisement_model_shards(
@@ -563,7 +1129,7 @@ pub async fn run_model_distribution_node(
     cache_config: ShardCacheConfig,
 ) -> Result<()> {
     let mut readiness = None;
-    run_model_distribution_node_inner(discovery, cache_config, &mut readiness).await
+    run_model_distribution_node_inner(discovery, cache_config, &mut readiness, None).await
 }
 
 pub async fn run_model_distribution_node_with_readiness(
@@ -572,7 +1138,34 @@ pub async fn run_model_distribution_node_with_readiness(
     readiness: ModelDistributionReadiness,
 ) -> Result<()> {
     let mut readiness = Some(readiness);
-    let result = run_model_distribution_node_inner(discovery, cache_config, &mut readiness).await;
+    let result =
+        run_model_distribution_node_inner(discovery, cache_config, &mut readiness, None).await;
+
+    if let Err(error) = &result {
+        signal_model_distribution_readiness(&mut readiness, Err(format!("{error:#}")));
+    }
+
+    result
+}
+
+/// Runs the long-lived model service and publishes its current peer registry
+/// to the owner. Desktop clients use this instead of creating a second swarm
+/// for every UI refresh, which otherwise causes visible connection churn and
+/// can race active model transfers.
+pub async fn run_model_distribution_node_with_readiness_and_registry(
+    discovery: DiscoveryConfig,
+    cache_config: ShardCacheConfig,
+    readiness: ModelDistributionReadiness,
+    registry_observer: ModelDistributionRegistryObserver,
+) -> Result<()> {
+    let mut readiness = Some(readiness);
+    let result = run_model_distribution_node_inner(
+        discovery,
+        cache_config,
+        &mut readiness,
+        Some(&registry_observer),
+    )
+    .await;
 
     if let Err(error) = &result {
         signal_model_distribution_readiness(&mut readiness, Err(format!("{error:#}")));
@@ -585,10 +1178,12 @@ async fn run_model_distribution_node_inner(
     mut discovery: DiscoveryConfig,
     cache_config: ShardCacheConfig,
     readiness: &mut Option<ModelDistributionReadiness>,
+    registry_observer: Option<&ModelDistributionRegistryObserver>,
 ) -> Result<()> {
     let topic = gossipsub::IdentTopic::new(discovery.topic.clone());
     let mut registry = ShardRegistry::new();
     registry.extend(discovery.static_peers.clone());
+    notify_registry_observer(registry_observer, &registry);
     let shard_cache = ShardCache::new(cache_config)?;
     let peer_id = discovery.peer_id().to_string();
 
@@ -597,9 +1192,18 @@ async fn run_model_distribution_node_inner(
     }
     refresh_advertisement_model_shards(&mut discovery.advertisement, Some(&shard_cache))?;
 
-    let mut swarm = build_grid_swarm(discovery.keypair.clone(), &topic)?;
-    add_static_peer_addresses(&mut swarm, &discovery.static_peers);
-    let listener_id = listen_on(&mut swarm, &discovery.p2p_listen)?;
+    let mut swarm = build_grid_swarm(
+        discovery.keypair.clone(),
+        &topic,
+        discovery.relay_server,
+        discovery.enable_mdns,
+    )?;
+    // The relay listener must own the first dial to a shared
+    // bootstrap/relay peer so its reservation cannot lose a dial race.
+    let listener_id = start_grid_listeners(&mut swarm, &discovery)?;
+    add_static_peer_addresses(&mut swarm, &discovery.static_peers, &discovery.relay_peers);
+    let rpc_tunnel_control = swarm.behaviour().rpc_tunnel.new_control();
+    let _rpc_tunnel_worker = start_local_rpc_tunnel_worker(&swarm)?;
 
     let mut publish_interval = interval(discovery.publish_interval);
     let mut static_peer_dial_interval = interval(Duration::from_secs(10));
@@ -620,7 +1224,7 @@ async fn run_model_distribution_node_inner(
                 )?;
             }
             _ = static_peer_dial_interval.tick(), if !discovery.static_peers.is_empty() => {
-                add_static_peer_addresses(&mut swarm, &discovery.static_peers);
+                add_static_peer_addresses(&mut swarm, &discovery.static_peers, &discovery.relay_peers);
             }
             _ = publish_interval.tick() => {
                 refresh_advertisement_model_shards(&mut discovery.advertisement, Some(&shard_cache))?;
@@ -696,16 +1300,54 @@ async fn run_model_distribution_node_inner(
                                 &mut pending_forwards,
                                 &local_completion_sender,
                                 &mut pending_local_activations,
+                                rpc_tunnel_control.clone(),
                             )?;
                         }
                     }
                 }
+                notify_registry_observer(registry_observer, &registry);
 
                 if let Some(address) = ready_address {
                     signal_model_distribution_readiness(readiness, Ok(address));
                 }
             }
         }
+    }
+}
+
+fn start_local_rpc_tunnel_worker(swarm: &Swarm<GridBehaviour>) -> Result<Option<RpcTunnelWorker>> {
+    let Some(endpoint) = local_llama_rpc_target().filter(|endpoint| endpoint.ready) else {
+        return Ok(None);
+    };
+    let host = endpoint
+        .host
+        .parse::<IpAddr>()
+        .with_context(|| format!("invalid process-local RPC host {}", endpoint.host))?;
+    let target = SocketAddr::new(host, endpoint.port);
+    if !target.ip().is_loopback() {
+        bail!("refusing non-loopback RPC tunnel target {target}");
+    }
+    // llama.cpp may overlap device discovery, allocation, and tensor transfer
+    // connections to one RPC worker during model load. The authenticated
+    // default keeps a strict bound without rejecting valid parallel sessions.
+    let admission =
+        RpcTunnelAdmission::allow_authenticated_peers(RpcTunnelAdmissionLimits::default())?;
+    let mut control = swarm.behaviour().rpc_tunnel.new_control();
+    let incoming = control
+        .accept(RPC_TUNNEL_PROTOCOL)
+        .map_err(|_| anyhow!("RPC tunnel protocol was already registered"))?;
+    Ok(Some(RpcTunnelWorker::spawn(
+        incoming,
+        RpcTunnelWorkerConfig::new(target, admission),
+    )?))
+}
+
+fn notify_registry_observer(
+    observer: Option<&ModelDistributionRegistryObserver>,
+    registry: &ShardRegistry,
+) {
+    if let Some(observer) = observer {
+        observer(registry.clone());
     }
 }
 
@@ -726,9 +1368,14 @@ pub async fn discover_for(mut config: DiscoveryConfig, timeout: Duration) -> Res
         registry.upsert(advertisement);
     }
 
-    let mut swarm = build_grid_swarm(config.keypair.clone(), &topic)?;
-    add_static_peer_addresses(&mut swarm, &config.static_peers);
-    listen_on(&mut swarm, &config.p2p_listen)?;
+    let mut swarm = build_grid_swarm(
+        config.keypair.clone(),
+        &topic,
+        config.relay_server,
+        config.enable_mdns,
+    )?;
+    start_grid_listeners(&mut swarm, &config)?;
+    add_static_peer_addresses(&mut swarm, &config.static_peers, &config.relay_peers);
 
     let deadline = Instant::now() + timeout;
 
@@ -753,7 +1400,7 @@ pub async fn discover_for(mut config: DiscoveryConfig, timeout: Duration) -> Res
 }
 
 pub async fn fetch_model_shard_over_libp2p(
-    mut config: DiscoveryConfig,
+    config: DiscoveryConfig,
     cache_config: ShardCacheConfig,
     model_id: String,
     layers: LayerRange,
@@ -761,8 +1408,32 @@ pub async fn fetch_model_shard_over_libp2p(
     version: Option<String>,
     discovery_timeout: Duration,
 ) -> Result<ModelFetchResult> {
+    fetch_model_shard_over_libp2p_with_progress(
+        config,
+        cache_config,
+        model_id,
+        layers,
+        checksum,
+        version,
+        discovery_timeout,
+        |_, _| {},
+    )
+    .await
+}
+
+pub async fn fetch_model_shard_over_libp2p_with_progress(
+    mut config: DiscoveryConfig,
+    cache_config: ShardCacheConfig,
+    model_id: String,
+    layers: LayerRange,
+    checksum: Option<String>,
+    version: Option<String>,
+    discovery_timeout: Duration,
+    mut on_progress: impl FnMut(u64, u64) + Send,
+) -> Result<ModelFetchResult> {
     let cache = ShardCache::new(cache_config)?;
     if let Some(record) = cache.find(&model_id, layers, checksum.as_deref(), version.as_deref())? {
+        on_progress(record.info.size_bytes, record.info.size_bytes);
         return Ok(ModelFetchResult {
             shard: record.info.clone(),
             source_peer_id: "local-cache".to_owned(),
@@ -780,34 +1451,51 @@ pub async fn fetch_model_shard_over_libp2p(
     }
     refresh_advertisement_model_shards(&mut config.advertisement, Some(&cache))?;
 
-    let mut swarm = build_grid_swarm(config.keypair.clone(), &topic)?;
-    add_static_peer_addresses(&mut swarm, &config.static_peers);
-    listen_on(&mut swarm, &config.p2p_listen)?;
+    let mut swarm = build_grid_swarm(
+        config.keypair.clone(),
+        &topic,
+        config.relay_server,
+        config.enable_mdns,
+    )?;
+    start_grid_listeners(&mut swarm, &config)?;
+    // A download request must own the target dial. Proactively dialing every
+    // discovered seed here races request-response and produces an immediate
+    // `DialFailure` while the correct connection is still in progress.
+    for advertisement in &config.static_peers {
+        add_advertisement_addresses(&mut swarm, advertisement);
+    }
 
     let deadline = Instant::now() + discovery_timeout;
     let mut publish_interval = interval(config.publish_interval);
+    let mut relay_ready = config.relay_peers.is_empty();
     let partial_dir = cache.config().root.join("tmp");
     fs::create_dir_all(&partial_dir)
         .with_context(|| format!("failed to create {}", partial_dir.display()))?;
+    let partial_identity = sanitize_path_segment(checksum.as_deref().unwrap_or("unresolved"));
     let partial_path = partial_dir.join(format!(
         "{}-{}-{}-{}.gguf.partial",
         sanitize_path_segment(&model_id),
         layers.start,
         layers.end,
-        uuid::Uuid::new_v4()
+        &partial_identity[..partial_identity.len().min(16)]
     ));
-    let _ = fs::remove_file(&partial_path);
-    let _partial_cleanup = RemoveFileOnDrop(partial_path.clone());
-    let mut downloaded_bytes = 0_u64;
+    // Keep a content-addressed partial file across restarts. The completed
+    // package is still SHA-256 verified before entering the cache, so resume
+    // never weakens package integrity.
+    let mut downloaded_bytes = fs::metadata(&partial_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
     let mut pending_request: Option<(
         request_response::OutboundRequestId,
         ModelShardCandidate,
         u64,
     )> = None;
+    let mut pending_dial: Option<ModelShardCandidate> = None;
     let mut failed_peers = HashMap::<String, Instant>::new();
+    let mut progress_started = false;
 
     loop {
-        if pending_request.is_none() {
+        if pending_request.is_none() && pending_dial.is_none() && relay_ready {
             if let Some(candidate) = select_model_shard_candidate(
                 &registry,
                 &local_peer_id,
@@ -835,6 +1523,19 @@ pub async fn fetch_model_shard_over_libp2p(
                         cache.config().max_storage_bytes
                     );
                 }
+                if downloaded_bytes > candidate.shard.size_bytes {
+                    fs::remove_file(&partial_path).with_context(|| {
+                        format!(
+                            "failed to reset oversized partial {}",
+                            partial_path.display()
+                        )
+                    })?;
+                    downloaded_bytes = 0;
+                }
+                if !progress_started {
+                    on_progress(downloaded_bytes, candidate.shard.size_bytes);
+                    progress_started = true;
+                }
                 let request = ModelBlobRequest::new_shard(
                     model_id.clone(),
                     layers,
@@ -842,9 +1543,24 @@ pub async fn fetch_model_shard_over_libp2p(
                     downloaded_bytes,
                     MODEL_BLOB_CHUNK_BYTES,
                 );
-                let request_id =
-                    send_model_blob_request(&mut swarm, &candidate.advertisement, request)?;
-                pending_request = Some((request_id, candidate, downloaded_bytes));
+                let candidate_peer_id = candidate
+                    .advertisement
+                    .peer_id
+                    .parse::<PeerId>()
+                    .with_context(|| {
+                        format!(
+                            "invalid model seed peer id {}",
+                            candidate.advertisement.peer_id
+                        )
+                    })?;
+                if swarm.is_connected(&candidate_peer_id) {
+                    let request_id =
+                        send_model_blob_request(&mut swarm, &candidate.advertisement, request)?;
+                    pending_request = Some((request_id, candidate, downloaded_bytes));
+                } else {
+                    dial_model_blob_peer(&mut swarm, &candidate.advertisement)?;
+                    pending_dial = Some(candidate);
+                }
             }
         }
 
@@ -859,6 +1575,55 @@ pub async fn fetch_model_shard_over_libp2p(
                 )?;
             }
             event = swarm.select_next_some() => {
+                if matches!(
+                    &event,
+                    SwarmEvent::Behaviour(GridBehaviourEvent::RelayClient(
+                        relay::client::Event::ReservationReqAccepted { .. }
+                    ))
+                ) {
+                    relay_ready = true;
+                }
+                let connected_pending_seed = match (&event, pending_dial.as_ref()) {
+                    (
+                        SwarmEvent::ConnectionEstablished { peer_id, .. },
+                        Some(candidate),
+                    ) => candidate.advertisement.peer_id == peer_id.to_string(),
+                    _ => false,
+                };
+                let failed_pending_seed = match (&event, pending_dial.as_ref()) {
+                    (
+                        SwarmEvent::OutgoingConnectionError {
+                            peer_id: Some(peer_id),
+                            ..
+                        },
+                        Some(candidate),
+                    ) => candidate.advertisement.peer_id == peer_id.to_string(),
+                    _ => false,
+                };
+                if connected_pending_seed {
+                    if let Some(candidate) = pending_dial.take() {
+                        let request = ModelBlobRequest::new_shard(
+                            model_id.clone(),
+                            layers,
+                            candidate.shard.checksum.clone(),
+                            downloaded_bytes,
+                            MODEL_BLOB_CHUNK_BYTES,
+                        );
+                        let request_id = send_model_blob_request(
+                            &mut swarm,
+                            &candidate.advertisement,
+                            request,
+                        )?;
+                        pending_request = Some((request_id, candidate, downloaded_bytes));
+                    }
+                } else if failed_pending_seed {
+                    if let Some(candidate) = pending_dial.take() {
+                        record_model_fetch_peer_failure(
+                            &mut failed_peers,
+                            candidate.advertisement.peer_id,
+                        );
+                    }
+                }
                 if let Some(network_event) = handle_grid_event(
                     &mut swarm,
                     event,
@@ -869,14 +1634,14 @@ pub async fn fetch_model_shard_over_libp2p(
                     config.dial_discovered_peers,
                 )? {
                     match network_event {
-                        GridNetworkEvent::ModelBlob(ModelBlobNetworkEvent::Response { request_id, response }) => {
-                            if let Some((pending_id, candidate, expected_offset)) = pending_request.take() {
+                        GridNetworkEvent::ModelBlob(ModelBlobNetworkEvent::Response { request_id, mut response }) => {
+                            if let Some((pending_id, mut candidate, expected_offset)) = pending_request.take() {
                                 if request_id != pending_id {
                                     pending_request = Some((pending_id, candidate, expected_offset));
                                     continue;
                                 }
 
-                                if let Some(error) = response.error {
+                                if let Some(error) = response.error.take() {
                                     record_model_fetch_peer_failure(
                                         &mut failed_peers,
                                         candidate.advertisement.peer_id.clone(),
@@ -885,6 +1650,9 @@ pub async fn fetch_model_shard_over_libp2p(
                                         "model shard chunk request failed: {error}; retrying peer after cooldown"
                                     );
                                     continue;
+                                }
+                                if candidate.seed_manifest.is_none() {
+                                    candidate.seed_manifest = response.seed_manifest.clone();
                                 }
                                 if response.model_id != model_id
                                     || response.source_checksum != candidate.shard.checksum
@@ -940,13 +1708,22 @@ pub async fn fetch_model_shard_over_libp2p(
                                 }
                                 append_source_chunk(&partial_path, &response.payload)?;
                                 downloaded_bytes = next_downloaded;
+                                on_progress(downloaded_bytes, candidate.shard.size_bytes);
 
                                 if downloaded_bytes >= candidate.shard.size_bytes {
-                                    let cache_record = cache.store_downloaded_file(
+                                    let cache_record = match cache.store_downloaded_file(
                                         &candidate.shard,
                                         &partial_path,
                                         candidate.seed_manifest.clone(),
-                                    )?;
+                                    ) {
+                                        Ok(record) => record,
+                                        Err(error) => {
+                                            // A complete file that fails its final digest must not
+                                            // poison every future resume attempt.
+                                            let _ = fs::remove_file(&partial_path);
+                                            return Err(error);
+                                        }
+                                    };
                                     refresh_advertisement_model_shards(&mut config.advertisement, Some(&cache))?;
                                     publish_local_advertisement(
                                         &mut swarm,
@@ -1047,12 +1824,20 @@ pub async fn fetch_model_source_over_libp2p(
     }
     refresh_advertisement_model_shards(&mut config.advertisement, Some(&cache))?;
 
-    let mut swarm = build_grid_swarm(config.keypair.clone(), &topic)?;
-    add_static_peer_addresses(&mut swarm, &config.static_peers);
-    listen_on(&mut swarm, &config.p2p_listen)?;
+    let mut swarm = build_grid_swarm(
+        config.keypair.clone(),
+        &topic,
+        config.relay_server,
+        config.enable_mdns,
+    )?;
+    start_grid_listeners(&mut swarm, &config)?;
+    for advertisement in &config.static_peers {
+        add_advertisement_addresses(&mut swarm, advertisement);
+    }
 
     let deadline = Instant::now() + discovery_timeout;
     let mut publish_interval = interval(config.publish_interval);
+    let mut relay_ready = config.relay_peers.is_empty();
     let partial_path = final_path.with_extension("gguf.partial");
     if let Some(parent) = final_path.parent() {
         fs::create_dir_all(parent)
@@ -1068,7 +1853,7 @@ pub async fn fetch_model_source_over_libp2p(
     on_progress(downloaded_bytes, total_size_bytes);
 
     loop {
-        if pending_request.is_none() {
+        if pending_request.is_none() && relay_ready {
             if let Some(advertisement) = select_model_blob_candidate(
                 &registry,
                 &local_peer_id,
@@ -1098,6 +1883,14 @@ pub async fn fetch_model_source_over_libp2p(
                 )?;
             }
             event = swarm.select_next_some() => {
+                if matches!(
+                    &event,
+                    SwarmEvent::Behaviour(GridBehaviourEvent::RelayClient(
+                        relay::client::Event::ReservationReqAccepted { .. }
+                    ))
+                ) {
+                    relay_ready = true;
+                }
                 if let Some(network_event) = handle_grid_event(
                     &mut swarm,
                     event,
@@ -1290,8 +2083,10 @@ pub async fn infer_over_libp2p(
     hidden_size: usize,
     discovery_timeout: Duration,
 ) -> Result<InferenceResult> {
-    let rpc_endpoints = normalize_trusted_rpc_endpoints(&config.rpc_endpoints)?;
-    if !rpc_endpoints.is_empty() {
+    if !config.rpc_endpoints.is_empty() {
+        bail!("raw RPC endpoints cannot cross the network; select authenticated worker peers");
+    }
+    if !config.rpc_worker_peer_ids.is_empty() {
         validate_rpc_model_manifest(&manifest)?;
     }
 
@@ -1299,9 +2094,14 @@ pub async fn infer_over_libp2p(
     let mut registry = ShardRegistry::new();
     registry.extend(config.static_peers.clone());
 
-    let mut swarm = build_grid_swarm(config.keypair.clone(), &topic)?;
-    add_static_peer_addresses(&mut swarm, &config.static_peers);
-    listen_on(&mut swarm, &config.p2p_listen)?;
+    let mut swarm = build_grid_swarm(
+        config.keypair.clone(),
+        &topic,
+        config.relay_server,
+        config.enable_mdns,
+    )?;
+    start_grid_listeners(&mut swarm, &config)?;
+    add_static_peer_addresses(&mut swarm, &config.static_peers, &config.relay_peers);
 
     let route = if let Some(route) = config.planned_route.clone() {
         validate_planned_route(&route, &manifest, &config.static_peers)?;
@@ -1324,24 +2124,35 @@ pub async fn infer_over_libp2p(
     } else {
         Vec::new()
     };
+    let prompt_metadata = PromptMetadata {
+        prompt,
+        demo_mode,
+        rpc_endpoints: Vec::new(),
+        rpc_worker_peer_ids: Vec::new(),
+    };
     let request = ActivationRequest::new(
         manifest.model_id.clone(),
         route.clone(),
         hidden_size,
         activation,
-        Some(PromptMetadata {
-            prompt,
-            demo_mode,
-            rpc_endpoints,
-        }),
+        Some(prompt_metadata.clone()),
     );
     let first_hop = request
         .current_hop()
         .cloned()
         .ok_or_else(|| anyhow!("route must contain at least one hop"))?;
+    connect_to_activation_hop(
+        &mut swarm,
+        &mut registry,
+        &mut config,
+        &topic,
+        &first_hop,
+        Duration::from_secs(30),
+    )
+    .await?;
     let outbound_id =
         send_activation_request_with_relays(&mut swarm, &config.static_peers, &first_hop, request)?;
-    let response = wait_for_client_response(
+    let mut response = wait_for_client_response(
         &mut swarm,
         &mut registry,
         &mut config,
@@ -1354,10 +2165,78 @@ pub async fn infer_over_libp2p(
     )
     .await?;
 
-    if let Some(error) = &response.error {
-        bail!("remote activation error: {error}");
+    if demo_mode {
+        if let Some(error) = &response.error {
+            bail!("remote activation error: {error}");
+        }
+        return Ok(InferenceResult { route, response });
     }
 
+    const MAX_GENERATED_TOKENS: usize = 64;
+    let trace_id = response.trace_id;
+    let mut output_text = String::new();
+    let mut complete_trace = Vec::new();
+    let mut generated_tokens = 0_usize;
+    loop {
+        if let Some(error) = &response.error {
+            bail!("remote activation error: {error}");
+        }
+        complete_trace.append(&mut response.trace);
+        if let Some(piece) = response.output_text.take() {
+            output_text.push_str(&piece);
+        }
+        if response.generation_complete || generated_tokens >= MAX_GENERATED_TOKENS {
+            break;
+        }
+        let sampled_token_id = response.sampled_token_id.ok_or_else(|| {
+            anyhow!("final Infernet worker returned no sampled token for the next pipeline pass")
+        })?;
+        generated_tokens += 1;
+        if generated_tokens >= MAX_GENERATED_TOKENS {
+            break;
+        }
+
+        let mut next_request = ActivationRequest::new(
+            manifest.model_id.clone(),
+            route.clone(),
+            hidden_size,
+            Vec::new(),
+            Some(prompt_metadata.clone()),
+        );
+        next_request.trace_id = trace_id;
+        next_request.input_token_id = Some(sampled_token_id);
+        next_request.sequence_position = response.next_sequence_position;
+        let first_hop = next_request
+            .current_hop()
+            .cloned()
+            .ok_or_else(|| anyhow!("route must contain at least one hop"))?;
+        connect_to_activation_hop(
+            &mut swarm,
+            &mut registry,
+            &mut config,
+            &topic,
+            &first_hop,
+            Duration::from_secs(30),
+        )
+        .await?;
+        let outbound_id = send_activation_request_with_relays(
+            &mut swarm,
+            &config.static_peers,
+            &first_hop,
+            next_request,
+        )?;
+        response = wait_for_client_response(
+            &mut swarm,
+            &mut registry,
+            &mut config,
+            &topic,
+            outbound_id,
+            Duration::from_secs(5 * 60),
+        )
+        .await?;
+    }
+    response.trace = complete_trace;
+    response.output_text = Some(output_text);
     Ok(InferenceResult { route, response })
 }
 
@@ -1368,18 +2247,16 @@ fn normalize_trusted_rpc_endpoints(endpoints: &[String]) -> Result<Vec<String>> 
     for endpoint in endpoints {
         let endpoint = endpoint.trim();
         let (host, port) = endpoint.split_once(':').ok_or_else(|| {
-            anyhow!("llama RPC endpoint must use the private IPv4 host:port form")
+            anyhow!("llama RPC endpoint must use the loopback IPv4 host:port form")
         })?;
         if host.is_empty() || port.is_empty() || port.contains(':') {
-            bail!("llama RPC endpoint must use the private IPv4 host:port form");
+            bail!("llama RPC endpoint must use the loopback IPv4 host:port form");
         }
         let host = host.parse::<Ipv4Addr>().with_context(|| {
-            format!("llama RPC endpoint {endpoint:?} must use a private IPv4 address")
+            format!("llama RPC endpoint {endpoint:?} must use a loopback IPv4 address")
         })?;
         if !is_trusted_rpc_ipv4(host) {
-            bail!(
-                "llama RPC endpoint {endpoint:?} is not on a private LAN, link-local, or Tailscale address"
-            );
+            bail!("llama RPC endpoint {endpoint:?} is not process-local loopback");
         }
         if !port.bytes().all(|byte| byte.is_ascii_digit()) {
             bail!("llama RPC endpoint {endpoint:?} has an invalid port");
@@ -1418,10 +2295,9 @@ fn validate_planned_route(
         }
         let advertised = advertisements.iter().any(|advertisement| {
             advertisement.peer_id == hop.peer_id
-                && advertisement
-                    .hosted_shards
-                    .iter()
-                    .any(|shard| shard.model_id == manifest.model_id && shard.layers == hop.layers)
+                && advertisement.hosted_shards.iter().any(|shard| {
+                    shard.model_id == manifest.model_id && shard.layers.contains(&hop.layers)
+                })
         });
         if !advertised {
             bail!(
@@ -1438,9 +2314,7 @@ fn validate_planned_route(
 }
 
 fn is_trusted_rpc_ipv4(address: Ipv4Addr) -> bool {
-    let [first, second, _, _] = address.octets();
-    let carrier_grade_nat = first == 100 && (64..=127).contains(&second);
-    address.is_private() || address.is_link_local() || carrier_grade_nat
+    address.is_loopback()
 }
 
 fn validate_rpc_model_manifest(manifest: &ModelManifest) -> Result<()> {
@@ -1660,6 +2534,9 @@ pub fn process_activation_step(
         .expect("validation ensures a current hop exists");
     let started = Instant::now();
     let mut output_text = None;
+    let mut sampled_token_id = None;
+    let mut generation_complete = false;
+    let mut next_sequence_position = request.sequence_position;
     let timing_ms;
 
     match config.runtime_kind {
@@ -1682,6 +2559,9 @@ pub fn process_activation_step(
             Ok(output) => {
                 request.activation = output.activation;
                 output_text = output.output_text;
+                sampled_token_id = output.sampled_token_id;
+                generation_complete = output.generation_complete;
+                next_sequence_position = output.next_sequence_position;
                 timing_ms = output.timing_ms;
             }
             Err(error) => {
@@ -1713,12 +2593,12 @@ pub fn process_activation_step(
     } else {
         let output =
             output_text.unwrap_or_else(|| DemoRuntime::decode_activation(&request.activation));
-        Ok(ActivationStep::Final(ActivationResponse::success(
-            request,
-            config.peer_id.clone(),
-            Some(output),
-            timing_ms,
-        )))
+        let mut response =
+            ActivationResponse::success(request, config.peer_id.clone(), Some(output), timing_ms);
+        response.sampled_token_id = sampled_token_id;
+        response.generation_complete = generation_complete;
+        response.next_sequence_position = next_sequence_position;
+        Ok(ActivationStep::Final(response))
     }
 }
 
@@ -1726,6 +2606,9 @@ pub fn process_activation_step(
 struct LlamaShardOutput {
     activation: Vec<f32>,
     output_text: Option<String>,
+    sampled_token_id: Option<i32>,
+    generation_complete: bool,
+    next_sequence_position: u32,
     timing_ms: u64,
 }
 
@@ -1743,7 +2626,192 @@ struct LlamaBridgeJson {
     #[serde(default)]
     output_text: Option<String>,
     #[serde(default)]
+    sampled_token_id: Option<i32>,
+    #[serde(default)]
+    generation_complete: bool,
+    #[serde(default)]
+    next_sequence_position: u32,
+    #[serde(default)]
     timing_ms: Option<f64>,
+}
+
+struct PersistentInfernetWorker {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+}
+
+static PERSISTENT_INFERNET_WORKERS: OnceLock<Mutex<HashMap<String, PersistentInfernetWorker>>> =
+    OnceLock::new();
+
+impl PersistentInfernetWorker {
+    fn spawn(
+        bridge: &Path,
+        model_path: &Path,
+        layers: LayerRange,
+        hidden_size: usize,
+    ) -> Result<Self> {
+        let mut command = Command::new(bridge);
+        if let Some(runtime_dir) = bridge.parent() {
+            command.current_dir(runtime_dir);
+        }
+        constrain_llama_bridge_library_threads(&mut command);
+        #[cfg(target_os = "windows")]
+        {
+            let mut library_dirs = Vec::new();
+            if let Some(parent) = bridge.parent() {
+                library_dirs.push(parent.to_path_buf());
+            }
+            if let Some(path) = env::var_os("PATH") {
+                library_dirs.extend(env::split_paths(&path));
+            }
+            if let Ok(path) = env::join_paths(library_dirs) {
+                command.env("PATH", path);
+            }
+        }
+        command
+            .arg("--model")
+            .arg(model_path)
+            .arg("--layer-start")
+            .arg(layers.start.to_string())
+            .arg("--layer-end")
+            .arg(layers.end.to_string())
+            .arg("--hidden-size")
+            .arg(hidden_size.to_string())
+            .arg("--threads")
+            .arg(llama_bridge_thread_cap().to_string())
+            .arg("--max-context")
+            .arg("8192")
+            .arg("--server")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+
+        let mut child = command.spawn().with_context(|| {
+            format!(
+                "failed to start persistent Infernet worker for {}:{}",
+                layers.start, layers.end
+            )
+        })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("persistent Infernet worker has no stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("persistent Infernet worker has no stdout"))?;
+        let mut worker = Self {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+        };
+        let ready = worker.read_json_line()?;
+        if !ready
+            .get("ready")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            let error = ready
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("worker stopped before becoming ready");
+            bail!("persistent Infernet worker failed to load local layers: {error}");
+        }
+        Ok(worker)
+    }
+
+    fn request(&mut self, command: &str) -> Result<LlamaBridgeJson> {
+        if self.child.try_wait()?.is_some() {
+            bail!("persistent Infernet worker exited unexpectedly");
+        }
+        self.stdin
+            .write_all(command.as_bytes())
+            .context("failed to send work to persistent Infernet worker")?;
+        self.stdin.write_all(b"\n")?;
+        self.stdin.flush()?;
+        let value = self.read_json_line()?;
+        serde_json::from_value(value).context("failed to parse persistent Infernet worker response")
+    }
+
+    fn read_json_line(&mut self) -> Result<serde_json::Value> {
+        let mut line = String::new();
+        let read = self
+            .stdout
+            .read_line(&mut line)
+            .context("failed to read persistent Infernet worker response")?;
+        if read == 0 {
+            bail!("persistent Infernet worker closed its output stream");
+        }
+        serde_json::from_str(line.trim()).with_context(|| {
+            format!(
+                "persistent Infernet worker emitted invalid JSON: {}",
+                line.trim()
+            )
+        })
+    }
+}
+
+impl Drop for PersistentInfernetWorker {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn encode_worker_field(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(value.len() * 2);
+    for byte in value.as_bytes() {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn run_persistent_infernet_worker(
+    bridge: &Path,
+    model_path: &Path,
+    layers: LayerRange,
+    hidden_size: usize,
+    command: &str,
+) -> Result<LlamaBridgeJson> {
+    let key = format!(
+        "{}:{}:{}:{}:{}",
+        bridge.display(),
+        model_path.display(),
+        layers.start,
+        layers.end,
+        hidden_size
+    );
+    let workers = PERSISTENT_INFERNET_WORKERS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut workers = workers
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for attempt in 0..2 {
+        if !workers.contains_key(&key) {
+            workers.insert(
+                key.clone(),
+                PersistentInfernetWorker::spawn(bridge, model_path, layers, hidden_size)?,
+            );
+        }
+        let result = workers
+            .get_mut(&key)
+            .expect("worker was inserted")
+            .request(command);
+        match result {
+            Ok(output) => return Ok(output),
+            Err(error) if attempt == 0 => {
+                workers.remove(&key);
+                eprintln!(
+                    "persistent_worker_restart layers={}:{} error={error:#}",
+                    layers.start, layers.end
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!()
 }
 
 fn execute_llama_cpp_shard(
@@ -1784,37 +2852,6 @@ fn execute_llama_cpp_shard(
             manifest.runtime_kind.as_str()
         );
     }
-    let rpc_endpoints =
-        validated_rpc_endpoints_for_execution(config, layers, request, &manifest, &model_path)?;
-    if !rpc_endpoints.is_empty() {
-        let binary = find_llama_server_binary().ok_or_else(|| {
-            anyhow!(
-                "llama-server binary is missing; run npm run prepare-runtime or set INFERNET_LLAMA_SERVER"
-            )
-        })?;
-        let release = OfficialModelRelease::infernet_chat_v1_compatibility();
-        let completion = complete_with_persistent_llama_server(
-            LlamaServerConfig {
-                binary,
-                model_path,
-                rpc_endpoints,
-                context_size: release.launch_context_cap_tokens,
-                threads: llama_bridge_thread_cap(),
-                cache_ram_mib: 0,
-                startup_timeout: Duration::from_secs(8 * 60),
-                request_timeout: Duration::from_secs(7 * 60),
-                log_dir: cache_config.root.join("runtime"),
-            },
-            &prompt.prompt,
-            64,
-        )?;
-        return Ok(LlamaShardOutput {
-            activation: Vec::new(),
-            output_text: Some(completion.text),
-            timing_ms: completion.timing_ms,
-        });
-    }
-
     let bridge = find_llama_bridge_binary().ok_or_else(|| {
         anyhow!(
             "infernet-llama-bridge binary is missing; run npm run prepare-runtime or set INFERNET_LLAMA_BRIDGE"
@@ -1824,7 +2861,10 @@ fn execute_llama_cpp_shard(
     let temp_root = env::temp_dir().join("infernet-activation-frames");
     fs::create_dir_all(&temp_root)
         .with_context(|| format!("failed to create {}", temp_root.display()))?;
-    let frame_id = format!("{}-{}", request.trace_id, request.current_hop_index);
+    let frame_id = format!(
+        "{}-{}-{}",
+        request.trace_id, request.current_hop_index, request.sequence_position
+    );
     let input_path = temp_root.join(format!("{frame_id}-in.f32"));
     let output_path = temp_root.join(format!("{frame_id}-out.f32"));
 
@@ -1832,79 +2872,45 @@ fn execute_llama_cpp_shard(
         write_f32_activation(&input_path, &request.activation)?;
     }
 
-    let mut command = Command::new(&bridge);
-    if let Some(runtime_dir) = bridge.parent() {
-        command.current_dir(runtime_dir);
-    }
-    constrain_llama_bridge_library_threads(&mut command);
-    #[cfg(target_os = "windows")]
-    {
-        let mut library_dirs = Vec::new();
-        if let Some(parent) = bridge.parent() {
-            library_dirs.push(parent.to_path_buf());
-        }
-        if let Some(path) = env::var_os("PATH") {
-            library_dirs.extend(env::split_paths(&path));
-        }
-        if let Ok(path) = env::join_paths(library_dirs) {
-            command.env("PATH", path);
-        }
-    }
+    let input = if request.activation.is_empty() {
+        String::new()
+    } else {
+        input_path.to_string_lossy().into_owned()
+    };
+    let output = if request.next_hop().is_some() {
+        output_path.to_string_lossy().into_owned()
+    } else {
+        String::new()
+    };
+    let command = match request.input_token_id {
+        Some(token_id) => format!(
+            "TOKEN\t{}\t{}\t{}\t{}\t{}",
+            request.trace_id,
+            token_id,
+            request.sequence_position,
+            encode_worker_field(&input),
+            encode_worker_field(&output)
+        ),
+        None => format!(
+            "PREFILL\t{}\t{}\t{}\t{}",
+            request.trace_id,
+            encode_worker_field(&prompt.prompt),
+            encode_worker_field(&input),
+            encode_worker_field(&output)
+        ),
+    };
+    let bridge_output =
+        run_persistent_infernet_worker(&bridge, &model_path, layers, config.hidden_size, &command)?;
 
-    command
-        .arg("--model")
-        .arg(&model_path)
-        .arg("--layer-start")
-        .arg(layers.start.to_string())
-        .arg("--layer-end")
-        .arg(layers.end.to_string())
-        .arg("--hidden-size")
-        .arg(config.hidden_size.to_string())
-        .arg("--threads")
-        .arg(llama_bridge_thread_cap().to_string())
-        .arg("--prompt")
-        .arg(&prompt.prompt);
-    if layers.start == 0 && layers.end == manifest.layer_count {
-        // Compatibility packages must use llama.cpp's unmodified full graph.
-        // Enabling Infernet's partial-graph patch here breaks architectures for
-        // which no split executor exists yet (including Qwen 3.5).
-        command.arg("--full-model");
-    }
-    append_llama_rpc_arguments(&mut command, &rpc_endpoints);
-    if !request.activation.is_empty() {
-        command.arg("--input").arg(&input_path);
-    }
-    if request.next_hop().is_some() {
-        command.arg("--output").arg(&output_path);
-    }
-
-    let output = run_llama_bridge_with_timeout(&mut command, LLAMA_BRIDGE_EXECUTION_TIMEOUT)
-        .with_context(|| {
-            format!(
-                "failed to run {} for {} {}:{}",
-                bridge.display(),
-                config.model_id,
-                layers.start,
-                layers.end
-            )
-        })?;
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let bridge_output = parse_llama_bridge_json(&output)?;
-
-    if !output.status.success() || !bridge_output.ok {
+    if !bridge_output.ok {
         bail!(
-            "infernet-llama-bridge failed for {} {}:{}: {}{}",
+            "persistent Infernet worker failed for {} {}:{}: {}",
             config.model_id,
             layers.start,
             layers.end,
             bridge_output
                 .error
-                .unwrap_or_else(|| format!("exit status {:?}", output.status.code())),
-            if stderr.trim().is_empty() {
-                String::new()
-            } else {
-                format!("; stderr={}", stderr.trim())
-            }
+                .unwrap_or_else(|| "unknown worker error".to_owned()),
         );
     }
 
@@ -1954,6 +2960,9 @@ fn execute_llama_cpp_shard(
     Ok(LlamaShardOutput {
         activation,
         output_text: bridge_output.output_text,
+        sampled_token_id: bridge_output.sampled_token_id,
+        generation_complete: bridge_output.generation_complete,
+        next_sequence_position: bridge_output.next_sequence_position,
         timing_ms: bridge_output
             .timing_ms
             .map(|value| value.max(0.0).round() as u64)
@@ -2471,6 +3480,91 @@ async fn wait_for_client_response(
     }
 }
 
+async fn connect_to_activation_hop(
+    swarm: &mut Swarm<GridBehaviour>,
+    registry: &mut ShardRegistry,
+    config: &mut DiscoveryConfig,
+    topic: &gossipsub::IdentTopic,
+    hop: &RouteHop,
+    timeout: Duration,
+) -> Result<()> {
+    let peer_id = hop
+        .peer_id
+        .parse::<PeerId>()
+        .with_context(|| format!("invalid libp2p peer id {}", hop.peer_id))?;
+    if swarm.is_connected(&peer_id) {
+        return Ok(());
+    }
+
+    let addresses = hop_addresses(hop)?;
+    let deadline = Instant::now() + timeout;
+    let mut retry = interval(Duration::from_millis(500));
+    let mut last_error = None::<String>;
+
+    loop {
+        tokio::select! {
+            _ = retry.tick() => {
+                if swarm.is_connected(&peer_id) {
+                    return Ok(());
+                }
+                let dial = if addresses.is_empty() {
+                    DialOpts::peer_id(peer_id)
+                        .condition(PeerCondition::DisconnectedAndNotDialing)
+                        .build()
+                } else {
+                    DialOpts::peer_id(peer_id)
+                        .condition(PeerCondition::DisconnectedAndNotDialing)
+                        .addresses(addresses.clone())
+                        .extend_addresses_through_behaviour()
+                        .build()
+                };
+                if let Err(error) = swarm.dial(dial) {
+                    last_error = Some(error.to_string());
+                }
+            }
+            event = swarm.select_next_some() => {
+                let connected = matches!(
+                    &event,
+                    SwarmEvent::ConnectionEstablished { peer_id: connected_peer, .. }
+                        if connected_peer == &peer_id
+                );
+                if let SwarmEvent::OutgoingConnectionError {
+                    peer_id: Some(failed_peer),
+                    error,
+                    ..
+                } = &event
+                {
+                    if failed_peer == &peer_id {
+                        last_error = Some(error.to_string());
+                    }
+                }
+                let _ = handle_grid_event(
+                    swarm,
+                    event,
+                    registry,
+                    &mut config.advertisement,
+                    topic,
+                    config.advertise_listen_addresses,
+                    config.dial_discovered_peers,
+                )?;
+                if connected || swarm.is_connected(&peer_id) {
+                    return Ok(());
+                }
+            }
+            _ = sleep_until(deadline) => {
+                bail!(
+                    "timed out connecting to activation peer {}{}",
+                    hop.peer_id,
+                    last_error
+                        .as_deref()
+                        .map(|error| format!(": {error}"))
+                        .unwrap_or_default()
+                );
+            }
+        }
+    }
+}
+
 fn handle_worker_activation_event(
     swarm: &mut Swarm<GridBehaviour>,
     worker: &WorkerConfig,
@@ -2588,6 +3682,7 @@ fn handle_cached_activation_event(
     pending_forwards: &mut HashMap<request_response::OutboundRequestId, PendingOutbound>,
     completion_sender: &mpsc::UnboundedSender<CompletedLocalActivation>,
     pending_local_activations: &mut HashMap<uuid::Uuid, PendingLocalActivation>,
+    rpc_tunnel_control: libp2p_stream::Control,
 ) -> Result<()> {
     match network_event {
         ActivationNetworkEvent::Request { request, channel } => {
@@ -2601,6 +3696,7 @@ fn handle_cached_activation_event(
                 pending_forwards,
                 completion_sender,
                 pending_local_activations,
+                rpc_tunnel_control,
             )?;
         }
         ActivationNetworkEvent::Response {
@@ -2652,6 +3748,7 @@ fn handle_cached_activation_request(
     pending_forwards: &mut HashMap<request_response::OutboundRequestId, PendingOutbound>,
     completion_sender: &mpsc::UnboundedSender<CompletedLocalActivation>,
     pending_local_activations: &mut HashMap<uuid::Uuid, PendingLocalActivation>,
+    _rpc_tunnel_control: libp2p_stream::Control,
 ) -> Result<()> {
     let trace_id = request.trace_id;
     if request
@@ -2682,6 +3779,25 @@ fn handle_cached_activation_request(
         return Ok(());
     }
 
+    if request
+        .prompt
+        .as_ref()
+        .is_some_and(|prompt| !prompt.rpc_endpoints.is_empty())
+    {
+        send_response(
+            swarm,
+            channel,
+            ActivationResponse::failure(
+                trace_id,
+                peer_id.to_owned(),
+                "raw RPC endpoints are forbidden; use authenticated Infernet worker identities"
+                    .to_owned(),
+                request.trace,
+            ),
+        );
+        return Ok(());
+    }
+
     let worker = match worker_config_for_activation(cache, peer_id, &request) {
         Ok(worker) => worker,
         Err(error) => {
@@ -2700,6 +3816,11 @@ fn handle_cached_activation_request(
     };
 
     let job_id = uuid::Uuid::new_v4();
+    let activity_kind = if request.prompt.is_some() && request.route.len() == 1 {
+        LocalNodeActivityKind::ChatCompletion
+    } else {
+        LocalNodeActivityKind::ComputeContribution
+    };
     pending_local_activations.insert(
         job_id,
         PendingLocalActivation {
@@ -2707,11 +3828,27 @@ fn handle_cached_activation_request(
             peer_id: peer_id.to_owned(),
         },
     );
+    start_local_node_activity(job_id, trace_id, activity_kind);
     let completion_sender = completion_sender.clone();
     let peer_id = peer_id.to_owned();
     set_local_inference_active(true);
-    tokio::task::spawn_blocking(move || {
-        let outcome = process_local_activation_steps(&worker, &peer_id, request);
+    tokio::spawn(async move {
+        let trace_id = request.trace_id;
+        let failure_trace = request.trace.clone();
+        let processing_peer_id = peer_id.clone();
+        let outcome = match tokio::task::spawn_blocking(move || {
+            process_local_activation_steps(&worker, &processing_peer_id, request)
+        })
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => LocalActivationOutcome::Response(ActivationResponse::failure(
+                trace_id,
+                peer_id,
+                format!("local persistent worker task failed: {error}"),
+                failure_trace,
+            )),
+        };
         let _ = completion_sender.unbounded_send(CompletedLocalActivation { job_id, outcome });
     });
 
@@ -2753,6 +3890,7 @@ fn handle_completed_local_activation(
         return Ok(());
     };
     set_local_inference_active(false);
+    finish_local_node_activity(completed.job_id, &completed.outcome);
     match completed.outcome {
         LocalActivationOutcome::Response(response) => {
             send_response(swarm, pending.channel, response);
@@ -2997,25 +4135,26 @@ fn model_blob_response_from_cache(
             }
         };
 
-        if request.offset >= record.info.size_bytes {
-            return ModelBlobResponse::success(
+        let success = |payload| {
+            let mut response = ModelBlobResponse::success(
                 request,
                 peer_id.to_owned(),
                 record.info.size_bytes,
-                Vec::new(),
+                payload,
             );
+            response.seed_manifest = record.manifest.clone();
+            response
+        };
+
+        if request.offset >= record.info.size_bytes {
+            return success(Vec::new());
         }
         let bytes_to_read = request
             .max_bytes
             .min(MODEL_BLOB_CHUNK_BYTES)
             .min((record.info.size_bytes - request.offset).min(u64::from(u32::MAX)) as u32);
         return match read_source_chunk(&record.path, request.offset, bytes_to_read as usize) {
-            Ok(payload) => ModelBlobResponse::success(
-                request,
-                peer_id.to_owned(),
-                record.info.size_bytes,
-                payload,
-            ),
+            Ok(payload) => success(payload),
             Err(error) => {
                 ModelBlobResponse::failure(request, peer_id.to_owned(), error.to_string())
             }
@@ -3044,13 +4183,14 @@ fn model_blob_response_from_cache(
     };
 
     let total_size_bytes = manifest.source.file_size_bytes;
+    let success = |payload| {
+        let mut response =
+            ModelBlobResponse::success(request, peer_id.to_owned(), total_size_bytes, payload);
+        response.seed_manifest = Some(manifest.clone());
+        response
+    };
     if request.offset >= total_size_bytes {
-        return ModelBlobResponse::success(
-            request,
-            peer_id.to_owned(),
-            total_size_bytes,
-            Vec::new(),
-        );
+        return success(Vec::new());
     }
 
     let bytes_to_read = request
@@ -3059,9 +4199,7 @@ fn model_blob_response_from_cache(
         .min((total_size_bytes - request.offset).min(u64::from(u32::MAX)) as u32);
 
     match read_source_chunk(&source_path, request.offset, bytes_to_read as usize) {
-        Ok(payload) => {
-            ModelBlobResponse::success(request, peer_id.to_owned(), total_size_bytes, payload)
-        }
+        Ok(payload) => success(payload),
         Err(error) => ModelBlobResponse::failure(request, peer_id.to_owned(), error.to_string()),
     }
 }
@@ -3091,25 +4229,29 @@ fn executable_seed_manifest_for_layers(
     model_id: &str,
     layers: LayerRange,
 ) -> Result<Option<(SeedShardManifest, PathBuf)>> {
+    let mut containing = None;
     for record in cache.list()? {
-        if record.info.model_id != model_id || record.info.layers != layers {
+        if record.info.model_id != model_id || !record.info.layers.contains(&layers) {
             continue;
         }
         let Some(manifest) = record.manifest.clone() else {
             continue;
         };
-        if manifest.model_id != model_id || manifest.layers != layers {
+        if manifest.model_id != model_id || !manifest.layers.contains(&layers) {
             continue;
         }
         if manifest.runtime_kind == RuntimeKind::Demo {
             return Ok(Some((manifest, PathBuf::new())));
         }
         if is_executable_shard_record(&record) {
-            return Ok(Some((manifest, record.path)));
+            if manifest.layers == layers {
+                return Ok(Some((manifest, record.path)));
+            }
+            containing = Some((manifest, record.path));
         }
     }
 
-    Ok(None)
+    Ok(containing)
 }
 
 fn read_source_chunk(path: &Path, offset: u64, len: usize) -> Result<Vec<u8>> {
@@ -3152,47 +4294,14 @@ fn send_activation_request(
 
 fn send_activation_request_with_relays(
     swarm: &mut Swarm<GridBehaviour>,
-    activation_relays: &[NodeAdvertisement],
+    _activation_relays: &[NodeAdvertisement],
     hop: &RouteHop,
     request: ActivationRequest,
 ) -> Result<request_response::OutboundRequestId> {
-    let local_peer_id = swarm.local_peer_id().to_string();
-    let relay_hop = activation_relay_hop(&local_peer_id, activation_relays, hop);
-    let send_hop = relay_hop.as_ref().unwrap_or(hop);
-    if send_hop.peer_id != hop.peer_id {
-        println!(
-            "activation_relay target_peer={} relay_peer={} trace_id={}",
-            hop.peer_id, send_hop.peer_id, request.trace_id
-        );
-    }
-    send_activation_request(swarm, send_hop, request)
-}
-
-fn activation_relay_hop(
-    local_peer_id: &str,
-    activation_relays: &[NodeAdvertisement],
-    target_hop: &RouteHop,
-) -> Option<RouteHop> {
-    if route_hop_is_loopback(target_hop) {
-        return None;
-    }
-
-    activation_relays
-        .iter()
-        .filter(|relay| relay.peer_id != local_peer_id && relay.peer_id != target_hop.peer_id)
-        .find_map(|relay| {
-            relay.addresses.first().map(|address| RouteHop {
-                peer_id: relay.peer_id.clone(),
-                address: address.clone(),
-                layers: target_hop.layers,
-            })
-        })
-}
-
-fn route_hop_is_loopback(hop: &RouteHop) -> bool {
-    hop.address.contains("/ip4/127.")
-        || hop.address.contains("/ip6/::1")
-        || hop.address.contains("/ip6/0:0:0:0:0:0:0:1")
+    // Circuit Relay v2 and DCUtR are transport-level connections to the exact
+    // target PeerId. Never substitute an arbitrary bootstrap peer as an
+    // application-level activation hop.
+    send_activation_request(swarm, hop, request)
 }
 
 fn send_model_blob_request(
@@ -3219,6 +4328,37 @@ fn send_model_blob_request(
     };
 
     Ok(request_id)
+}
+
+fn dial_model_blob_peer(
+    swarm: &mut Swarm<GridBehaviour>,
+    advertisement: &NodeAdvertisement,
+) -> Result<()> {
+    let peer_id = advertisement
+        .peer_id
+        .parse::<PeerId>()
+        .with_context(|| format!("invalid libp2p peer id {}", advertisement.peer_id))?;
+    let addresses = advertisement
+        .addresses
+        .iter()
+        .filter_map(|address| address.parse::<Multiaddr>().ok())
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        bail!(
+            "model seed {} has no dialable address",
+            advertisement.peer_id
+        );
+    }
+
+    let dial = DialOpts::peer_id(peer_id)
+        .condition(PeerCondition::DisconnectedAndNotDialing)
+        .addresses(addresses)
+        .extend_addresses_through_behaviour()
+        .build();
+    swarm
+        .dial(dial)
+        .with_context(|| format!("failed to dial model seed {}", advertisement.peer_id))?;
+    Ok(())
 }
 
 fn send_response(
@@ -3256,11 +4396,19 @@ fn send_model_blob_response(
     channel: request_response::ResponseChannel<ModelBlobResponse>,
     response: ModelBlobResponse,
 ) {
-    if let Err(response) = swarm.behaviour_mut().blob.send_response(channel, response) {
-        eprintln!(
-            "failed to send model blob response request_id={} offset={} error={:?}",
-            response.request_id, response.offset, response.error
-        );
+    let served_bytes = response
+        .error
+        .is_none()
+        .then_some(response.payload.len() as u64)
+        .unwrap_or(0);
+    match swarm.behaviour_mut().blob.send_response(channel, response) {
+        Ok(()) => MODEL_SERVING_TELEMETRY.record_chunk(served_bytes, model_serving_now_unix_ms()),
+        Err(response) => {
+            eprintln!(
+                "failed to send model blob response request_id={} offset={} error={:?}",
+                response.request_id, response.offset, response.error
+            );
+        }
     }
 }
 
@@ -3276,18 +4424,12 @@ fn handle_grid_event(
     match event {
         SwarmEvent::NewListenAddr { address, .. } => {
             let peer_id = *swarm.local_peer_id();
+            let printable = match address.clone().with_p2p(peer_id) {
+                Ok(address) | Err(address) => address,
+            };
+            println!("libp2p_listen={printable}");
             if advertise_listen_addresses && update_listen_address(advertisement, peer_id, address)
             {
-                if let Some(advertisement) = advertisement.as_ref() {
-                    println!(
-                        "libp2p_listen={}",
-                        advertisement
-                            .addresses
-                            .last()
-                            .map(String::as_str)
-                            .unwrap_or("<no-address>")
-                    );
-                }
                 publish_local_advertisement(swarm, topic, advertisement, &peer_id.to_string())?;
             }
         }
@@ -3317,7 +4459,6 @@ fn handle_grid_event(
         SwarmEvent::Behaviour(GridBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
             if dial_discovered_peers {
                 for (peer_id, address) in peers {
-                    swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                     swarm.add_peer_address(peer_id, address);
                 }
             }
@@ -3330,6 +4471,62 @@ fn handle_grid_event(
                     .remove_explicit_peer(&peer_id);
             }
         }
+        SwarmEvent::Behaviour(GridBehaviourEvent::RelayClient(
+            relay::client::Event::ReservationReqAccepted {
+                relay_peer_id,
+                renewal,
+                ..
+            },
+        )) => {
+            println!(
+                "libp2p_relay_reserved peer_id={} renewal={}",
+                relay_peer_id, renewal
+            );
+        }
+        SwarmEvent::Behaviour(GridBehaviourEvent::RelayServer(
+            relay::Event::ReservationReqAccepted {
+                src_peer_id,
+                renewed,
+            },
+        )) => {
+            println!(
+                "libp2p_relay_client_reserved peer_id={} renewal={}",
+                src_peer_id, renewed
+            );
+        }
+        SwarmEvent::Behaviour(GridBehaviourEvent::Dcutr(event)) => match event.result {
+            Ok(_) => println!("libp2p_direct_upgrade peer_id={}", event.remote_peer_id),
+            Err(error) => eprintln!(
+                "libp2p_direct_upgrade_failed peer_id={} error={error}",
+                event.remote_peer_id
+            ),
+        },
+        SwarmEvent::Behaviour(GridBehaviourEvent::Identify(identify::Event::Received {
+            peer_id,
+            info,
+            ..
+        })) => {
+            let mut observed = empty_advertisement(peer_id.to_string(), String::new());
+            for address in info.listen_addrs.into_iter().take(32) {
+                let address = match address.iter().last() {
+                    Some(Protocol::P2p(address_peer_id)) if address_peer_id != peer_id => continue,
+                    Some(Protocol::P2p(_)) => address,
+                    _ => address.with(Protocol::P2p(peer_id)),
+                };
+                let address_text = address.to_string();
+                if !observed.addresses.contains(&address_text) {
+                    observed.addresses.push(address_text);
+                }
+                swarm.add_peer_address(peer_id, address);
+            }
+            registry.merge(observed);
+        }
+        // Public networks inevitably contain stale and incompatible peers.
+        // Identify/Ping negotiation failures are expected compatibility
+        // signals, not actionable application errors, so keep them out of the
+        // user-facing development console.
+        SwarmEvent::Behaviour(GridBehaviourEvent::Identify(identify::Event::Error { .. })) => {}
+        SwarmEvent::Behaviour(GridBehaviourEvent::Ping(ping::Event { result: Err(_), .. })) => {}
         SwarmEvent::Behaviour(GridBehaviourEvent::Gossipsub(gossipsub::Event::Message {
             message,
             ..
@@ -3466,6 +4663,8 @@ fn handle_grid_event(
 fn build_grid_swarm(
     keypair: identity::Keypair,
     topic: &gossipsub::IdentTopic,
+    relay_server_enabled: bool,
+    enable_mdns: bool,
 ) -> Result<Swarm<GridBehaviour>> {
     let peer_id = keypair.public().to_peer_id();
     let mut swarm = SwarmBuilder::with_existing_identity(keypair)
@@ -3475,14 +4674,33 @@ fn build_grid_swarm(
             noise::Config::new,
             yamux::Config::default,
         )?
+        .with_quic()
         .with_dns()?
-        .with_behaviour(|key| {
+        .with_relay_client(noise::Config::new, yamux::Config::default)?
+        .with_behaviour(|key, relay_client| {
+            let relay_server = relay_server_enabled
+                .then(|| relay::Behaviour::new(peer_id, public_relay_server_config()))
+                .into();
+            let dcutr = dcutr::Behaviour::new(peer_id);
+            let identify = identify::Behaviour::new(
+                identify::Config::new_with_signed_peer_record(IDENTIFY_PROTOCOL.to_owned(), key)
+                    .with_agent_version(IDENTIFY_AGENT.to_owned())
+                    .with_push_listen_addr_updates(true),
+            );
+            let ping = ping::Behaviour::new(
+                ping::Config::new()
+                    .with_interval(Duration::from_secs(15))
+                    .with_timeout(Duration::from_secs(20)),
+            );
             let gossipsub = gossipsub::Behaviour::new(
                 gossipsub::MessageAuthenticity::Signed(key.clone()),
                 gossipsub::Config::default(),
             )?;
-            let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?;
-            let activation = request_response::json::Behaviour::new(
+            let mdns = enable_mdns
+                .then(|| mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id))
+                .transpose()?
+                .into();
+            let activation = request_response::Behaviour::new(
                 [(
                     StreamProtocol::new(ACTIVATION_PROTOCOL),
                     request_response::ProtocolSupport::Full,
@@ -3509,11 +4727,17 @@ fn build_grid_swarm(
             );
 
             Ok(GridBehaviour {
+                relay_client,
+                relay_server,
+                dcutr,
+                identify,
+                ping,
                 gossipsub,
                 mdns,
                 activation,
                 model,
                 blob,
+                rpc_tunnel: libp2p_stream::Behaviour::new(),
             })
         })?
         .build();
@@ -3523,6 +4747,22 @@ fn build_grid_swarm(
     Ok(swarm)
 }
 
+fn public_relay_server_config() -> relay::Config {
+    relay::Config {
+        max_reservations: 4_096,
+        max_reservations_per_peer: 4,
+        reservation_duration: PUBLIC_RELAY_RESERVATION_DURATION,
+        max_circuits: 2_048,
+        max_circuits_per_peer: 16,
+        max_circuit_duration: PUBLIC_RELAY_CIRCUIT_DURATION,
+        // A model is transferred as authenticated libp2p streams. The relay
+        // default (128 KiB) is intentionally tiny and would sever the first
+        // model chunk, so public Infernet relays allow a full verified package.
+        max_circuit_bytes: PUBLIC_RELAY_MAX_CIRCUIT_BYTES,
+        ..relay::Config::default()
+    }
+}
+
 fn listen_on(swarm: &mut Swarm<GridBehaviour>, listen: &str) -> Result<ListenerId> {
     let p2p_listen = listen
         .parse::<Multiaddr>()
@@ -3530,6 +4770,122 @@ fn listen_on(swarm: &mut Swarm<GridBehaviour>, listen: &str) -> Result<ListenerI
     swarm
         .listen_on(p2p_listen)
         .with_context(|| format!("failed to start libp2p listener on {listen}"))
+}
+
+fn start_grid_listeners(
+    swarm: &mut Swarm<GridBehaviour>,
+    config: &DiscoveryConfig,
+) -> Result<ListenerId> {
+    let direct_address = config
+        .p2p_listen
+        .parse::<Multiaddr>()
+        .with_context(|| format!("invalid libp2p listen address {}", config.p2p_listen))?;
+    let direct_listener = listen_on(swarm, &config.p2p_listen)?;
+
+    if let Some(quic_address) = quic_listen_address(&direct_address) {
+        swarm
+            .listen_on(quic_address.clone())
+            .with_context(|| format!("failed to start libp2p QUIC listener on {quic_address}"))?;
+    }
+
+    if config.relay_server {
+        add_relay_server_external_addresses(swarm, config)?;
+    }
+
+    // The relay client associates one reservation with one direct relay
+    // connection. Starting two listeners for the same PeerId (for example an
+    // IP and DNS spelling of one bootstrap) can replace the first reservation
+    // inside libp2p, so reserve once per relay identity.
+    let mut seen_relays = HashSet::new();
+    for relay_peer in &config.relay_peers {
+        let (relay_peer_id, circuit_address) = relay_circuit_listen_address(relay_peer)?;
+        if !seen_relays.insert(relay_peer_id) {
+            continue;
+        }
+        swarm
+            .behaviour_mut()
+            .gossipsub
+            .add_explicit_peer(&relay_peer_id);
+        swarm
+            .listen_on(circuit_address.clone())
+            .with_context(|| format!("failed to reserve Infernet relay {circuit_address}"))?;
+        println!("libp2p_relay_reserving={circuit_address}");
+    }
+
+    Ok(direct_listener)
+}
+
+fn quic_listen_address(address: &Multiaddr) -> Option<Multiaddr> {
+    let mut quic = Multiaddr::empty();
+    let mut converted = false;
+    for protocol in address.iter() {
+        if converted {
+            // TCP encapsulations such as WebSocket cannot be mechanically
+            // translated into QUIC listen addresses.
+            return None;
+        }
+        match protocol {
+            Protocol::Tcp(port) => {
+                quic.push(Protocol::Udp(port));
+                quic.push(Protocol::QuicV1);
+                converted = true;
+            }
+            protocol => quic.push(protocol),
+        }
+    }
+    converted.then_some(quic)
+}
+
+fn relay_circuit_listen_address(relay_peer: &str) -> Result<(PeerId, Multiaddr)> {
+    let relay_address = relay_peer
+        .parse::<Multiaddr>()
+        .with_context(|| format!("invalid Infernet relay multiaddress {relay_peer}"))?;
+    if relay_address
+        .iter()
+        .any(|protocol| matches!(protocol, Protocol::P2pCircuit))
+    {
+        bail!(
+            "Infernet relay address must identify the relay itself, without /p2p-circuit: {relay_peer}"
+        );
+    }
+    let Some(Protocol::P2p(relay_peer_id)) = relay_address.iter().last() else {
+        bail!("Infernet relay address must end in /p2p/<relay-peer-id>: {relay_peer}");
+    };
+    if relay_address.iter().count() < 2 {
+        bail!("Infernet relay address is missing a transport: {relay_peer}");
+    }
+
+    Ok((relay_peer_id, relay_address.with(Protocol::P2pCircuit)))
+}
+
+fn add_relay_server_external_addresses(
+    swarm: &mut Swarm<GridBehaviour>,
+    config: &DiscoveryConfig,
+) -> Result<()> {
+    let local_peer_id = *swarm.local_peer_id();
+    let Some(advertisement) = config.advertisement.as_ref() else {
+        return Ok(());
+    };
+    for address in &advertisement.addresses {
+        let mut address = address
+            .parse::<Multiaddr>()
+            .with_context(|| format!("invalid relay server public address {address}"))?;
+        if address
+            .iter()
+            .any(|protocol| matches!(protocol, Protocol::P2pCircuit))
+        {
+            continue;
+        }
+        match address.iter().last() {
+            Some(Protocol::P2p(peer_id)) if peer_id != local_peer_id => {
+                bail!("relay server public address identifies {peer_id}, expected {local_peer_id}");
+            }
+            Some(Protocol::P2p(_)) => {}
+            _ => address.push(Protocol::P2p(local_peer_id)),
+        }
+        swarm.add_external_address(address);
+    }
+    Ok(())
 }
 
 fn publish_advertisement(
@@ -3589,6 +4945,17 @@ fn update_listen_address(
         return false;
     };
 
+    // Loopback and wildcard listeners are process-local implementation
+    // details. Advertising them makes remote nodes dial themselves while
+    // expecting this PeerId, producing an `Unexpected peer ID` failure.
+    if address.iter().any(|protocol| match protocol {
+        Protocol::Ip4(host) => host.is_loopback() || host.is_unspecified(),
+        Protocol::Ip6(host) => host.is_loopback() || host.is_unspecified(),
+        _ => false,
+    }) {
+        return false;
+    }
+
     let address = match address.with_p2p(peer_id) {
         Ok(address) | Err(address) => address.to_string(),
     };
@@ -3603,9 +4970,52 @@ fn update_listen_address(
 fn add_static_peer_addresses(
     swarm: &mut Swarm<GridBehaviour>,
     advertisements: &[NodeAdvertisement],
+    relay_peers: &[String],
 ) {
+    let relay_peer_ids = relay_peers
+        .iter()
+        .filter_map(|address| address.parse::<Multiaddr>().ok())
+        .filter_map(|address| match address.iter().last() {
+            Some(Protocol::P2p(peer_id)) => Some(peer_id),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+
     for advertisement in advertisements {
+        let Ok(peer_id) = advertisement.peer_id.parse::<PeerId>() else {
+            continue;
+        };
+        // The relay behaviour owns this peer's addresses and connection.
+        // Feeding the same peer into gossipsub/request-response discovery can
+        // schedule a competing normal dial before the reservation is sent.
+        if relay_peer_ids.contains(&peer_id) {
+            continue;
+        }
+
         add_advertisement_addresses(swarm, advertisement);
+        let dial_addresses = advertisement
+            .addresses
+            .iter()
+            .filter_map(|address| address.parse::<Multiaddr>().ok())
+            .collect::<Vec<_>>();
+        if dial_addresses.is_empty() {
+            continue;
+        }
+
+        // Configured bootstrap/static peers form the initial network mesh, so
+        // they are the only advertisements that should proactively connect.
+        // Periodic calls are harmless because peer-aware dialing is rejected
+        // while already connected or dialing.
+        swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+        // A relay listener must establish and own its reservation connection.
+        // Issuing a normal static dial to that same PeerId races the relay
+        // behaviour and can leave the client connected but without a circuit.
+        let dial = DialOpts::peer_id(peer_id)
+            .condition(PeerCondition::DisconnectedAndNotDialing)
+            .addresses(dial_addresses)
+            .extend_addresses_through_behaviour()
+            .build();
+        let _ = swarm.dial(dial);
     }
 }
 
@@ -3617,11 +5027,9 @@ fn add_advertisement_addresses(
         return;
     };
 
-    swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
     for address in &advertisement.addresses {
         if let Ok(address) = address.parse::<Multiaddr>() {
-            swarm.add_peer_address(peer_id, address.clone());
-            let _ = swarm.dial(address);
+            swarm.add_peer_address(peer_id, address);
         }
     }
 }
@@ -3666,15 +5074,20 @@ fn select_model_shard_candidate(
                                 manifest.payload_kind.as_str(),
                                 model_distribution::PAYLOAD_KIND_GGUF_SHARD
                                     | model_distribution::PAYLOAD_KIND_INFERNET_SHARD
+                                    | model_distribution::PAYLOAD_KIND_FULL_MODEL
                             )
                         })
                         .cloned();
 
-                    seed_manifest.map(|seed_manifest| ModelShardCandidate {
-                        advertisement: advertisement.clone(),
-                        shard,
-                        seed_manifest: Some(seed_manifest),
-                    })
+                    if seed_manifest.is_some() || (checksum.is_some() && version.is_some()) {
+                        Some(ModelShardCandidate {
+                            advertisement: advertisement.clone(),
+                            shard,
+                            seed_manifest,
+                        })
+                    } else {
+                        None
+                    }
                 })
         })
         .filter(|candidate| {
@@ -3742,9 +5155,37 @@ fn hop_addresses(hop: &RouteHop) -> Result<Vec<Multiaddr>> {
         return Ok(Vec::new());
     }
 
-    Ok(vec![hop.address.parse::<Multiaddr>().with_context(
-        || format!("invalid route multiaddr {}", hop.address),
-    )?])
+    let mut address = hop
+        .address
+        .parse::<Multiaddr>()
+        .with_context(|| format!("invalid route multiaddr {}", hop.address))?;
+
+    // `request_response::send_request_with_addresses` already receives the
+    // destination PeerId separately. Its explicit dial addresses therefore
+    // must not repeat that PeerId as a trailing `/p2p/...` component. Keeping
+    // it causes libp2p to discard the otherwise-valid direct address and fall
+    // back to unrelated observed addresses (for example a stale private-IP
+    // address), which breaks worker-to-worker forwarding.
+    if let Some(Protocol::P2p(address_peer_id)) = address.iter().last() {
+        let route_peer_id = hop
+            .peer_id
+            .parse::<PeerId>()
+            .with_context(|| format!("invalid libp2p peer id {}", hop.peer_id))?;
+        if address_peer_id != route_peer_id {
+            bail!(
+                "route multiaddr identifies peer {}, expected {}",
+                address_peer_id,
+                route_peer_id
+            );
+        }
+        address.pop();
+    }
+
+    if address.is_empty() {
+        bail!("route multiaddr {} has no transport", hop.address);
+    }
+
+    Ok(vec![address])
 }
 
 fn sleep_until(deadline: Instant) -> tokio::time::Sleep {
@@ -3805,11 +5246,95 @@ mod tests {
         }
     }
 
-    fn relay(peer_id: &str) -> NodeAdvertisement {
-        empty_advertisement(
-            peer_id.to_owned(),
-            format!("/ip4/203.0.113.10/tcp/9777/p2p/{peer_id}"),
-        )
+    #[test]
+    fn local_node_activity_journal_is_bounded_and_chronological() {
+        let mut state = LocalNodeActivityState::default();
+
+        for index in 0..(LOCAL_NODE_ACTIVITY_JOURNAL_LIMIT + 2) {
+            let id = format!("job-{index}");
+            state.start(LocalNodeActivityTask {
+                id: id.clone(),
+                trace_id: format!("trace-{index}"),
+                kind: LocalNodeActivityKind::ChatCompletion,
+                started_at_unix_ms: index as u64,
+            });
+            state.finish(
+                &id,
+                None,
+                LocalNodeActivityOutcome::Success,
+                index as u64 + 1,
+            );
+        }
+
+        let snapshot = state.snapshot();
+        assert!(snapshot.current.is_empty());
+        assert_eq!(snapshot.journal.len(), LOCAL_NODE_ACTIVITY_JOURNAL_LIMIT);
+        assert_eq!(snapshot.journal.first().unwrap().id, "trace-2");
+        assert_eq!(
+            snapshot.journal.last().unwrap().id,
+            format!("trace-{}", LOCAL_NODE_ACTIVITY_JOURNAL_LIMIT + 1)
+        );
+        assert!(
+            snapshot
+                .journal
+                .windows(2)
+                .all(|entries| entries[0].completed_at_unix_ms <= entries[1].completed_at_unix_ms)
+        );
+    }
+
+    #[test]
+    fn local_node_activity_coalesces_repeated_work_for_one_trace() {
+        let mut state = LocalNodeActivityState::default();
+        state.start(LocalNodeActivityTask {
+            id: "job-one".to_owned(),
+            trace_id: "trace-shared".to_owned(),
+            kind: LocalNodeActivityKind::ChatCompletion,
+            started_at_unix_ms: 10,
+        });
+        state.finish("job-one", None, LocalNodeActivityOutcome::Success, 20);
+        state.start(LocalNodeActivityTask {
+            id: "job-two".to_owned(),
+            trace_id: "trace-shared".to_owned(),
+            kind: LocalNodeActivityKind::ChatCompletion,
+            started_at_unix_ms: 21,
+        });
+
+        assert!(state.journal.is_empty());
+        assert_eq!(state.current[0].started_at_unix_ms, 10);
+
+        state.finish("job-two", None, LocalNodeActivityOutcome::Success, 30);
+        assert_eq!(state.journal.len(), 1);
+        assert_eq!(state.journal[0].id, "trace-shared");
+        assert_eq!(state.journal[0].started_at_unix_ms, 10);
+        assert_eq!(state.journal[0].completed_at_unix_ms, 30);
+    }
+
+    #[test]
+    fn local_node_activity_snapshot_serializes_for_the_ui() {
+        let snapshot = LocalNodeActivitySnapshot {
+            current: vec![LocalNodeActivityTask {
+                id: "job-current".to_owned(),
+                trace_id: "trace-current".to_owned(),
+                kind: LocalNodeActivityKind::ChatCompletion,
+                started_at_unix_ms: 10,
+            }],
+            journal: vec![LocalNodeActivityEntry {
+                id: "job-complete".to_owned(),
+                trace_id: "trace-complete".to_owned(),
+                kind: LocalNodeActivityKind::ComputeContribution,
+                outcome: LocalNodeActivityOutcome::Error,
+                started_at_unix_ms: 20,
+                completed_at_unix_ms: 30,
+            }],
+        };
+
+        let value = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(value["current"][0]["traceId"], "trace-current");
+        assert_eq!(value["current"][0]["kind"], "chatCompletion");
+        assert_eq!(value["current"][0]["startedAtUnixMs"], 10);
+        assert_eq!(value["journal"][0]["kind"], "computeContribution");
+        assert_eq!(value["journal"][0]["outcome"], "error");
+        assert_eq!(value["journal"][0]["completedAtUnixMs"], 30);
     }
 
     fn official_rpc_fixture() -> (
@@ -3875,6 +5400,7 @@ mod tests {
                 prompt: "hello".to_owned(),
                 demo_mode: false,
                 rpc_endpoints: vec!["192.168.1.20:50052".to_owned()],
+                rpc_worker_peer_ids: Vec::new(),
             }),
         );
         let worker = WorkerConfig {
@@ -3899,23 +5425,194 @@ mod tests {
     }
 
     #[test]
+    fn discovery_config_does_not_accidentally_run_a_public_relay() {
+        let discovery = DiscoveryConfig::new("infernet/test");
+        assert!(!discovery.relay_server);
+        assert!(discovery.relay_peers.is_empty());
+    }
+
+    #[test]
+    fn tcp_listeners_get_a_matching_quic_fallback() {
+        let tcp = "/ip4/0.0.0.0/tcp/9777".parse::<Multiaddr>().unwrap();
+        assert_eq!(
+            quic_listen_address(&tcp).unwrap().to_string(),
+            "/ip4/0.0.0.0/udp/9777/quic-v1"
+        );
+
+        let websocket = "/ip4/0.0.0.0/tcp/9777/ws".parse::<Multiaddr>().unwrap();
+        assert!(quic_listen_address(&websocket).is_none());
+    }
+
+    #[test]
+    fn relay_peer_address_becomes_a_circuit_listener() {
+        let relay_peer_id = identity::Keypair::generate_ed25519().public().to_peer_id();
+        let address = format!("/dns4/relay.example/tcp/9777/p2p/{relay_peer_id}");
+        let (parsed_peer_id, circuit) = relay_circuit_listen_address(&address).unwrap();
+
+        assert_eq!(parsed_peer_id, relay_peer_id);
+        assert_eq!(circuit.to_string(), format!("{address}/p2p-circuit"));
+        assert!(relay_circuit_listen_address("/dns4/relay.example/tcp/9777").is_err());
+        assert!(relay_circuit_listen_address(&format!("{address}/p2p-circuit")).is_err());
+    }
+
+    #[test]
+    fn public_relay_can_carry_a_full_model_transfer() {
+        let config = public_relay_server_config();
+        assert!(config.max_circuit_bytes >= 14_400_000_000);
+        assert!(config.max_circuit_duration >= Duration::from_secs(60 * 60));
+        assert!(config.reservation_duration >= config.max_circuit_duration);
+    }
+
+    #[tokio::test]
+    async fn relay_server_behaviour_is_explicitly_toggled() {
+        let topic = gossipsub::IdentTopic::new("infernet/test/relay-toggle");
+        let disabled =
+            build_grid_swarm(identity::Keypair::generate_ed25519(), &topic, false, true).unwrap();
+        assert!(!disabled.behaviour().relay_server.is_enabled());
+
+        let enabled =
+            build_grid_swarm(identity::Keypair::generate_ed25519(), &topic, true, true).unwrap();
+        assert!(enabled.behaviour().relay_server.is_enabled());
+    }
+
+    #[tokio::test]
+    async fn arbitrary_advertisements_do_not_queue_unsolicited_dials() {
+        let topic = gossipsub::IdentTopic::new("infernet/test/single-dial");
+        let mut swarm =
+            build_grid_swarm(identity::Keypair::generate_ed25519(), &topic, false, false).unwrap();
+        let remote_peer_id = identity::Keypair::generate_ed25519().public().to_peer_id();
+        let advertisement = empty_advertisement(
+            remote_peer_id.to_string(),
+            format!("/ip4/127.0.0.1/tcp/9/p2p/{remote_peer_id}"),
+        );
+
+        add_advertisement_addresses(&mut swarm, &advertisement);
+        add_advertisement_addresses(&mut swarm, &advertisement);
+
+        assert_eq!(
+            swarm
+                .network_info()
+                .connection_counters()
+                .num_pending_outgoing(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_static_peer_updates_queue_only_one_dial() {
+        let topic = gossipsub::IdentTopic::new("infernet/test/static-single-dial");
+        let mut swarm =
+            build_grid_swarm(identity::Keypair::generate_ed25519(), &topic, false, false).unwrap();
+        let remote_peer_id = identity::Keypair::generate_ed25519().public().to_peer_id();
+        let advertisement = empty_advertisement(
+            remote_peer_id.to_string(),
+            format!("/ip4/127.0.0.1/tcp/9/p2p/{remote_peer_id}"),
+        );
+
+        add_static_peer_addresses(&mut swarm, std::slice::from_ref(&advertisement), &[]);
+        add_static_peer_addresses(&mut swarm, std::slice::from_ref(&advertisement), &[]);
+
+        assert_eq!(
+            swarm
+                .network_info()
+                .connection_counters()
+                .num_pending_outgoing(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn static_bootstrap_that_is_also_a_relay_does_not_race_reservation() {
+        let topic = gossipsub::IdentTopic::new("infernet/test/static-relay-no-race");
+        let mut swarm =
+            build_grid_swarm(identity::Keypair::generate_ed25519(), &topic, false, false).unwrap();
+        let relay_peer_id = identity::Keypair::generate_ed25519().public().to_peer_id();
+        let relay_address = format!("/ip4/127.0.0.1/tcp/9/p2p/{relay_peer_id}");
+        let advertisement = empty_advertisement(relay_peer_id.to_string(), relay_address.clone());
+
+        add_static_peer_addresses(
+            &mut swarm,
+            std::slice::from_ref(&advertisement),
+            &[relay_address],
+        );
+
+        assert_eq!(
+            swarm
+                .network_info()
+                .connection_counters()
+                .num_pending_outgoing(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_client_obtains_a_real_circuit_listen_address() {
+        let topic = gossipsub::IdentTopic::new(format!(
+            "infernet/test/relay-reservation/{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut relay =
+            build_grid_swarm(identity::Keypair::generate_ed25519(), &topic, true, false).unwrap();
+        let relay_peer_id = *relay.local_peer_id();
+        let relay_listener = listen_on(&mut relay, "/ip4/127.0.0.1/tcp/0").unwrap();
+        let relay_transport_address = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let SwarmEvent::NewListenAddr {
+                    listener_id,
+                    address,
+                } = relay.select_next_some().await
+                    && listener_id == relay_listener
+                {
+                    break address;
+                }
+            }
+        })
+        .await
+        .expect("relay did not start listening");
+        let relay_public_address = relay_transport_address.with(Protocol::P2p(relay_peer_id));
+        relay.add_external_address(relay_public_address.clone());
+
+        let mut client =
+            build_grid_swarm(identity::Keypair::generate_ed25519(), &topic, false, false).unwrap();
+        let client_peer_id = *client.local_peer_id();
+        let circuit_listener = client
+            .listen_on(relay_public_address.with(Protocol::P2pCircuit))
+            .unwrap();
+
+        let circuit_address = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                tokio::select! {
+                    _ = relay.select_next_some() => {}
+                    event = client.select_next_some() => {
+                        if let SwarmEvent::NewListenAddr { listener_id, address } = event
+                            && listener_id == circuit_listener
+                            && address.iter().any(|protocol| matches!(protocol, Protocol::P2pCircuit))
+                        {
+                            break address;
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("client did not obtain a relay reservation");
+
+        assert!(matches!(
+            circuit_address.iter().last(),
+            Some(Protocol::P2p(peer_id)) if peer_id == client_peer_id
+        ));
+    }
+
+    #[test]
     fn trusted_rpc_endpoints_are_canonicalized_and_deduplicated() {
         let endpoints = normalize_trusted_rpc_endpoints(&[
-            " 192.168.1.20:50052 ".to_owned(),
-            "192.168.1.20:50052".to_owned(),
-            "100.64.2.3:6000".to_owned(),
-            "169.254.10.8:50052".to_owned(),
+            " 127.0.0.1:50052 ".to_owned(),
+            "127.0.0.1:50052".to_owned(),
+            "127.0.0.2:6000".to_owned(),
         ])
         .unwrap();
 
-        assert_eq!(
-            endpoints,
-            [
-                "192.168.1.20:50052",
-                "100.64.2.3:6000",
-                "169.254.10.8:50052",
-            ]
-        );
+        assert_eq!(endpoints, ["127.0.0.1:50052", "127.0.0.2:6000"]);
     }
 
     #[test]
@@ -3923,10 +5620,12 @@ mod tests {
         for endpoint in [
             "8.8.8.8:50052",
             "worker.example.com:50052",
-            "127.0.0.1:50052",
+            "192.168.1.20:50052",
+            "100.64.2.3:6000",
+            "169.254.10.8:50052",
             "[::1]:50052",
-            "192.168.1.20:0",
-            "192.168.1.20:not-a-port",
+            "127.0.0.1:0",
+            "127.0.0.1:not-a-port",
         ] {
             assert!(
                 normalize_trusted_rpc_endpoints(&[endpoint.to_owned()]).is_err(),
@@ -4167,31 +5866,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn activation_relay_selected_for_non_loopback_remote_hop() {
-        let target = RouteHop {
-            peer_id: "peer-b".to_owned(),
-            address: "/ip4/10.0.0.2/tcp/9777/p2p/peer-b".to_owned(),
-            layers: LayerRange::new(0, 3).unwrap(),
-        };
-
-        let relay = activation_relay_hop("peer-a", &[relay("relay-peer")], &target).unwrap();
-
-        assert_eq!(relay.peer_id, "relay-peer");
-        assert_eq!(relay.layers, target.layers);
-    }
-
-    #[test]
-    fn activation_relay_skips_loopback_target() {
-        let target = RouteHop {
-            peer_id: "peer-b".to_owned(),
-            address: "/ip4/127.0.0.1/tcp/9777/p2p/peer-b".to_owned(),
-            layers: LayerRange::new(0, 3).unwrap(),
-        };
-
-        assert!(activation_relay_hop("peer-a", &[relay("relay-peer")], &target).is_none());
-    }
-
     #[tokio::test]
     async fn model_blob_codec_roundtrips_raw_payload() {
         let protocol = StreamProtocol::new(MODEL_BLOB_PROTOCOL);
@@ -4226,6 +5900,57 @@ mod tests {
         let decoded = request_response::Codec::read_response(&mut codec, &protocol, &mut reader)
             .await
             .unwrap();
+        assert_eq!(decoded, response);
+    }
+
+    #[tokio::test]
+    async fn activation_codec_keeps_f32_payload_binary_and_roundtrips_token_state() {
+        let protocol = StreamProtocol::new(ACTIVATION_PROTOCOL);
+        let mut request = ActivationRequest::new(
+            "infernet-chat-v1",
+            vec![hop("peer-a", 0, 5)],
+            4,
+            vec![0.125, -2.5, 7.0, f32::MIN_POSITIVE],
+            None,
+        );
+        request.input_token_id = Some(42);
+        request.sequence_position = 9;
+
+        let mut writer = futures::io::Cursor::new(Vec::new());
+        request_response::Codec::write_request(
+            &mut ActivationCodec,
+            &protocol,
+            &mut writer,
+            request.clone(),
+        )
+        .await
+        .unwrap();
+        let bytes = writer.into_inner();
+        assert!(bytes.len() < 1024, "small activation was JSON-expanded");
+        let mut reader = futures::io::Cursor::new(bytes);
+        let decoded =
+            request_response::Codec::read_request(&mut ActivationCodec, &protocol, &mut reader)
+                .await
+                .unwrap();
+        assert_eq!(decoded, request);
+
+        let mut response = ActivationResponse::success(request, "peer-a", Some("x".into()), 3);
+        response.sampled_token_id = Some(99);
+        response.next_sequence_position = 10;
+        let mut writer = futures::io::Cursor::new(Vec::new());
+        request_response::Codec::write_response(
+            &mut ActivationCodec,
+            &protocol,
+            &mut writer,
+            response.clone(),
+        )
+        .await
+        .unwrap();
+        let mut reader = futures::io::Cursor::new(writer.into_inner());
+        let decoded =
+            request_response::Codec::read_response(&mut ActivationCodec, &protocol, &mut reader)
+                .await
+                .unwrap();
         assert_eq!(decoded, response);
     }
 
@@ -4280,5 +6005,47 @@ mod tests {
         assert_eq!(response.payload, b"456789");
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn full_model_package_is_a_download_candidate() {
+        let (_, layers, _, manifest, package) = official_rpc_fixture();
+        let mut advertisement =
+            empty_advertisement("seed-peer".to_owned(), "/ip4/127.0.0.1/tcp/9777".to_owned());
+        advertisement.hosted_shards.push(ShardDescriptor {
+            model_id: manifest.model_id.clone(),
+            layers,
+            runtime_kind: manifest.runtime_kind.clone(),
+            tokenizer: Some(manifest.tokenizer.clone()),
+            metadata: Some(manifest.metadata.clone()),
+            shard_hash: Some(manifest.shard_hash.clone()),
+            seed_manifest: Some(Box::new(manifest.clone())),
+        });
+        advertisement.model_shards.push(ModelShardInfo {
+            model_id: manifest.model_id.clone(),
+            layers,
+            checksum: package.payload.checksum_sha256.clone(),
+            size_bytes: package.payload.size_bytes,
+            version: "1".to_owned(),
+            protocol_version: PROTOCOL_VERSION,
+        });
+        let mut registry = ShardRegistry::new();
+        registry.upsert(advertisement);
+
+        let candidate = select_model_shard_candidate(
+            &registry,
+            "downloader",
+            &manifest.model_id,
+            layers,
+            Some(&package.payload.checksum_sha256),
+            Some("1"),
+            &HashMap::new(),
+        );
+
+        assert!(candidate.is_some());
+        assert_eq!(
+            candidate.unwrap().seed_manifest.unwrap().payload_kind,
+            PAYLOAD_KIND_FULL_MODEL
+        );
     }
 }

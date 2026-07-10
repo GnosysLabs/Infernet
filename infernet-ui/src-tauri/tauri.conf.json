@@ -6,17 +6,17 @@
   "build": {
     "beforeDevCommand": "npm run prepare-runtime && npm run dev",
     "beforeBuildCommand": "npm run prepare-runtime && npm run build",
-    "devUrl": "http://127.0.0.1:5173",
+    "devUrl": "http://127.0.0.1:43127",
     "frontendDist": "../dist"
   },
   "app": {
     "windows": [
       {
         "title": "Infernet",
-        "width": 1440,
-        "height": 1000,
-        "minWidth": 1040,
-        "minHeight": 720
+        "width": 1200,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 640
       }
     ],
     "security": {

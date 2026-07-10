@@ -23,7 +23,10 @@ use infernet_node::{
     set_local_llama_rpc_endpoint, set_local_rpc_active, spawn_llama_rpc_server,
     stop_persistent_llama_server,
 };
-use infernet_protocol::{LlamaRpcEndpoint, ModelShardInfo, NodeAdvertisement, RouteHop};
+use infernet_protocol::{
+    ACTIVATION_PROTOCOL, LLAMA_RPC_TUNNEL_PROTOCOL, LlamaRpcEndpoint, ModelShardInfo,
+    NodeAdvertisement, RouteHop,
+};
 use infernet_router::ShardRegistry;
 use sha2::{Digest, Sha256};
 
@@ -77,6 +80,9 @@ struct ServeArgs {
     p2p_listen: String,
     #[arg(long, default_value = DEFAULT_TOPIC)]
     topic: String,
+    /// Public Circuit Relay v2 server multiaddress (repeatable).
+    #[arg(long = "relay-peer")]
+    relay_peers: Vec<String>,
     #[arg(long)]
     hidden_size: Option<usize>,
 }
@@ -91,6 +97,9 @@ struct DiscoveryArgs {
     discovery_timeout_ms: u64,
     #[arg(long = "static-peer")]
     static_peers: Vec<String>,
+    /// Public Circuit Relay v2 server multiaddress (repeatable).
+    #[arg(long = "relay-peer")]
+    relay_peers: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -203,10 +212,13 @@ struct ModelServeArgs {
     topic: String,
     #[arg(long, default_value = "/ip4/0.0.0.0/tcp/0")]
     p2p_listen: String,
+    /// Public Circuit Relay v2 server multiaddress (repeatable).
+    #[arg(long = "relay-peer")]
+    relay_peers: Vec<String>,
     /// Disable the private llama.cpp RPC compute sidecar.
     #[arg(long, default_value_t = false)]
     no_rpc: bool,
-    /// Private RFC1918 or Tailscale IPv4 address to bind and advertise.
+    /// Deprecated: RPC is always loopback-only and exposed through libp2p.
     #[arg(long)]
     rpc_host: Option<Ipv4Addr>,
     /// RPC port. The default is 50052, with an automatic private-port fallback.
@@ -287,6 +299,7 @@ async fn bootstrap(args: BootstrapArgs) -> Result<()> {
     discovery.advertise_listen_addresses = false;
     discovery.dial_discovered_peers = false;
     discovery.relay_advertisements = true;
+    discovery.relay_server = true;
 
     let mut bootstrap_advertisement =
         local_capability_advertisement(peer_id.clone(), String::new());
@@ -294,26 +307,35 @@ async fn bootstrap(args: BootstrapArgs) -> Result<()> {
         bootstrap_advertisement
             .addresses
             .push(format!("/ip4/{ip}/tcp/{tcp_port}/p2p/{peer_id}"));
+        bootstrap_advertisement
+            .addresses
+            .push(format!("/ip4/{ip}/udp/{tcp_port}/quic-v1/p2p/{peer_id}"));
     }
     if let Some(domain) = args.public_domain.as_deref() {
         bootstrap_advertisement
             .addresses
             .push(format!("/dns4/{domain}/tcp/{tcp_port}/p2p/{peer_id}"));
+        bootstrap_advertisement.addresses.push(format!(
+            "/dns4/{domain}/udp/{tcp_port}/quic-v1/p2p/{peer_id}"
+        ));
     }
     discovery.advertisement = Some(bootstrap_advertisement);
 
     println!("peer_id={peer_id}");
     println!("listen={}", args.p2p_listen);
     println!("model_protocol=/infernet/model/1");
-    println!("activation_protocol=/infernet/activation/1");
+    println!("activation_protocol={ACTIVATION_PROTOCOL}");
     println!("identity_file={}", args.identity_file.display());
     println!("cache={}", args.cache_dir.display());
     if let Some(domain) = args.public_domain.as_deref() {
         println!("public_multiaddr=/dns4/{domain}/tcp/{tcp_port}/p2p/{peer_id}");
+        println!("public_quic_multiaddr=/dns4/{domain}/udp/{tcp_port}/quic-v1/p2p/{peer_id}");
     }
     if let Some(ip) = args.public_ip.as_deref() {
         println!("public_multiaddr=/ip4/{ip}/tcp/{tcp_port}/p2p/{peer_id}");
+        println!("public_quic_multiaddr=/ip4/{ip}/udp/{tcp_port}/quic-v1/p2p/{peer_id}");
     }
+    println!("relay_protocol=/libp2p/circuit/relay/0.2.0/hop");
 
     run_model_distribution_node(
         discovery,
@@ -407,6 +429,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
 
     let mut discovery = DiscoveryConfig::new(args.topic);
     discovery.p2p_listen = args.p2p_listen;
+    discovery.relay_peers = args.relay_peers;
     let peer_id = discovery.peer_id().to_string();
 
     discovery.advertisement = Some(enrich_local_advertisement(shard_descriptor_advertisement(
@@ -420,7 +443,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
     println!("model={}", manifest.model_id);
     println!("runtime={}", manifest.runtime_kind.as_str());
     println!("layers={}:{}", owned_layers.start, owned_layers.end);
-    println!("activation_protocol=/infernet/activation/1");
+    println!("activation_protocol={ACTIVATION_PROTOCOL}");
 
     run_worker_node(
         discovery,
@@ -440,6 +463,7 @@ async fn infer(args: InferArgs) -> Result<()> {
     let manifest = manifest_for_model(&args.model)?;
     let mut discovery = DiscoveryConfig::new(args.discovery.topic);
     discovery.p2p_listen = args.discovery.p2p_listen;
+    discovery.relay_peers = args.discovery.relay_peers;
     discovery.static_peers = args
         .discovery
         .static_peers
@@ -504,6 +528,7 @@ async fn infer(args: InferArgs) -> Result<()> {
 async fn discover_registry(args: DiscoveryArgs, manifest: &ModelManifest) -> Result<ShardRegistry> {
     let mut discovery = DiscoveryConfig::new(args.topic);
     discovery.p2p_listen = args.p2p_listen;
+    discovery.relay_peers = args.relay_peers;
     discovery.static_peers = args
         .static_peers
         .iter()
@@ -708,6 +733,7 @@ async fn serve_model_distribution(args: ModelServeArgs) -> Result<()> {
     let mut rpc_server = start_worker_rpc_server(&args)?;
     let mut discovery = DiscoveryConfig::new(args.topic);
     discovery.p2p_listen = args.p2p_listen;
+    discovery.relay_peers = args.relay_peers;
     let peer_id = discovery.peer_id().to_string();
     discovery.advertisement = Some(local_capability_advertisement(
         peer_id.clone(),
@@ -834,6 +860,7 @@ fn start_worker_rpc_server(args: &ModelServeArgs) -> Result<Option<AdvertisedWor
         runtime_abi: INFERNET_LLAMA_RPC_RUNTIME_ABI.to_owned(),
         backend: backend.clone(),
         ready: true,
+        tunnel_protocol: Some(LLAMA_RPC_TUNNEL_PROTOCOL.to_owned()),
     };
     let server = spawn_llama_rpc_server(LlamaRpcServerConfig {
         binary,
@@ -857,28 +884,12 @@ fn start_worker_rpc_server(args: &ModelServeArgs) -> Result<Option<AdvertisedWor
 }
 
 fn configured_worker_rpc_host(explicit: Option<Ipv4Addr>) -> Result<Ipv4Addr> {
-    let host = if let Some(host) = explicit {
-        host
-    } else if let Ok(value) = env::var("INFERNET_LLAMA_RPC_HOST") {
-        value
-            .trim()
-            .parse::<Ipv4Addr>()
-            .context("INFERNET_LLAMA_RPC_HOST must be a private IPv4 address")?
-    } else {
-        preferred_private_ipv4().ok_or_else(|| {
-            anyhow!(
-                "no private LAN/Tailscale IPv4 address was detected; pass --rpc-host explicitly"
-            )
-        })?
-    };
-
-    if is_private_or_tailscale_ipv4(host) {
-        Ok(host)
-    } else {
-        Err(anyhow!(
-            "refusing to expose unauthenticated llama.cpp RPC on non-private address {host}"
-        ))
+    if explicit.is_some_and(|host| !host.is_loopback()) {
+        return Err(anyhow!(
+            "--rpc-host may only be 127.0.0.1; remote RPC uses the encrypted Infernet tunnel"
+        ));
     }
+    Ok(Ipv4Addr::LOCALHOST)
 }
 
 fn is_private_or_tailscale_ipv4(host: Ipv4Addr) -> bool {
@@ -1002,6 +1013,7 @@ async fn fetch_model_shard(args: ModelFetchArgs, mirror_after_download: bool) ->
     let layers = parse_layer_range(&args.layers)?;
     let mut discovery = DiscoveryConfig::new(args.discovery.topic.clone());
     discovery.p2p_listen = args.discovery.p2p_listen.clone();
+    discovery.relay_peers = args.discovery.relay_peers.clone();
     discovery.static_peers = args
         .discovery
         .static_peers

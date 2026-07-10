@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "linux")]
 use std::fs;
 
-use infernet_protocol::{LlamaRpcEndpoint, NodeCapabilities};
+use infernet_protocol::{LLAMA_RPC_TUNNEL_PROTOCOL, LlamaRpcEndpoint, NodeCapabilities};
 use sha2::{Digest, Sha256};
 
 const KIBIBYTE: u64 = 1024;
@@ -165,6 +165,12 @@ fn local_llama_rpc_endpoint() -> Option<LlamaRpcEndpoint> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .resolve(configured)
+}
+
+/// Returns the process-local loopback RPC target for the authenticated tunnel.
+/// The host/port are never serialized in node advertisements.
+pub fn local_llama_rpc_target() -> Option<LlamaRpcEndpoint> {
+    local_llama_rpc_endpoint()
 }
 
 /// Returns an advertised llama.cpp RPC endpoint only when its network address,
@@ -349,6 +355,7 @@ fn llama_rpc_endpoint_from_config(
         runtime_abi: runtime_abi.to_owned(),
         backend,
         ready: configured_ready(ready),
+        tunnel_protocol: Some(LLAMA_RPC_TUNNEL_PROTOCOL.to_owned()),
     };
     validate_llama_rpc_endpoint(&endpoint).ok()?;
     Some(endpoint)
@@ -424,6 +431,11 @@ fn detect_system_memory() -> Option<MemoryStats> {
         });
     }
 
+    #[cfg(target_os = "windows")]
+    {
+        return windows_memory_stats();
+    }
+
     #[allow(unreachable_code)]
     None
 }
@@ -443,8 +455,30 @@ fn detect_available_ram_bytes() -> Option<u64> {
             .and_then(|input| parse_vm_stat_available_bytes(&input));
     }
 
+    #[cfg(target_os = "windows")]
+    {
+        return windows_memory_stats().map(|memory| memory.available_bytes);
+    }
+
     #[allow(unreachable_code)]
     None
+}
+
+#[cfg(target_os = "windows")]
+fn windows_memory_stats() -> Option<MemoryStats> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+    let mut status = MEMORYSTATUSEX {
+        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `status` is initialized with the required structure size and
+    // remains valid and exclusively borrowed for the duration of the call.
+    let succeeded = unsafe { GlobalMemoryStatusEx(&mut status) };
+    (succeeded != 0).then_some(MemoryStats {
+        total_bytes: status.ullTotalPhys,
+        available_bytes: status.ullAvailPhys.min(status.ullTotalPhys),
+    })
 }
 
 fn detect_cpu_name() -> Option<String> {
@@ -615,6 +649,7 @@ mod tests {
             runtime_abi: "infernet-llama-rpc-v1".to_owned(),
             backend: "cuda".to_owned(),
             ready,
+            tunnel_protocol: Some(LLAMA_RPC_TUNNEL_PROTOCOL.to_owned()),
         }
     }
 

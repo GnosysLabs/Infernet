@@ -14,8 +14,16 @@ infernet-protocol.workspace = true
 infernet-runtime.workspace = true
 infernet-router.workspace = true
 libp2p.workspace = true
+libp2p-stream = "0.4.0-alpha"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
+tokio-util = { version = "0.7.18", features = ["compat"] }
 uuid.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_SystemInformation"] }
+
+[dev-dependencies]
+libp2p-swarm-test = "0.6.0"

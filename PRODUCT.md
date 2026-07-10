@@ -30,7 +30,7 @@ Calm, warm, quietly capable. Infernet should feel trustworthy and human like the
 1. Conversation first. Chat content and the composer own the primary surface.
 2. Hide the machinery, preserve trust. Explain outcomes in plain language and reveal technical details only on request.
 3. Show progress that answers user questions: what is happening, how long it has taken, and whether action is needed.
-4. Use progressive disclosure. Activity belongs in a collapsible secondary surface, with developer details reserved for Developer Mode.
+4. Use progressive disclosure. Activity is a collapsible HUD and journal for this node; network-wide state belongs on the Network screen.
 5. Make every state actionable. Empty, loading, download, success, and error states should tell users what matters next.
 6. Curate the runtime. Infernet controls, tests, signs, and distributes every model package exposed in the product.
 

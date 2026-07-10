@@ -34,7 +34,11 @@ export interface PeerView {
 export interface MachineView {
   peerId: string;
   shortPeerId: string;
+  addresses: string[];
+  machineId?: string | null;
   isLocal: boolean;
+  connectionStatus: "connected" | "reconnecting" | "unreachable";
+  lastSeenSeconds: number;
   computeBackend: string;
   deviceName: string;
   logicalCpuCores: number;
@@ -100,6 +104,9 @@ export interface DistributionSnapshot {
   maxStorageBytes: number;
   currentUploads: number;
   currentDownloads: number;
+  bytesServed: number;
+  chunksServed: number;
+  lastServedUnixMs?: number | null;
   replicationHealth: ReplicationHealthView[];
 }
 
@@ -130,6 +137,36 @@ export interface ModelImportProgress {
   detail: string;
   downloadedBytes: number;
   totalBytes?: number | null;
+}
+
+export type LocalNodeActivityKind = "chatCompletion" | "computeContribution";
+export type LocalNodeActivityOutcome = "success" | "error";
+
+export interface LocalNodeActivityTask {
+  id: string;
+  traceId: string;
+  kind: LocalNodeActivityKind;
+  startedAtUnixMs: number;
+}
+
+export interface LocalNodeActivityEntry extends LocalNodeActivityTask {
+  outcome: LocalNodeActivityOutcome;
+  completedAtUnixMs: number;
+}
+
+export interface LocalNodeActivitySnapshot {
+  computeActive: boolean;
+  computeReady: boolean;
+  computeBackend: string;
+  deviceName: string;
+  totalMemoryBytes: number;
+  availableMemoryBytes: number;
+  sharingActive: boolean;
+  bytesServed: number;
+  chunksServed: number;
+  lastServedUnixMs?: number | null;
+  current: LocalNodeActivityTask[];
+  journal: LocalNodeActivityEntry[];
 }
 
 export type ProgressEvent =

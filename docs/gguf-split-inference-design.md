@@ -14,7 +14,7 @@ The proof is correctness, not speed:
 
 - a real GGUF model is partitioned by contiguous transformer layer ranges;
 - each peer loads only its assigned layer range and required boundary tensors;
-- activations are forwarded over `/infernet/activation/1`;
+- activations are forwarded over `/infernet/activation/2`;
 - route construction remains dynamic through peer advertisements;
 - the UI shows available models, route coverage, participating peers, and hop
   timing without exposing a Local-vs-AI-Grid mode switch.
@@ -353,9 +353,9 @@ The UI should visualize:
 - Physical tensor-only shards are still required before claiming that no peer
   has the full model source file. Current GGUF peers may cache the verified
   source and load only their assigned layer range from it.
-- The first bridge supports prompt-pass plus one sampled token. Persistent
-  session state, KV-cache forwarding, and streaming multi-token generation are
-  future runtime work.
+- Persistent workers keep their assigned weights and KV cache resident. The
+  sticky route repeats for each sampled token, so only activations and token
+  state cross the network during multi-token generation.
 - There is no non-functional bridge fallback. If the real
   `infernet-llama-bridge` cannot be built or provided, runtime preparation must
   fail with the missing dependency instead of presenting the app as runnable.
@@ -368,7 +368,8 @@ The UI should visualize:
    range.
 4. Update routing to support `RuntimeKind::LlamaCpp`.
 5. Make runtime execution explicitly select demo vs llama.cpp. LlamaCpp workers
-   now invoke `infernet-llama-bridge` through `/infernet/activation/1`; the old
+   now invoke persistent `infernet-llama-bridge` workers through
+   `/infernet/activation/2`; the old
    full-local `llama-cli` fallback has been removed from the inference path.
 6. Remove UI execution modes and present models as the primary navigation.
 7. Package the llama.cpp bridge as a Tauri sidecar.

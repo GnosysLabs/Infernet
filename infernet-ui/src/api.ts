@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   GridSnapshot,
   LocalIdentity,
+  LocalNodeActivitySnapshot,
   ModelImportProgress,
   ProgressEvent,
   RunDemoResponse,
@@ -27,12 +28,19 @@ export const emptySnapshot: GridSnapshot = {
     maxStorageBytes: 0,
     currentUploads: 0,
     currentDownloads: 0,
+    bytesServed: 0,
+    chunksServed: 0,
+    lastServedUnixMs: null,
     replicationHealth: [],
   },
 };
 
 export async function getLocalIdentity(): Promise<LocalIdentity> {
   return invoke<LocalIdentity>("get_local_identity");
+}
+
+export async function getLocalNodeActivity(): Promise<LocalNodeActivitySnapshot> {
+  return invoke<LocalNodeActivitySnapshot>("get_local_node_activity");
 }
 
 export async function getManualPeers(): Promise<string[]> {
