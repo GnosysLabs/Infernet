@@ -953,10 +953,11 @@ fn start_local_rpc_tunnel_worker(swarm: &Swarm<GridBehaviour>) -> Result<Option<
     if !target.ip().is_loopback() {
         bail!("refusing non-loopback RPC tunnel target {target}");
     }
-    let admission = RpcTunnelAdmission::allow_authenticated_peers(RpcTunnelAdmissionLimits {
-        max_sessions: 1,
-        max_sessions_per_peer: 1,
-    })?;
+    // llama.cpp may overlap device discovery, allocation, and tensor transfer
+    // connections to one RPC worker during model load. The authenticated
+    // default keeps a strict bound without rejecting valid parallel sessions.
+    let admission =
+        RpcTunnelAdmission::allow_authenticated_peers(RpcTunnelAdmissionLimits::default())?;
     let mut control = swarm.behaviour().rpc_tunnel.new_control();
     let incoming = control
         .accept(RPC_TUNNEL_PROTOCOL)

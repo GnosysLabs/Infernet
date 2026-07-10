@@ -46,6 +46,7 @@ const TICKET_BYTES: usize = 32;
 const OPEN_FRAME_BYTES: usize = 4 + 2 + 16 + TICKET_BYTES;
 const ACK_FRAME_BYTES: usize = 4 + 2 + 1;
 const MAX_PENDING_REJECTIONS: usize = 32;
+pub const LLAMA_RPC_TUNNEL_MAX_CONNECTIONS: usize = 16;
 
 /// Unforgeable per-job credential delivered to both selected peers over their
 /// already authenticated control plane.
@@ -96,8 +97,8 @@ pub struct RpcTunnelAdmissionLimits {
 impl Default for RpcTunnelAdmissionLimits {
     fn default() -> Self {
         Self {
-            max_sessions: 8,
-            max_sessions_per_peer: 2,
+            max_sessions: LLAMA_RPC_TUNNEL_MAX_CONNECTIONS,
+            max_sessions_per_peer: LLAMA_RPC_TUNNEL_MAX_CONNECTIONS,
         }
     }
 }
@@ -319,7 +320,11 @@ impl RpcTunnelProxyConfig {
             ticket,
             handshake_timeout: Duration::from_secs(10),
             max_session_duration: Duration::from_secs(30 * 60),
-            max_connections: 2,
+            // llama.cpp creates several short-lived and overlapping RPC
+            // connections while enumerating devices and loading tensors. A
+            // limit of two caused the proxy to close legitimate connections,
+            // which llama.cpp reports as a crashed or malformed RPC server.
+            max_connections: LLAMA_RPC_TUNNEL_MAX_CONNECTIONS,
         }
     }
 

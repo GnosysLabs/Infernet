@@ -109,6 +109,15 @@ fn configs_refuse_non_loopback_tcp_exposure() {
 }
 
 #[test]
+fn default_limits_allow_llama_model_load_connection_fanout() {
+    let limits = RpcTunnelAdmissionLimits::default();
+    let proxy = RpcTunnelProxyConfig::new(libp2p::PeerId::random(), RpcTunnelTicket::random());
+    assert_eq!(limits.max_sessions, 16);
+    assert_eq!(limits.max_sessions_per_peer, 16);
+    assert_eq!(proxy.max_connections, 16);
+}
+
+#[test]
 fn tickets_are_redacted_in_debug_output() {
     let ticket = RpcTunnelTicket::from_bytes([0x5a; 32]);
     let debug = format!("{ticket:?}");
