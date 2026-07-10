@@ -2128,7 +2128,10 @@ async fn ensure_model_distribution_service(
     discovery.p2p_listen = format!("/ip4/0.0.0.0/tcp/{UI_LISTEN_PORT}");
     discovery.static_peers = configured_static_peers(state)?;
     discovery.relay_peers = default_relay_peer_addresses()?;
-    discovery.enable_mdns = true;
+    // Desktop discovery is public-bootstrap based. Broadcasting the node over
+    // mDNS makes legacy LAN builds repeatedly connect and fail modern
+    // Identify/Ping negotiation, producing noisy errors and needless sockets.
+    discovery.enable_mdns = false;
     discovery.advertisement = Some(local_node_advertisement(&cache_config, local_peer_id));
 
     let (waiter_sender, waiter_receiver) = oneshot::channel();
