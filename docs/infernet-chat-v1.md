@@ -31,13 +31,17 @@ optional measured throughput. NVIDIA capacity comes from `nvidia-smi`; Apple
 Silicon reports Metal with its currently available unified memory. Device names
 are descriptive only—the planner uses the reported numbers.
 
-The launch scheduler selects one verified package coordinator and a leased set
-of CUDA/Metal RPC workers. Pinned llama.cpp assigns contiguous layers and their
-KV buffers in proportion to backend memory. Infernet reserves KV cache, runtime
-scratch space, and a safety margin before accepting the topology. Saturated
-machines and duplicate app identities on one physical host are skipped. The
-topology remains stable across prompts so weights and distributed KV stay
-resident instead of being retransferred whenever free-memory telemetry changes.
+The launch scheduler groups app identities by physical machine and selects an
+eligible CUDA/Metal execution topology. Whenever at least two distinct eligible
+physical machines are available, pinned llama.cpp assigns contiguous layers and
+their KV buffers across at least two of them in proportion to backend memory. A
+local-only topology is accepted only when the requesting machine is itself the
+sole eligible machine; a lone remote machine never receives another user's whole
+request. Infernet reserves KV cache, runtime scratch space, and a safety margin
+before accepting the topology. Saturated machines and duplicate app identities
+on one physical host are skipped. The topology remains stable across prompts so
+weights and distributed KV stay resident instead of being retransferred whenever
+free-memory telemetry changes.
 
 ## Package contract
 
@@ -57,7 +61,8 @@ the multi-component runtime is completed:
 These values come from Google's [raw repository pointer](https://huggingface.co/google/gemma-4-26B-A4B-it-qat-q4_0-gguf/raw/main/gemma-4-26B_q4_0-it.gguf).
 The app rejects peers advertising the same model ID with any other version,
 size, layer coverage, or checksum. This compatibility payload is a trust anchor
-and single-node correctness fallback, not the distributed launch package.
+and packaging bridge while the distributed launch package is completed. It does
+not authorize routing another user's whole request to one remote machine.
 
 The target component plan is:
 
@@ -97,13 +102,19 @@ The official package does not ship until all of these pass:
 5. Total unique package bytes satisfy the storage invariant.
 6. Repeated runs survive peer restart, missing-component, timeout, and checksum
    failure tests without freezing a host.
+7. Scheduling uses at least two distinct eligible physical machines whenever
+   available, permits local-only execution only for the sole eligible requester,
+   and rejects a topology containing only one remote machine.
 
 For launch, the compatibility package remains a complete `0:N` package on one
 coordinator, while llama.cpp RPC distributes its tensors and KV allocations
-across the selected machines at load time. This delivers real multi-machine
-execution without duplicating global tensors into 30+ GB of generated shard
-files. A future native-component release can remove the remaining requirement
-that one coordinator stores the complete source package.
+across the selected machines at load time whenever the topology has multiple
+eligible physical machines. The coordinator is never used as a one-remote
+whole-request fallback. A local requester may use the package alone only when it
+is the sole eligible machine. This delivers real multi-machine execution without
+duplicating global tensors into 30+ GB of generated shard files. A future
+native-component release can remove the remaining requirement that one
+coordinator stores the complete source package.
 
 ## Seeding the pinned compatibility release
 

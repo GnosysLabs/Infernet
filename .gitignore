@@ -12,6 +12,8 @@ infernet-ui/src-tauri/binaries/infernet-llama-bridge-*
 infernet-ui/src-tauri/binaries/ggml-rpc-server-*
 infernet-ui/src-tauri/binaries/llama-server-*
 infernet-ui/src-tauri/binaries/.infernet-llama-runtime-*.stamp
+infernet-ui/src-tauri/binaries/sd-cli-*
+infernet-ui/src-tauri/binaries/.infernet-stable-diffusion-runtime-*.stamp
 infernet-ui/src-tauri/binaries/*.dll
 infernet-ui/src-tauri/binaries/*.dylib
 infernet-ui/src-tauri/binaries/*.so

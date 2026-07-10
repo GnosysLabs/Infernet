@@ -3,6 +3,7 @@ pub mod llama_server_runtime;
 pub mod model_distribution;
 pub mod rpc_runtime;
 pub mod rpc_tunnel;
+pub mod stable_diffusion_runtime;
 
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -30,11 +31,12 @@ use infernet_model::{
     SeedShardManifest, ShardDescriptor,
 };
 use infernet_protocol::{
-    ACTIVATION_PROTOCOL, ActivationRequest, ActivationResponse, MODEL_BLOB_PROTOCOL,
-    MODEL_PROTOCOL, ModelBlobRequest, ModelBlobResponse, ModelShardInfo, ModelShardRequest,
-    ModelShardResponse, NodeAdvertisement, PROTOCOL_VERSION, PromptMetadata, RouteHop, TraceEvent,
+    ACTIVATION_PROTOCOL, ActivationRequest, ActivationResponse, MIN_DISTRIBUTED_MACHINE_COUNT,
+    MODEL_BLOB_PROTOCOL, MODEL_PROTOCOL, ModelBlobRequest, ModelBlobResponse, ModelShardInfo,
+    ModelShardRequest, ModelShardResponse, NodeAdvertisement, PROTOCOL_VERSION, PromptMetadata,
+    RouteHop, TraceEvent,
 };
-use infernet_router::ShardRegistry;
+use infernet_router::{RouterError, ShardRegistry, validate_execution_route};
 use infernet_runtime::{DemoRuntime, LayerRuntime, activation_checksum};
 use libp2p::{
     Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
@@ -67,8 +69,9 @@ use tokio::time::{Instant, interval, sleep};
 pub use capabilities::{
     PINNED_GGML_RPC_PROTOCOL_VERSION, clear_local_llama_rpc_endpoint,
     configured_llama_rpc_endpoint, detect_node_capabilities, local_llama_rpc_target,
-    set_local_inference_active, set_local_llama_rpc_endpoint, set_local_rpc_active,
-    set_vram_contribution_limit_bytes, validate_llama_rpc_endpoint, vram_contribution_limit_bytes,
+    set_local_inference_active, set_local_llama_rpc_endpoint, set_local_model_components,
+    set_local_rpc_active, set_vram_contribution_limit_bytes, validate_llama_rpc_endpoint,
+    vram_contribution_limit_bytes,
 };
 pub use llama_server_runtime::{
     LlamaServerCompletion, LlamaServerConfig, complete_with_persistent_llama_server,
@@ -82,6 +85,10 @@ pub use rpc_tunnel::{
     RPC_TUNNEL_PROTOCOL, RpcTunnelAdmission, RpcTunnelAdmissionLimits, RpcTunnelProxy,
     RpcTunnelProxyConfig, RpcTunnelTicket, RpcTunnelWorker, RpcTunnelWorkerConfig,
 };
+pub use stable_diffusion_runtime::{
+    ImageGenerationOutput, ImageGenerationRequest, StableDiffusionConfig, StableDiffusionPlacement,
+    find_sd_cli_binary, generate_with_sd_cli,
+};
 
 pub type ModelDistributionReadiness = oneshot::Sender<std::result::Result<String, String>>;
 pub type ModelDistributionRegistryObserver = Arc<dyn Fn(ShardRegistry) + Send + Sync>;
@@ -89,6 +96,7 @@ pub type ModelDistributionRegistryObserver = Arc<dyn Fn(ShardRegistry) + Send + 
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
     pub peer_id: String,
+    pub machine_id: String,
     pub model_id: String,
     pub runtime_kind: RuntimeKind,
     pub owned_layers: LayerRange,
@@ -292,6 +300,7 @@ pub struct LocalNodeActivityEntry {
 #[serde(rename_all = "camelCase")]
 pub enum LocalNodeActivityKind {
     ChatCompletion,
+    ImageGeneration,
     ComputeContribution,
 }
 
@@ -368,6 +377,26 @@ impl LocalNodeActivityState {
 
 static LOCAL_NODE_ACTIVITY: OnceLock<Mutex<LocalNodeActivityState>> = OnceLock::new();
 
+pub struct LocalNodeActivityGuard {
+    job_id: uuid::Uuid,
+    completed: bool,
+}
+
+impl LocalNodeActivityGuard {
+    pub fn complete(mut self, outcome: LocalNodeActivityOutcome) {
+        finish_tracked_local_node_activity(self.job_id, outcome);
+        self.completed = true;
+    }
+}
+
+impl Drop for LocalNodeActivityGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            finish_tracked_local_node_activity(self.job_id, LocalNodeActivityOutcome::Error);
+        }
+    }
+}
+
 /// Returns the authoritative process-local activation activity snapshot.
 pub fn local_node_activity_snapshot() -> LocalNodeActivitySnapshot {
     LOCAL_NODE_ACTIVITY
@@ -375,6 +404,31 @@ pub fn local_node_activity_snapshot() -> LocalNodeActivitySnapshot {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .snapshot()
+}
+
+pub fn begin_local_node_activity(
+    trace_id: uuid::Uuid,
+    kind: LocalNodeActivityKind,
+) -> LocalNodeActivityGuard {
+    let job_id = uuid::Uuid::new_v4();
+    start_local_node_activity(job_id, trace_id, kind);
+    LocalNodeActivityGuard {
+        job_id,
+        completed: false,
+    }
+}
+
+fn finish_tracked_local_node_activity(job_id: uuid::Uuid, outcome: LocalNodeActivityOutcome) {
+    LOCAL_NODE_ACTIVITY
+        .get_or_init(|| Mutex::new(LocalNodeActivityState::default()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .finish(
+            &job_id.to_string(),
+            None,
+            outcome,
+            model_serving_now_unix_ms(),
+        );
 }
 
 fn start_local_node_activity(
@@ -578,6 +632,8 @@ struct ActivationCodec;
 struct ActivationRequestHeader {
     protocol_version: u32,
     trace_id: uuid::Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    origin_machine_id: Option<String>,
     model_id: String,
     route: Vec<RouteHop>,
     current_hop_index: usize,
@@ -630,6 +686,7 @@ impl request_response::Codec for ActivationCodec {
         Ok(ActivationRequest {
             protocol_version: header.protocol_version,
             trace_id: header.trace_id,
+            origin_machine_id: header.origin_machine_id,
             model_id: header.model_id,
             route: header.route,
             current_hop_index: header.current_hop_index,
@@ -684,6 +741,7 @@ impl request_response::Codec for ActivationCodec {
         let header = ActivationRequestHeader {
             protocol_version: req.protocol_version,
             trace_id: req.trace_id,
+            origin_machine_id: req.origin_machine_id,
             model_id: req.model_id,
             route: req.route,
             current_hop_index: req.current_hop_index,
@@ -1070,10 +1128,12 @@ pub async fn run_worker_node(mut discovery: DiscoveryConfig, worker: WorkerConfi
                 add_static_peer_addresses(&mut swarm, &discovery.static_peers, &discovery.relay_peers);
             }
             _ = publish_interval.tick(), if discovery.advertisement.is_some() => {
-                refresh_advertisement_model_shards(
-                    &mut discovery.advertisement,
-                    shard_cache.as_ref(),
-                )?;
+                if shard_cache.is_some() {
+                    refresh_advertisement_model_shards(
+                        &mut discovery.advertisement,
+                        shard_cache.as_ref(),
+                    )?;
+                }
                 publish_local_advertisement(
                     &mut swarm,
                     &topic,
@@ -2089,6 +2149,7 @@ pub async fn infer_over_libp2p(
     if !config.rpc_worker_peer_ids.is_empty() {
         validate_rpc_model_manifest(&manifest)?;
     }
+    let origin_machine_id = local_machine_id()?;
 
     let topic = gossipsub::IdentTopic::new(config.topic.clone());
     let mut registry = ShardRegistry::new();
@@ -2104,7 +2165,7 @@ pub async fn infer_over_libp2p(
     add_static_peer_addresses(&mut swarm, &config.static_peers, &config.relay_peers);
 
     let route = if let Some(route) = config.planned_route.clone() {
-        validate_planned_route(&route, &manifest, &config.static_peers)?;
+        validate_planned_route(&route, &manifest, &config.static_peers, &origin_machine_id)?;
         route
     } else {
         discover_route_on_swarm(
@@ -2113,6 +2174,7 @@ pub async fn infer_over_libp2p(
             &mut config,
             &topic,
             &manifest,
+            &origin_machine_id,
             discovery_timeout,
         )
         .await?
@@ -2130,13 +2192,14 @@ pub async fn infer_over_libp2p(
         rpc_endpoints: Vec::new(),
         rpc_worker_peer_ids: Vec::new(),
     };
-    let request = ActivationRequest::new(
+    let mut request = ActivationRequest::new(
         manifest.model_id.clone(),
         route.clone(),
         hidden_size,
         activation,
         Some(prompt_metadata.clone()),
     );
+    request.origin_machine_id = Some(origin_machine_id.clone());
     let first_hop = request
         .current_hop()
         .cloned()
@@ -2205,6 +2268,7 @@ pub async fn infer_over_libp2p(
             Vec::new(),
             Some(prompt_metadata.clone()),
         );
+        next_request.origin_machine_id = Some(origin_machine_id.clone());
         next_request.trace_id = trace_id;
         next_request.input_token_id = Some(sampled_token_id);
         next_request.sequence_position = response.next_sequence_position;
@@ -2361,37 +2425,55 @@ fn normalize_trusted_rpc_endpoints(endpoints: &[String]) -> Result<Vec<String>> 
     Ok(normalized)
 }
 
+fn local_machine_id() -> Result<String> {
+    detect_node_capabilities()
+        .machine_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|machine_id| !machine_id.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("could not determine this computer's stable identity"))
+}
+
+fn validate_execution_placement(route: &[RouteHop], origin_machine_id: Option<&str>) -> Result<()> {
+    if route.is_empty() {
+        bail!("inference route must not be empty");
+    }
+    let mut machine_ids = HashSet::new();
+    for hop in route {
+        let machine_id = hop.machine_id.trim();
+        if machine_id.is_empty() {
+            bail!(
+                "inference route peer {} has no verifiable physical-machine identity",
+                hop.peer_id
+            );
+        }
+        machine_ids.insert(machine_id);
+    }
+    if machine_ids.len() >= MIN_DISTRIBUTED_MACHINE_COUNT {
+        return Ok(());
+    }
+
+    let requester_is_the_only_machine = origin_machine_id
+        .map(str::trim)
+        .filter(|machine_id| !machine_id.is_empty())
+        .is_some_and(|origin| machine_ids.len() == 1 && machine_ids.contains(origin));
+    if requester_is_the_only_machine {
+        return Ok(());
+    }
+
+    bail!(
+        "Infernet will not assign an entire request to one remote computer; waiting for another eligible computer"
+    )
+}
+
 fn validate_planned_route(
     route: &[RouteHop],
     manifest: &ModelManifest,
     advertisements: &[NodeAdvertisement],
+    origin_machine_id: &str,
 ) -> Result<()> {
-    if route.is_empty() {
-        bail!("planned inference route must not be empty");
-    }
-    let mut expected_start = 0_u32;
-    for hop in route {
-        if hop.layers.start != expected_start || hop.layers.end > manifest.layer_count {
-            bail!("planned inference route is not contiguous for the selected model");
-        }
-        let advertised = advertisements.iter().any(|advertisement| {
-            advertisement.peer_id == hop.peer_id
-                && advertisement.hosted_shards.iter().any(|shard| {
-                    shard.model_id == manifest.model_id && shard.layers.contains(&hop.layers)
-                })
-        });
-        if !advertised {
-            bail!(
-                "planned coordinator {} no longer advertises the selected verified model",
-                hop.peer_id
-            );
-        }
-        expected_start = hop.layers.end;
-    }
-    if expected_start != manifest.layer_count {
-        bail!("planned inference route does not cover the full selected model");
-    }
-    Ok(())
+    validate_execution_route(manifest, advertisements, origin_machine_id, route).map_err(Into::into)
 }
 
 fn is_trusted_rpc_ipv4(address: Ipv4Addr) -> bool {
@@ -2434,6 +2516,7 @@ pub fn demo_advertisement(
         capabilities: None,
         hosted_shards: vec![ShardDescriptor::demo(model_id, layers)],
         model_shards: Vec::new(),
+        model_components: Vec::new(),
     })
 }
 
@@ -2458,6 +2541,7 @@ pub fn shard_advertisement(
         capabilities: None,
         hosted_shards: vec![ShardDescriptor::for_manifest(manifest, layers)],
         model_shards: Vec::new(),
+        model_components: Vec::new(),
     })
 }
 
@@ -2477,6 +2561,7 @@ pub fn empty_advertisement(peer_id: String, address: String) -> NodeAdvertisemen
         capabilities: None,
         hosted_shards: Vec::new(),
         model_shards: Vec::new(),
+        model_components: Vec::new(),
     }
 }
 
@@ -2504,6 +2589,7 @@ pub fn refresh_local_advertisement_capabilities(
     advertisement.available_vram_bytes = (capabilities.available_accelerator_memory_bytes > 0)
         .then_some(capabilities.available_accelerator_memory_bytes);
     advertisement.capabilities = Some(capabilities);
+    advertisement.model_components = capabilities::local_model_components();
     true
 }
 
@@ -3489,6 +3575,8 @@ fn validate_activation_request(config: &WorkerConfig, request: &ActivationReques
         );
     }
 
+    validate_execution_placement(&request.route, request.origin_machine_id.as_deref())?;
+
     if request.model_id != config.model_id {
         bail!(
             "worker {} hosts model {}, got {}",
@@ -3519,6 +3607,15 @@ fn validate_activation_request(config: &WorkerConfig, request: &ActivationReques
         );
     }
 
+    if hop.machine_id != config.machine_id {
+        bail!(
+            "route expected physical machine {}, but peer {} runs on {}",
+            hop.machine_id,
+            config.peer_id,
+            config.machine_id
+        );
+    }
+
     if !config.owned_layers.contains(&hop.layers) {
         bail!(
             "peer {} owns {:?}, route requested {:?}",
@@ -3537,15 +3634,24 @@ async fn discover_route_on_swarm(
     config: &mut DiscoveryConfig,
     topic: &gossipsub::IdentTopic,
     manifest: &ModelManifest,
+    origin_machine_id: &str,
     timeout: Duration,
 ) -> Result<Vec<RouteHop>> {
     let deadline = Instant::now() + timeout;
+    let mut saw_invalid_execution_placement = false;
 
     loop {
-        let route_error = match registry.route_for_model(manifest) {
-            Ok(route) => return Ok(route),
-            Err(error) => error,
-        };
+        match registry.execution_route_for_model(manifest, origin_machine_id) {
+            Ok(route) if execution_route_is_distributed(&route) => return Ok(route),
+            // A local-only route is provisional until the discovery window
+            // closes. A remote may already be online but its advertisement
+            // has not reached this short-lived inference swarm yet.
+            Ok(_) => {}
+            Err(error) => {
+                saw_invalid_execution_placement |=
+                    matches!(&error, RouterError::InvalidExecutionPlacement { .. });
+            }
+        }
 
         tokio::select! {
             event = swarm.select_next_some() => {
@@ -3560,10 +3666,33 @@ async fn discover_route_on_swarm(
                 )?;
             }
             _ = sleep_until(deadline) => {
-                return Err(route_error.into());
+                match registry.execution_route_for_model(manifest, origin_machine_id) {
+                    Ok(route) => return Ok(route),
+                    Err(error) => {
+                        if saw_invalid_execution_placement
+                            || matches!(&error, RouterError::InvalidExecutionPlacement { .. })
+                        {
+                            return Err(RouterError::InvalidExecutionPlacement {
+                                model_id: manifest.model_id.clone(),
+                            }
+                            .into());
+                        }
+                        return Err(error.into());
+                    }
+                }
             }
         }
     }
+}
+
+fn execution_route_is_distributed(route: &[RouteHop]) -> bool {
+    route
+        .iter()
+        .map(|hop| hop.machine_id.trim())
+        .filter(|machine_id| !machine_id.is_empty())
+        .collect::<HashSet<_>>()
+        .len()
+        >= MIN_DISTRIBUTED_MACHINE_COUNT
 }
 
 async fn wait_for_client_response(
@@ -4094,6 +4223,7 @@ fn worker_config_for_activation(
 
     Ok(WorkerConfig {
         peer_id: peer_id.to_owned(),
+        machine_id: local_machine_id()?,
         model_id: manifest.model_id,
         runtime_kind: manifest.runtime_kind,
         owned_layers: manifest.layers,
@@ -5379,6 +5509,7 @@ mod tests {
     fn worker(peer_id: &str, layers: LayerRange) -> WorkerConfig {
         WorkerConfig {
             peer_id: peer_id.to_owned(),
+            machine_id: peer_id.to_owned(),
             model_id: "grid-demo-12".to_owned(),
             runtime_kind: RuntimeKind::Demo,
             owned_layers: layers,
@@ -5390,6 +5521,7 @@ mod tests {
     fn hop(peer_id: &str, start: u32, end: u32) -> RouteHop {
         RouteHop {
             peer_id: peer_id.to_owned(),
+            machine_id: peer_id.to_owned(),
             address: String::new(),
             layers: LayerRange::new(start, end).unwrap(),
         }
@@ -5644,6 +5776,7 @@ mod tests {
         );
         let worker = WorkerConfig {
             peer_id: "coordinator".to_owned(),
+            machine_id: "coordinator".to_owned(),
             model_id: model.model_id,
             runtime_kind: model.runtime_kind,
             owned_layers: layers,
@@ -6089,9 +6222,55 @@ mod tests {
     }
 
     #[test]
+    fn placement_allows_only_distributed_or_requester_local_routes() {
+        let local_route = vec![hop("local-worker", 0, 12)];
+        assert!(
+            validate_execution_placement(&local_route, Some("local-worker")).is_ok(),
+            "the requester may use its own machine when it is the sole executor"
+        );
+
+        let remote_route = vec![hop("remote-worker", 0, 12)];
+        assert!(
+            validate_execution_placement(&remote_route, Some("requester-machine")).is_err(),
+            "one remote machine must never receive the whole request"
+        );
+
+        let distributed_route = vec![hop("machine-a", 0, 6), hop("machine-b", 6, 12)];
+        assert!(
+            validate_execution_placement(&distributed_route, Some("requester-machine")).is_ok()
+        );
+    }
+
+    #[test]
+    fn placement_does_not_count_multiple_peers_on_one_remote_machine() {
+        let mut first = hop("peer-a", 0, 6);
+        let mut second = hop("peer-b", 6, 12);
+        first.machine_id = "one-remote-machine".to_owned();
+        second.machine_id = "one-remote-machine".to_owned();
+
+        assert!(validate_execution_placement(&[first, second], Some("requester-machine")).is_err());
+    }
+
+    #[test]
+    fn worker_rejects_a_single_remote_route_before_execution() {
+        let route = vec![hop("remote-worker", 0, 3)];
+        let mut request = ActivationRequest::new("grid-demo-12", route, 4, vec![0.1; 4], None);
+        request.origin_machine_id = Some("requester-machine".to_owned());
+
+        let response = process_activation_step(
+            &worker("remote-worker", LayerRange::new(0, 3).unwrap()),
+            request,
+        )
+        .unwrap_err();
+
+        assert!(response.error.unwrap().contains("one remote computer"));
+    }
+
+    #[test]
     fn activation_step_rejects_wrong_layer_range() {
         let route = vec![hop("peer-a", 3, 6)];
-        let request = ActivationRequest::new("grid-demo-12", route, 4, vec![0.1; 4], None);
+        let mut request = ActivationRequest::new("grid-demo-12", route, 4, vec![0.1; 4], None);
+        request.origin_machine_id = Some("peer-a".to_owned());
 
         let response =
             process_activation_step(&worker("peer-a", LayerRange::new(0, 3).unwrap()), request)

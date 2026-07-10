@@ -8,7 +8,10 @@ The next milestone is to replace the toy transformer with one real GGUF language
 model that can run across multiple independent Infernet peers. Infernet is now
 always a distributed network: the local computer is one node in the same network
 as every other node. Users select a model, not an execution mode. The scheduler
-chooses whether the route is local-only, mixed local/remote, or remote-only.
+splits work across at least two distinct eligible physical machines whenever two
+or more are available. A local-only route is valid only when the requesting
+computer is itself the sole eligible machine. A sole remote machine is never
+selected to run another user's whole request.
 
 The proof is correctness, not speed:
 
@@ -264,10 +267,14 @@ Correctness-first constraints:
   binary payload before large real activations.
 - Support one request at a time per worker before batching.
 - Keep the same route for the whole generation session.
+- Treat duplicate peer identities on one host as one physical machine. Split the
+  route across at least two eligible physical machines whenever possible; allow
+  local-only execution only for the sole eligible requester, never a sole remote.
 
 Initial real generation flow:
 
-1. Scheduler builds a complete route for the selected model.
+1. Scheduler builds a complete route for the selected model under the physical-
+   machine distribution rule above.
 2. First shard tokenizes the prompt or receives token IDs from the client and
    creates the embedding/hidden activation.
 3. Each shard executes its contiguous layer range and forwards hidden state.
@@ -292,16 +299,22 @@ Scheduler inputs:
 
 Route construction should prefer:
 
+- at least two distinct eligible physical machines whenever two or more are
+  available;
+- local-only execution only when the requester is the sole eligible machine, and
+  never one remote machine for another user's complete request;
 - complete layer coverage;
 - compatible runtime kind and model checksum;
-- fewer hops when latency is otherwise similar;
+- fewer hops when latency is otherwise similar, after the distribution rule is
+  satisfied;
 - local shards when they reduce total latency;
 - peers with the exact required shard checksum;
 - peers with lower recent failure rate.
 
 The current greedy route builder remains acceptable for the first GGUF metadata
-step, but it must filter against `manifest.runtime_kind`, not hard-code demo
-runtime compatibility.
+step only if it enforces the physical-machine distribution rule and filters
+against `manifest.runtime_kind` rather than hard-coding demo runtime
+compatibility.
 
 ## Metrics
 

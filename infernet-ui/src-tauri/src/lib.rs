@@ -1,6 +1,7 @@
 mod app_settings;
 mod chat_history;
 mod execution_plan;
+mod image_runtime;
 mod peer_presence;
 
 #[cfg(test)]
@@ -15,6 +16,7 @@ use std::{
 };
 
 use app_settings::{AppSettingsStore, get_vram_contribution_settings, set_vram_contribution};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chat_history::{
     ChatHistoryStore, append_chat_message, create_chat_thread, delete_chat_thread,
     get_chat_history, select_chat_thread,
@@ -25,20 +27,25 @@ use infernet_model::{
     INFERNET_CHAT_KV_CACHE_BYTES_PER_LAYER, LayerRange, ModelManifest, OfficialComponentKind,
     OfficialModelRelease, RuntimeKind, SeedShardManifest, ShardDescriptor,
 };
+use infernet_node::stable_diffusion_runtime::{
+    ImageGenerationRequest, StableDiffusionConfig, StableDiffusionPlacement, find_sd_cli_binary,
+    generate_with_sd_cli,
+};
 use infernet_node::{
     DiscoveryConfig, INFERNET_LLAMA_RPC_RUNTIME_ABI, LLAMA_RPC_DEFAULT_PORT,
     LLAMA_RPC_PROTOCOL_VERSION, LlamaRpcServer, LlamaRpcServerConfig, LocalNodeActivityEntry,
-    LocalNodeActivityTask, PAYLOAD_KIND_FULL_MODEL, PAYLOAD_KIND_GGUF_SHARD,
-    PAYLOAD_KIND_INFERNET_SHARD, ShardCache, ShardCacheConfig, clear_local_llama_rpc_endpoint,
+    LocalNodeActivityKind, LocalNodeActivityOutcome, LocalNodeActivityTask,
+    PAYLOAD_KIND_FULL_MODEL, PAYLOAD_KIND_GGUF_SHARD, PAYLOAD_KIND_INFERNET_SHARD, ShardCache,
+    ShardCacheConfig, begin_local_node_activity, clear_local_llama_rpc_endpoint,
     detect_node_capabilities, empty_advertisement, enrich_local_advertisement,
     fetch_model_shard_over_libp2p_with_progress, find_llama_rpc_server_binary,
     import_seed_model_from_file_consuming_verified, infer_over_libp2p, is_executable_shard_record,
     load_or_generate_keypair, local_capability_advertisement, local_node_activity_snapshot,
     model_serving_telemetry, persistent_infernet_worker_is_resident,
     run_model_distribution_node_with_readiness_and_registry, seed_manifest_for_network,
-    set_local_inference_active, set_local_llama_rpc_endpoint, set_local_rpc_active, sha256_file,
-    spawn_llama_rpc_server, stop_persistent_llama_server, stop_persistent_rpc_tunnels,
-    vram_contribution_limit_bytes,
+    set_local_inference_active, set_local_llama_rpc_endpoint, set_local_model_components,
+    set_local_rpc_active, sha256_file, spawn_llama_rpc_server, stop_persistent_llama_server,
+    stop_persistent_rpc_tunnels, vram_contribution_limit_bytes,
 };
 use infernet_protocol::{
     LLAMA_RPC_TUNNEL_PROTOCOL, LlamaRpcEndpoint, ModelShardInfo, NodeAdvertisement,
@@ -51,6 +58,7 @@ use libp2p::{Multiaddr, PeerId, identity, multiaddr::Protocol};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::io::AsyncWriteExt;
+use tokio::time::{Instant, sleep};
 
 use peer_presence::{ConnectionStatus, PeerPresence, PresenceRecord, PresenceSnapshot};
 
@@ -106,6 +114,7 @@ struct UiState {
     manual_peers: Mutex<Vec<NodeAdvertisement>>,
     peer_presence: Mutex<PeerPresence>,
     execution_plan: Mutex<Option<execution_plan::WorkerExecutionPlan>>,
+    image_operation: Arc<Mutex<bool>>,
 }
 
 impl Default for UiState {
@@ -125,6 +134,7 @@ impl Default for UiState {
             manual_peers: Mutex::new(Vec::new()),
             peer_presence: Mutex::new(PeerPresence::default()),
             execution_plan: Mutex::new(None),
+            image_operation: Arc::new(Mutex::new(false)),
         }
     }
 }
@@ -295,6 +305,33 @@ struct RunDemoResponse {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct GenerateImageResponse {
+    image_data_url: String,
+    image_id: String,
+    prompt: String,
+    seed: i64,
+    width: u32,
+    height: u32,
+    steps: u32,
+    duration_ms: u64,
+    release_id: String,
+    placement: String,
+}
+
+struct ImageOperationGuard {
+    busy: Arc<Mutex<bool>>,
+}
+
+impl Drop for ImageOperationGuard {
+    fn drop(&mut self) {
+        if let Ok(mut busy) = self.busy.lock() {
+            *busy = false;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ModelImportProgress {
     model_id: String,
     stage: String,
@@ -445,6 +482,275 @@ async fn get_grid_snapshot(
         model_id.as_deref(),
     )
     .await
+}
+
+#[tauri::command]
+fn get_image_runtime_status(
+    app: AppHandle,
+    state: State<'_, UiState>,
+) -> Result<image_runtime::ImageRuntimeStatus, String> {
+    let cache_config = cache_config_for_app(&app);
+    sync_local_image_components(&cache_config);
+    let mut status = image_runtime::image_runtime_status(&cache_config);
+    status.busy = image_operation_is_busy(&state)?;
+    Ok(status)
+}
+
+#[tauri::command]
+async fn install_official_image(
+    app: AppHandle,
+    state: State<'_, UiState>,
+) -> Result<image_runtime::ImageRuntimeStatus, String> {
+    let _operation = begin_image_operation(&state)?;
+    let cache_config = cache_config_for_app(&app);
+    let progress_app = app.clone();
+    let result = image_runtime::install_official_package(&cache_config, move |progress| {
+        emit_model_import_progress(
+            &progress_app,
+            image_runtime::IMAGE_MODEL_ID,
+            progress.stage,
+            progress.detail,
+            progress.downloaded_bytes,
+            Some(progress.total_bytes),
+        );
+    })
+    .await;
+
+    match result {
+        Ok(mut status) => {
+            sync_local_image_components(&cache_config);
+            status.busy = false;
+            Ok(status)
+        }
+        Err(error) => {
+            sync_local_image_components(&cache_config);
+            emit_model_import_progress(
+                &app,
+                image_runtime::IMAGE_MODEL_ID,
+                "Image package download failed",
+                error.to_string(),
+                image_runtime::image_runtime_status(&cache_config).downloaded_bytes,
+                Some(image_runtime::IMAGE_TOTAL_BYTES),
+            );
+            Err(error.to_string())
+        }
+    }
+}
+
+#[tauri::command]
+async fn generate_image(
+    app: AppHandle,
+    state: State<'_, UiState>,
+    prompt: String,
+    seed: Option<i64>,
+) -> Result<GenerateImageResponse, String> {
+    let prompt = prompt.trim().to_owned();
+    if prompt.is_empty() {
+        return Err("Describe an image before generating.".to_owned());
+    }
+    if prompt.chars().count() > 4_000 {
+        return Err("Image prompts must be 4,000 characters or fewer.".to_owned());
+    }
+    let _operation = begin_image_operation(&state)?;
+    let cache_config = cache_config_for_app(&app);
+    ensure_model_distribution_service(&state, cache_config.clone()).await?;
+    let package_paths = image_runtime::ensure_verified_package(&cache_config)
+        .await
+        .map_err(|error| error.to_string())?;
+    sync_local_image_components(&cache_config);
+    let binary = find_sd_cli_binary().ok_or_else(|| {
+        "The Infernet Image runtime is not prepared for this platform.".to_owned()
+    })?;
+    let local_capabilities = detect_node_capabilities();
+    let origin_machine_id = local_capabilities
+        .machine_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|machine_id| !machine_id.is_empty())
+        .ok_or_else(|| "Infernet could not verify this computer's identity.".to_owned())?;
+    let placement = discover_image_placement(
+        &app,
+        &state,
+        &cache_config,
+        origin_machine_id,
+        Duration::from_millis(DEFAULT_DISCOVERY_TIMEOUT_MS),
+    )
+    .await?;
+    let StableDiffusionPlacement::RequesterLocal = placement else {
+        let machine_count = match placement {
+            StableDiffusionPlacement::Distributed { machine_count } => machine_count,
+            StableDiffusionPlacement::RequesterLocal => unreachable!(),
+        };
+        return Err(format!(
+            "{machine_count} eligible physical machines are online, so Infernet requires this image request to be split. The distributed image stage runtime is not connected yet; no single machine received the request."
+        ));
+    };
+
+    let backend = match local_capabilities.compute_backend.as_str() {
+        "metal" => "metal",
+        "cuda" => "cuda0",
+        _ => {
+            return Err(
+                "Infernet Image currently requires a Metal or CUDA accelerator.".to_owned(),
+            );
+        }
+    };
+    let image_trace_id = uuid::Uuid::new_v4();
+    let image_id = image_trace_id.to_string();
+    let seed = seed.unwrap_or_else(|| (current_unix_ms_u64() & i64::MAX as u64) as i64);
+    let config = StableDiffusionConfig {
+        binary,
+        diffusion_model_path: package_paths.diffusion_model,
+        text_encoder_path: package_paths.text_encoder,
+        vae_path: package_paths.vae,
+        output_dir: app_data_dir(&app).join("generated-images"),
+        log_dir: app_data_dir(&app).join("runtime-logs").join("image"),
+        backend: backend.to_owned(),
+        params_backend: Some("*=cpu".to_owned()),
+        rpc_servers: Vec::new(),
+        placement: StableDiffusionPlacement::RequesterLocal,
+        timeout: Duration::from_secs(10 * 60),
+    };
+    let request = ImageGenerationRequest {
+        job_id: image_id.clone(),
+        prompt: prompt.clone(),
+        seed,
+        width: 1024,
+        height: 1024,
+        steps: 8,
+    };
+
+    let activity =
+        begin_local_node_activity(image_trace_id, LocalNodeActivityKind::ImageGeneration);
+    set_local_inference_active(true);
+    let generation = tokio::task::spawn_blocking(move || generate_with_sd_cli(&config, &request))
+        .await
+        .map_err(|error| format!("Infernet Image runtime task failed: {error}"));
+    set_local_inference_active(false);
+    let output = generation?.map_err(|error| error.to_string())?;
+    let image_bytes = tokio::fs::read(&output.png_path)
+        .await
+        .map_err(|error| format!("failed to read generated image: {error}"))?;
+    activity.complete(LocalNodeActivityOutcome::Success);
+
+    Ok(GenerateImageResponse {
+        image_data_url: format!(
+            "data:image/png;base64,{}",
+            BASE64_STANDARD.encode(image_bytes)
+        ),
+        image_id,
+        prompt,
+        seed: output.seed,
+        width: output.width,
+        height: output.height,
+        steps: output.steps,
+        duration_ms: output.duration_ms,
+        release_id: image_runtime::IMAGE_RELEASE_ID.to_owned(),
+        placement: "requester-local sole eligible machine".to_owned(),
+    })
+}
+
+fn begin_image_operation(state: &State<'_, UiState>) -> Result<ImageOperationGuard, String> {
+    let busy = Arc::clone(&state.image_operation);
+    {
+        let mut active = busy
+            .lock()
+            .map_err(|_| "failed to lock Infernet Image operation state".to_owned())?;
+        if *active {
+            return Err("Infernet Image is already installing or generating.".to_owned());
+        }
+        *active = true;
+    }
+    Ok(ImageOperationGuard { busy })
+}
+
+fn image_operation_is_busy(state: &State<'_, UiState>) -> Result<bool, String> {
+    state
+        .image_operation
+        .lock()
+        .map(|busy| *busy)
+        .map_err(|_| "failed to lock Infernet Image operation state".to_owned())
+}
+
+fn eligible_image_machine_ids(
+    advertisements: &[NodeAdvertisement],
+    local_peer_id: &str,
+) -> BTreeSet<String> {
+    let expected_components = image_runtime::component_infos();
+    advertisements
+        .iter()
+        .filter_map(|advertisement| {
+            let capabilities = advertisement.capabilities.as_ref()?;
+            if !matches!(capabilities.compute_backend.as_str(), "cuda" | "metal")
+                || capabilities.active_sessions >= capabilities.max_sessions
+                || capabilities.available_accelerator_memory_bytes == 0
+                || (advertisement.peer_id != local_peer_id
+                    && (advertisement.addresses.is_empty()
+                        || capabilities.vram_contribution_limit_bytes == Some(0)))
+                || !expected_components.iter().all(|expected| {
+                    advertisement
+                        .model_components
+                        .iter()
+                        .any(|actual| actual == expected)
+                })
+            {
+                return None;
+            }
+            capabilities
+                .machine_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|machine_id| !machine_id.is_empty())
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+fn plan_image_placement(
+    eligible_machine_ids: &BTreeSet<String>,
+    origin_machine_id: &str,
+) -> Result<StableDiffusionPlacement, String> {
+    match eligible_machine_ids.len() {
+        0 => Err("No eligible computer has the verified Infernet Image package.".to_owned()),
+        1 if eligible_machine_ids.contains(origin_machine_id) => {
+            Ok(StableDiffusionPlacement::RequesterLocal)
+        }
+        1 => Err(
+            "Infernet will not assign an entire image request to one remote computer; waiting for another eligible computer."
+                .to_owned(),
+        ),
+        machine_count => Ok(StableDiffusionPlacement::Distributed { machine_count }),
+    }
+}
+
+async fn discover_image_placement(
+    app: &AppHandle,
+    state: &State<'_, UiState>,
+    cache_config: &ShardCacheConfig,
+    origin_machine_id: &str,
+    timeout: Duration,
+) -> Result<StableDiffusionPlacement, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let (registry, local_peer_id, _, _) =
+            discover_registry(app, state, cache_config, 0).await?;
+        let eligible_machines =
+            eligible_image_machine_ids(&registry.advertisements(), &local_peer_id);
+        let planned = plan_image_placement(&eligible_machines, origin_machine_id);
+
+        match &planned {
+            Ok(StableDiffusionPlacement::Distributed { .. }) => return planned,
+            Ok(StableDiffusionPlacement::RequesterLocal) if Instant::now() >= deadline => {
+                return planned;
+            }
+            Err(_) if Instant::now() >= deadline => return planned,
+            _ => sleep(Duration::from_millis(100)).await,
+        }
+    }
+}
+
+fn sync_local_image_components(cache_config: &ShardCacheConfig) {
+    set_local_model_components(image_runtime::advertised_components(cache_config));
 }
 
 #[tauri::command]
@@ -655,6 +961,7 @@ fn leased_worker_execution_plan(
     registry: &ShardRegistry,
     manifest: &ModelManifest,
 ) -> Result<execution_plan::WorkerExecutionPlan, String> {
+    let origin_peer_id = identity_from_state(state)?.0;
     let mut lease = state
         .execution_plan
         .lock()
@@ -664,7 +971,7 @@ fn leased_worker_execution_plan(
             return Ok(plan.clone());
         }
     }
-    let plan = plan_worker_execution(registry, manifest)?;
+    let plan = plan_worker_execution(registry, manifest, &origin_peer_id)?;
     *lease = Some(plan.clone());
     Ok(plan)
 }
@@ -1596,12 +1903,14 @@ fn snapshot_from_registry(
     };
     let machines = machine_views_from_presence(presence.records(), &local_peer_id);
     let network_peer_count = connected_remote_machine_count(&machines);
+    let available_models =
+        available_model_views(cache_config, Some(registry), Some(&local_peer_id));
 
     GridSnapshot {
         local_peer_id,
         topic,
         selected_model: manifest.model_id.clone(),
-        available_models: available_model_views(cache_config, Some(registry)),
+        available_models,
         layer_count: manifest.layer_count,
         network_peer_count,
         peers: advertisements
@@ -1628,11 +1937,13 @@ fn empty_snapshot(
     let advertisements = ui_visible_advertisements(all_advertisements.clone(), None);
     let machines = machine_views_from_presence(presence.records(), &local_peer_id);
     let network_peer_count = connected_remote_machine_count(&machines);
+    let available_models =
+        available_model_views(cache_config, Some(registry), Some(&local_peer_id));
     GridSnapshot {
         local_peer_id,
         topic,
         selected_model: String::new(),
-        available_models: available_model_views(cache_config, Some(registry)),
+        available_models,
         layer_count: 0,
         network_peer_count,
         peers: advertisements
@@ -1673,11 +1984,16 @@ fn model_view_from_manifest(
 fn available_model_views(
     cache_config: &ShardCacheConfig,
     registry: Option<&ShardRegistry>,
+    origin_peer_id: Option<&str>,
 ) -> Vec<ModelView> {
     let installed_ids = installed_model_ids(cache_config);
     let manifest = ModelManifest::infernet_chat_v1();
     let network_runnable =
-        registry.is_some_and(|registry| plan_worker_execution(registry, &manifest).is_ok());
+        registry
+            .zip(origin_peer_id)
+            .is_some_and(|(registry, origin_peer_id)| {
+                plan_worker_execution(registry, &manifest, origin_peer_id).is_ok()
+            });
     vec![model_view_from_manifest(
         &manifest,
         installed_ids.contains(&manifest.model_id),
@@ -2434,10 +2750,12 @@ fn local_cache_advertisement(
         capabilities: None,
         hosted_shards,
         model_shards,
+        model_components: Vec::new(),
     })
 }
 
 fn local_node_advertisement(cache_config: &ShardCacheConfig, peer_id: String) -> NodeAdvertisement {
+    sync_local_image_components(cache_config);
     let advertisement = local_cache_advertisement(cache_config, peer_id.clone())
         .unwrap_or_else(|| empty_advertisement(peer_id, String::new()));
     enrich_local_advertisement(advertisement)
@@ -3126,6 +3444,27 @@ fn merge_peer_advertisement(existing: &mut NodeAdvertisement, peer: &NodeAdverti
             existing.model_shards.push(shard.clone());
         }
     }
+    for component in &peer.model_components {
+        if !existing
+            .model_components
+            .iter()
+            .any(|existing| existing == component)
+        {
+            existing.model_components.push(component.clone());
+        }
+    }
+    if peer.available_ram_bytes.is_some() {
+        existing.available_ram_bytes = peer.available_ram_bytes;
+    }
+    if peer.available_vram_bytes.is_some() {
+        existing.available_vram_bytes = peer.available_vram_bytes;
+    }
+    if peer.latency_hint_ms.is_some() {
+        existing.latency_hint_ms = peer.latency_hint_ms;
+    }
+    if peer.capabilities.is_some() {
+        existing.capabilities = peer.capabilities.clone();
+    }
 }
 
 fn default_bootstrap_peers() -> Result<Vec<NodeAdvertisement>, String> {
@@ -3464,6 +3803,9 @@ pub fn run() {
             append_chat_message,
             delete_chat_thread,
             get_grid_snapshot,
+            get_image_runtime_status,
+            install_official_image,
+            generate_image,
             install_official_model,
             run_demo_inference
         ])
@@ -3474,6 +3816,124 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use infernet_protocol::{ImageComponentRole, ModelComponentInfo};
+
+    fn eligible_image_advertisement(peer_id: &str, machine_id: &str) -> NodeAdvertisement {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let mut advertisement = local_capability_advertisement(
+            peer_id.to_owned(),
+            format!("/ip4/192.168.1.20/tcp/9777/p2p/{peer_id}"),
+        );
+        let capabilities = advertisement.capabilities.as_mut().unwrap();
+        capabilities.compute_backend = "metal".to_owned();
+        capabilities.machine_id = Some(machine_id.to_owned());
+        capabilities.total_accelerator_memory_bytes = 16 * GIB;
+        capabilities.available_accelerator_memory_bytes = 12 * GIB;
+        capabilities.max_sessions = 1;
+        capabilities.active_sessions = 0;
+        capabilities.vram_contribution_limit_bytes = None;
+        advertisement.available_vram_bytes = Some(12 * GIB);
+        advertisement.model_components = image_runtime::component_infos();
+        advertisement
+    }
+
+    #[test]
+    fn image_placement_allows_the_sole_requester_machine() {
+        let advertisements = vec![eligible_image_advertisement(
+            "requester-peer",
+            "requester-machine",
+        )];
+        let machines = eligible_image_machine_ids(&advertisements, "requester-peer");
+
+        assert_eq!(machines, BTreeSet::from(["requester-machine".to_owned()]));
+        assert_eq!(
+            plan_image_placement(&machines, "requester-machine").unwrap(),
+            StableDiffusionPlacement::RequesterLocal
+        );
+    }
+
+    #[test]
+    fn image_placement_rejects_a_sole_remote_machine() {
+        let advertisements = vec![eligible_image_advertisement(
+            "remote-peer",
+            "remote-machine",
+        )];
+        let machines = eligible_image_machine_ids(&advertisements, "requester-peer");
+
+        let error = plan_image_placement(&machines, "requester-machine").unwrap_err();
+        assert!(error.contains("one remote computer"));
+    }
+
+    #[test]
+    fn image_placement_requires_distribution_for_requester_and_remote() {
+        let advertisements = vec![
+            eligible_image_advertisement("requester-peer", "requester-machine"),
+            eligible_image_advertisement("remote-peer", "remote-machine"),
+        ];
+        let machines = eligible_image_machine_ids(&advertisements, "requester-peer");
+
+        assert_eq!(
+            plan_image_placement(&machines, "requester-machine").unwrap(),
+            StableDiffusionPlacement::Distributed { machine_count: 2 }
+        );
+    }
+
+    #[test]
+    fn image_placement_does_not_count_two_peers_on_one_remote_machine() {
+        let advertisements = vec![
+            eligible_image_advertisement("remote-peer-a", "shared-remote-machine"),
+            eligible_image_advertisement("remote-peer-b", "shared-remote-machine"),
+        ];
+        let machines = eligible_image_machine_ids(&advertisements, "requester-peer");
+
+        assert_eq!(
+            machines,
+            BTreeSet::from(["shared-remote-machine".to_owned()])
+        );
+        assert!(plan_image_placement(&machines, "requester-machine").is_err());
+    }
+
+    #[test]
+    fn discovered_advertisement_enriches_a_manual_peer_placeholder() {
+        let mut placeholder = empty_advertisement(
+            "manual-peer".to_owned(),
+            "/ip4/10.0.0.2/tcp/9777".to_owned(),
+        );
+        let mut discovered = local_capability_advertisement(
+            "manual-peer".to_owned(),
+            "/ip4/10.0.0.3/tcp/9777".to_owned(),
+        );
+        discovered.capabilities.as_mut().unwrap().machine_id = Some("machine-a".to_owned());
+        discovered.available_ram_bytes = Some(8);
+        discovered.available_vram_bytes = Some(4);
+        discovered.latency_hint_ms = Some(3);
+        let component = ModelComponentInfo {
+            release_id: "image-release".to_owned(),
+            model_id: "image-model".to_owned(),
+            component_id: "vae".to_owned(),
+            role: ImageComponentRole::Vae,
+            checksum: "checksum".to_owned(),
+            size_bytes: 42,
+            version: "1".to_owned(),
+            runtime_abi: "stable-diffusion.cpp-v1".to_owned(),
+        };
+        discovered.model_components.push(component.clone());
+
+        merge_peer_advertisement(&mut placeholder, &discovered);
+
+        assert_eq!(
+            placeholder
+                .capabilities
+                .as_ref()
+                .and_then(|capabilities| capabilities.machine_id.as_deref()),
+            Some("machine-a")
+        );
+        assert_eq!(placeholder.available_ram_bytes, Some(8));
+        assert_eq!(placeholder.available_vram_bytes, Some(4));
+        assert_eq!(placeholder.latency_hint_ms, Some(3));
+        assert_eq!(placeholder.model_components, vec![component]);
+        assert_eq!(placeholder.addresses.len(), 2);
+    }
 
     #[test]
     fn rpc_binding_rejects_public_loopback_and_wildcard_addresses() {
@@ -3516,7 +3976,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("infernet-ui-empty-{}", unix_ms()));
         let cache_config = ShardCacheConfig::new(root.clone());
 
-        let models = available_model_views(&cache_config, None);
+        let models = available_model_views(&cache_config, None, None);
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].model_id, OFFICIAL_CHAT_MODEL_ID);
         assert!(!models[0].installed);
@@ -3661,7 +4121,7 @@ mod tests {
         registry.upsert(orphan);
 
         assert_eq!(
-            available_model_views(&cache_config, Some(&registry)).len(),
+            available_model_views(&cache_config, Some(&registry), Some("local-peer")).len(),
             1
         );
         assert!(manifest_for_model(Some("gemma"), &cache_config, Some(&registry)).is_err());
@@ -3859,7 +4319,7 @@ mod tests {
 
         assert!(local_cache_advertisement(&cache_config, "local-peer".to_owned()).is_none());
         assert!(manifest_for_model(Some("gemma-4-12b-it-iq4-xs"), &cache_config, None).is_err());
-        let views = available_model_views(&cache_config, None);
+        let views = available_model_views(&cache_config, None, None);
         assert_eq!(views.len(), 1);
         assert_eq!(views[0].model_id, OFFICIAL_CHAT_MODEL_ID);
         assert!(!views[0].installed);
@@ -4000,7 +4460,7 @@ mod tests {
         assert_eq!(selected[0].info.layers, complete_layers);
         assert!(!is_executable_shard_record(&installed));
         assert!(
-            available_model_views(&cache_config, None)
+            available_model_views(&cache_config, None, None)
                 .into_iter()
                 .all(|model| model.model_id != "gemma"),
             "unsupported legacy partials must not appear runnable or advertised"

@@ -2,9 +2,9 @@ use infernet_model::{
     INFERNET_CHAT_KV_CACHE_BYTES_PER_LAYER, LayerRange, ModelManifest, OfficialModelRelease,
 };
 use infernet_protocol::{
-    MIN_INFERENCE_MACHINE_COUNT, NodeAdvertisement, NodeCapabilities, RouteHop,
+    MIN_DISTRIBUTED_MACHINE_COUNT, NodeAdvertisement, NodeCapabilities, RouteHop,
 };
-use infernet_router::ShardRegistry;
+use infernet_router::{ShardRegistry, execution_advertisement_is_eligible};
 use serde::Serialize;
 use std::collections::BTreeSet;
 
@@ -28,6 +28,7 @@ pub struct ExecutionParticipantView {
 pub struct WorkerExecutionPlan {
     pub route: Vec<RouteHop>,
     pub participants: Vec<ExecutionParticipantView>,
+    origin_machine_id: Option<String>,
     peer_bindings: Vec<String>,
     machine_bindings: Vec<String>,
 }
@@ -48,17 +49,19 @@ struct Candidate {
 pub fn plan_worker_execution(
     registry: &ShardRegistry,
     model: &ModelManifest,
+    origin_peer_id: &str,
 ) -> Result<WorkerExecutionPlan, String> {
     if model.layer_count == 0 {
         return Err("The selected model has no executable layers.".to_owned());
     }
-    let release = OfficialModelRelease::infernet_chat_v1_compatibility();
-    let bytes_per_layer = release
-        .expected_total_bytes
-        .div_ceil(u64::from(model.layer_count))
-        .saturating_add(INFERNET_CHAT_KV_CACHE_BYTES_PER_LAYER);
+    let bytes_per_layer = estimated_bytes_per_layer(model);
 
     let advertisements = registry.advertisements();
+    let origin_machine_id = advertisements
+        .iter()
+        .find(|advertisement| advertisement.peer_id == origin_peer_id)
+        .and_then(advertisement_machine_id)
+        .map(str::to_owned);
     let mut candidates = advertisements
         .iter()
         .filter(|advertisement| hosts_verified_full_model(advertisement, model))
@@ -73,10 +76,35 @@ pub fn plan_worker_execution(
 
     let mut machines = BTreeSet::new();
     candidates.retain(|candidate| machines.insert(candidate.machine_id.clone()));
-    candidates.truncate(MAX_PIPELINE_WORKERS.min(model.layer_count as usize));
-    if candidates.len() < MIN_INFERENCE_MACHINE_COUNT {
+    let eligible_machine_count = candidates.len();
+    let candidate_limit = MAX_PIPELINE_WORKERS.min(model.layer_count as usize);
+    if eligible_machine_count >= MIN_DISTRIBUTED_MACHINE_COUNT
+        && candidate_limit < MIN_DISTRIBUTED_MACHINE_COUNT
+    {
         return Err(
-            "Infernet requires at least two different computers with the verified model before inference can begin."
+            "The selected model cannot be divided across the available computers.".to_owned(),
+        );
+    }
+    if candidates.len() > candidate_limit {
+        let requester_index = origin_machine_id.as_ref().and_then(|origin_machine_id| {
+            candidates
+                .iter()
+                .position(|candidate| candidate.machine_id == *origin_machine_id)
+        });
+        if let Some(requester_index) = requester_index.filter(|index| *index >= candidate_limit) {
+            let requester = candidates.remove(requester_index);
+            candidates.truncate(candidate_limit - 1);
+            candidates.push(requester);
+        } else {
+            candidates.truncate(candidate_limit);
+        }
+    }
+    let requester_only = eligible_machine_count == 1
+        && candidates.len() == 1
+        && origin_machine_id.as_ref() == Some(&candidates[0].machine_id);
+    if candidates.len() < MIN_DISTRIBUTED_MACHINE_COUNT && !requester_only {
+        return Err(
+            "Infernet will not assign an entire request to one remote computer. Waiting for another computer to join."
                 .to_owned(),
         );
     }
@@ -136,6 +164,7 @@ pub fn plan_worker_execution(
         let layer_end = layer_start + candidate.assigned_layers;
         route.push(RouteHop {
             peer_id: candidate.peer_id.clone(),
+            machine_id: candidate.machine_id.clone(),
             address: candidate.address.clone(),
             layers: LayerRange {
                 start: layer_start,
@@ -172,6 +201,7 @@ pub fn plan_worker_execution(
     }
 
     Ok(WorkerExecutionPlan {
+        origin_machine_id,
         peer_bindings: route.iter().map(|hop| hop.peer_id.clone()).collect(),
         machine_bindings: candidates
             .iter()
@@ -184,35 +214,87 @@ pub fn plan_worker_execution(
 
 impl WorkerExecutionPlan {
     pub fn remains_usable(&self, registry: &ShardRegistry, model: &ModelManifest) -> bool {
-        if self
-            .machine_bindings
+        let advertisements = registry.advertisements();
+        let bytes_per_layer = estimated_bytes_per_layer(model);
+        let eligible_machine_ids = advertisements
             .iter()
-            .collect::<BTreeSet<_>>()
-            .len()
-            < MIN_INFERENCE_MACHINE_COUNT
+            .filter(|advertisement| hosts_verified_full_model(advertisement, model))
+            .filter_map(|advertisement| candidate(advertisement, model, bytes_per_layer))
+            .map(|candidate| candidate.machine_id)
+            .collect::<BTreeSet<_>>();
+        let machine_count = self.machine_bindings.iter().collect::<BTreeSet<_>>().len();
+        let requester_only =
+            machine_count == 1 && self.machine_bindings.first() == self.origin_machine_id.as_ref();
+        if eligible_machine_ids.len() >= MIN_DISTRIBUTED_MACHINE_COUNT {
+            if machine_count < MIN_DISTRIBUTED_MACHINE_COUNT {
+                return false;
+            }
+            if self.origin_machine_id.as_ref().is_some_and(|origin| {
+                eligible_machine_ids.contains(origin) && !self.machine_bindings.contains(origin)
+            }) {
+                return false;
+            }
+        } else if eligible_machine_ids.len() != 1
+            || !requester_only
+            || self
+                .origin_machine_id
+                .as_ref()
+                .is_none_or(|origin| !eligible_machine_ids.contains(origin))
         {
             return false;
         }
-        let advertisements = registry.advertisements();
-        self.peer_bindings
+
+        if self.route.len() != self.peer_bindings.len()
+            || self.route.len() != self.machine_bindings.len()
+            || !self
+                .machine_bindings
+                .iter()
+                .all(|machine_id| eligible_machine_ids.contains(machine_id))
+        {
+            return false;
+        }
+
+        self.route
             .iter()
+            .zip(&self.peer_bindings)
             .zip(&self.machine_bindings)
-            .all(|(peer_id, machine_id)| {
-            advertisements.iter().any(|advertisement| {
-                advertisement.peer_id == *peer_id
-                    && advertisement
-                        .capabilities
-                        .as_ref()
-                        .and_then(|capabilities| capabilities.machine_id.as_ref())
-                        == Some(machine_id)
-                    && hosts_verified_full_model(advertisement, model)
-                    && advertisement
-                        .capabilities
-                        .as_ref()
-                        .is_some_and(worker_is_available)
+            .all(|((hop, peer_id), machine_id)| {
+                advertisements.iter().any(|advertisement| {
+                    advertisement.peer_id == *peer_id
+                        && hop.peer_id == *peer_id
+                        && hop.machine_id == *machine_id
+                        && advertisement
+                            .capabilities
+                            .as_ref()
+                            .and_then(|capabilities| capabilities.machine_id.as_ref())
+                            == Some(machine_id)
+                        && hosts_verified_full_model(advertisement, model)
+                        && candidate(advertisement, model, bytes_per_layer).is_some_and(
+                            |candidate| {
+                                candidate.machine_id == *machine_id
+                                    && candidate.layer_capacity >= hop.layers.len()
+                            },
+                        )
+                })
             })
-        })
     }
+}
+
+fn estimated_bytes_per_layer(model: &ModelManifest) -> u64 {
+    OfficialModelRelease::infernet_chat_v1_compatibility()
+        .expected_total_bytes
+        .div_ceil(u64::from(model.layer_count))
+        .saturating_add(INFERNET_CHAT_KV_CACHE_BYTES_PER_LAYER)
+}
+
+fn advertisement_machine_id(advertisement: &NodeAdvertisement) -> Option<&str> {
+    advertisement
+        .capabilities
+        .as_ref()?
+        .machine_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|machine_id| !machine_id.is_empty())
 }
 
 fn candidate(
@@ -221,22 +303,23 @@ fn candidate(
     bytes_per_layer: u64,
 ) -> Option<Candidate> {
     let capabilities = advertisement.capabilities.as_ref()?;
-    if !worker_is_available(capabilities) {
+    if !execution_advertisement_is_eligible(model, advertisement)
+        || !worker_is_available(capabilities)
+    {
         return None;
     }
-    let machine_id = capabilities
-        .machine_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|machine_id| !machine_id.is_empty())?
-        .to_owned();
+    let machine_id = advertisement_machine_id(advertisement)?.to_owned();
     let address = preferred_address(advertisement)?;
     let available_memory_bytes = capabilities.available_accelerator_memory_bytes;
     let usable_memory_bytes = safe_model_memory(available_memory_bytes);
     let resident_layer_capacity = advertisement
         .hosted_shards
         .iter()
-        .filter(|shard| shard.model_id == model.model_id && shard.resident)
+        .filter(|shard| {
+            shard.model_id == model.model_id
+                && shard.runtime_kind == model.runtime_kind
+                && shard.resident
+        })
         .map(|shard| shard.layers.len())
         .max()
         .unwrap_or(0);
@@ -280,6 +363,7 @@ pub fn worker_is_usable(capabilities: &NodeCapabilities) -> bool {
 fn hosts_verified_full_model(advertisement: &NodeAdvertisement, model: &ModelManifest) -> bool {
     advertisement.hosted_shards.iter().any(|shard| {
         shard.model_id == model.model_id
+            && shard.runtime_kind == model.runtime_kind
             && shard.layers.start == 0
             && shard.layers.end == model.layer_count
             && shard
@@ -332,7 +416,7 @@ mod tests {
         registry.upsert(advertisement("worker-4060", 8, &model));
         registry.upsert(advertisement("worker-mac", 16, &model));
 
-        let plan = plan_worker_execution(&registry, &model).unwrap();
+        let plan = plan_worker_execution(&registry, &model, "worker-3090").unwrap();
         assert_eq!(plan.route.len(), 3);
         assert_eq!(plan.route.first().unwrap().layers.start, 0);
         assert_eq!(plan.route.last().unwrap().layers.end, model.layer_count);
@@ -353,18 +437,91 @@ mod tests {
         let mut peer = advertisement("worker", 24, &model);
         peer.hosted_shards.clear();
         registry.upsert(peer);
-        assert!(plan_worker_execution(&registry, &model).is_err());
+        assert!(plan_worker_execution(&registry, &model, "worker").is_err());
     }
 
     #[test]
-    fn rejects_one_resident_machine_even_when_it_can_hold_every_layer() {
+    fn allows_the_requesters_own_machine_when_it_is_the_only_candidate() {
         let model = ModelManifest::infernet_chat_v1();
         let mut registry = ShardRegistry::new();
         let mut peer = advertisement("resident-worker", 1, &model);
         peer.hosted_shards[0].resident = true;
         registry.upsert(peer);
 
-        assert!(plan_worker_execution(&registry, &model).is_err());
+        let plan = plan_worker_execution(&registry, &model, "resident-worker").unwrap();
+        assert_eq!(plan.route.len(), 1);
+        assert_eq!(plan.route[0].peer_id, "resident-worker");
+    }
+
+    #[test]
+    fn requester_machine_identity_allows_a_separate_local_worker_process() {
+        let model = ModelManifest::infernet_chat_v1();
+        let mut registry = ShardRegistry::new();
+        let mut requester = advertisement("requester-app", 1, &model);
+        requester.hosted_shards.clear();
+        requester.capabilities.as_mut().unwrap().machine_id = Some("local-machine".to_owned());
+        let mut worker = advertisement("local-worker", 24, &model);
+        worker.capabilities.as_mut().unwrap().machine_id = Some("local-machine".to_owned());
+        registry.upsert(requester);
+        registry.upsert(worker);
+
+        let plan = plan_worker_execution(&registry, &model, "requester-app").unwrap();
+        assert_eq!(plan.route.len(), 1);
+        assert_eq!(plan.route[0].peer_id, "local-worker");
+    }
+
+    #[test]
+    fn local_only_lease_expires_when_another_machine_becomes_eligible() {
+        let model = ModelManifest::infernet_chat_v1();
+        let mut registry = ShardRegistry::new();
+        registry.upsert(advertisement("requester", 24, &model));
+
+        let plan = plan_worker_execution(&registry, &model, "requester").unwrap();
+        assert!(plan.remains_usable(&registry, &model));
+
+        registry.upsert(advertisement("remote-worker", 8, &model));
+        assert!(!plan.remains_usable(&registry, &model));
+
+        let replacement = plan_worker_execution(&registry, &model, "requester").unwrap();
+        assert_eq!(replacement.route.len(), 2);
+    }
+
+    #[test]
+    fn lease_expires_when_a_worker_can_no_longer_hold_its_assigned_layers() {
+        let model = ModelManifest::infernet_chat_v1();
+        let mut registry = ShardRegistry::new();
+        registry.upsert(advertisement("requester", 24, &model));
+        registry.upsert(advertisement("remote-worker", 24, &model));
+
+        let plan = plan_worker_execution(&registry, &model, "requester").unwrap();
+        let remote_layers = plan
+            .route
+            .iter()
+            .find(|hop| hop.peer_id == "remote-worker")
+            .expect("remote worker participates")
+            .layers
+            .len();
+        assert!(remote_layers > 1);
+        assert!(plan.remains_usable(&registry, &model));
+
+        let mut constrained = advertisement("remote-worker", 24, &model);
+        constrained
+            .capabilities
+            .as_mut()
+            .unwrap()
+            .vram_contribution_limit_bytes = Some(3 * 1024 * 1024 * 1024);
+        registry.upsert(constrained);
+
+        assert!(!plan.remains_usable(&registry, &model));
+    }
+
+    #[test]
+    fn rejects_one_remote_machine_even_when_it_can_hold_every_layer() {
+        let model = ModelManifest::infernet_chat_v1();
+        let mut registry = ShardRegistry::new();
+        registry.upsert(advertisement("remote-worker", 24, &model));
+
+        assert!(plan_worker_execution(&registry, &model, "requester").is_err());
     }
 
     #[test]
@@ -378,7 +535,7 @@ mod tests {
         registry.upsert(first);
         registry.upsert(second);
 
-        assert!(plan_worker_execution(&registry, &model).is_err());
+        assert!(plan_worker_execution(&registry, &model, "requester").is_err());
     }
 
     #[test]
@@ -393,7 +550,7 @@ mod tests {
             .vram_contribution_limit_bytes = Some(4 * 1024 * 1024 * 1024);
         registry.upsert(peer);
 
-        assert!(plan_worker_execution(&registry, &model).is_err());
+        assert!(plan_worker_execution(&registry, &model, "limited-resident-worker").is_err());
     }
 
     fn advertisement(peer_id: &str, memory_gib: u64, model: &ModelManifest) -> NodeAdvertisement {
@@ -439,6 +596,7 @@ mod tests {
                 seed_manifest: None,
             }],
             model_shards: Vec::new(),
+            model_components: Vec::new(),
         }
     }
 }

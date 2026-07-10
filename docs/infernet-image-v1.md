@@ -1,12 +1,15 @@
 # Infernet Image v1
 
-Status: proposed runtime and package contract. The Chat/Image workspace switcher and Image shell are implemented; image inference is not connected yet.
+Status: requester-local first slice implemented. The pinned package installer,
+runtime status, generation command, and Image workspace are connected. The
+multi-machine stage runtime remains gated; requests refuse instead of falling
+back to one machine whenever two or more eligible physical machines are online.
 
 ## Product decision
 
 - The user-facing edition is **Infernet Image**.
 - Its upstream model is **Z-Image Turbo**.
-- The first official diffusion-transformer artifact should be `z-image-turbo-Q4_K_M.gguf`.
+- The first official diffusion-transformer artifact is `z-image-turbo-Q4_K_M.gguf`.
 - Users do not select quantizations, import GGUF files, or configure component paths.
 - Infernet publishes and verifies one signed logical image release made from three separately checksummed components.
 
@@ -30,21 +33,25 @@ Q2 and Q3 variants should not be the only official edition. They can be evaluate
 
 The linked 5.02 GB GGUF contains only the diffusion transformer. A working Z-Image pipeline also needs a text encoder and VAE.
 
-| Role | Candidate artifact | Approximate size | Candidate SHA-256 |
+| Role | Pinned artifact | Exact bytes | Pinned SHA-256 |
 | --- | --- | ---: | --- |
-| Diffusion transformer | [`z-image-turbo-Q4_K_M.gguf`](https://huggingface.co/unsloth/Z-Image-Turbo-GGUF/blob/main/z-image-turbo-Q4_K_M.gguf) | 5.02 GB | `e6494f87de6abaf6a561924f50317a5f271fc34bb4222aabbd801197df8f7daa` |
-| Text encoder | [`Qwen3-4B-Instruct-2507-Q4_K_M.gguf`](https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/blob/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf) | 2.50 GB | `3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597` |
-| VAE | [`ae.safetensors`](https://huggingface.co/Comfy-Org/z_image_turbo/blob/main/split_files/vae/ae.safetensors) | 335 MB | `afc8e28272cd15db3919bacdb6918ce9c1ed22e96cb12c4d5ed0fba823529e38` |
+| Diffusion transformer | [`z-image-turbo-Q4_K_M.gguf`](https://huggingface.co/unsloth/Z-Image-Turbo-GGUF/blob/main/z-image-turbo-Q4_K_M.gguf) | 5,017,613,376 | `e6494f87de6abaf6a561924f50317a5f271fc34bb4222aabbd801197df8f7daa` |
+| Text encoder | [`Qwen3-4B-Instruct-2507-Q4_K_M.gguf`](https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/blob/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf) | 2,497,281,120 | `3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597` |
+| VAE | [`ae.safetensors`](https://huggingface.co/Comfy-Org/z_image_turbo/blob/main/split_files/vae/ae.safetensors) | 335,304,388 | `afc8e28272cd15db3919bacdb6918ce9c1ed22e96cb12c4d5ed0fba823529e38` |
 
-The candidate weight download is about 7.86 GB decimal, or 7.32 GiB, before manifests and notices. Release engineering must pin immutable upstream revisions, re-read exact byte sizes, verify every checksum, and ship the Apache-2.0 model notices.
+The pinned weight download is 7,850,198,884 bytes, or about 7.31 GiB, before
+manifests and notices. Every URL uses an immutable upstream revision. The
+installer supports range-resume, checks exact byte counts, verifies every
+SHA-256, and records a file-identity marker before the package can be advertised
+or used.
 
 ## Runtime boundary
 
 Z-Image is a diffusion pipeline, not a llama.cpp text model. The existing `Demo` and `LlamaCpp` runtime kinds and `infernet-llama-*` package ABIs must not accept it.
 
-Add a separate image runtime based on [`stable-diffusion.cpp`](https://github.com/leejet/stable-diffusion.cpp), which supports Z-Image, GGUF, CUDA, Metal, Vulkan, CPU, and the three required component inputs.
+The requester-local slice uses a separate runtime based on [`stable-diffusion.cpp`](https://github.com/leejet/stable-diffusion.cpp), pinned to commit `cc734292286f85f9c48305d94d7fd22f42838522`. It is not routed through the chat runtime.
 
-Proposed contract:
+Implemented local contract:
 
 - Runtime kind: `StableDiffusionCpp`
 - Package ABI: `infernet-sdcpp-image-v1`
@@ -58,11 +65,46 @@ Use Flash Attention where supported. On an 8 GiB accelerator, keep the Q4_K_M tr
 
 ## Network rollout
 
-1. Package and run the complete pipeline locally on one capable node.
-2. Persist finished images and metadata separately from chat messages.
-3. Let Infernet distribute the three signed components through the existing verified model-transfer layer.
-4. Route a generation request to one capable peer and return only the finished image plus metadata.
-5. Benchmark inter-peer DiT splitting separately before adding it to the runtime contract.
+Image inference follows the product-wide physical-machine placement invariant:
+
+- Whenever two or more eligible distinct physical machines exist, Infernet
+  always splits the pipeline across them. It never selects a sole-machine image
+  plan while another eligible physical machine is available.
+- A complete pipeline may run on one machine only when that machine is the
+  requester's own physical machine and it is the sole eligible option.
+- A sole eligible remote physical machine is not a valid plan. The request must
+  wait for another eligible machine or fail with an actionable availability
+  message.
+- When the requester and a remote physical machine are both eligible, both
+  participate in the split pipeline. Separate peer identities on one physical
+  machine do not satisfy this requirement.
+
+The first network topology is a stage split, not whole-pipeline remote
+execution:
+
+1. Package the text encoder, diffusion transformer, and VAE as independently
+   verified, role-scoped components of one signed release.
+2. Add role-scoped runtime operations for prompt encoding, denoising, and VAE
+   decoding. Do not expose a remote end-to-end generation operation that can
+   bypass placement.
+3. For two eligible physical machines, place the text encoder and VAE on one
+   machine and the complete eight-step DiT denoising loop on the other. Transfer
+   prompt embeddings once to the DiT machine and the final latent once to the
+   VAE machine.
+4. For three or more eligible physical machines, place the three stages across
+   the eligible topology and split contiguous DiT block ranges when needed to
+   include additional capacity-safe participants. Keep one sticky plan for all
+   eight denoising steps.
+5. Persist finished images and metadata separately from chat messages, and let
+   Infernet distribute each signed component through the existing verified
+   model-transfer layer.
+6. If a participant disappears, cancel or acquire a new valid split plan. Never
+   collapse the active request onto one remote machine. A new sole-machine plan
+   is valid only if the requester is then the sole eligible machine.
+
+Stage placement is the initial production boundary. Inter-peer DiT block
+splitting remains gated on correctness and network benchmarks because its
+activation boundary repeats during all eight denoising steps.
 
 Do not reuse stable-diffusion.cpp RPC as the network design. Its client-driven tensor and graph transfer is different from Infernet's worker-cached, signed package model.
 
@@ -72,4 +114,11 @@ Do not reuse stable-diffusion.cpp RPC as the network design. Its client-driven t
 - Compare Q4_K_M against Q5_K_M for prompt adherence, text rendering, faces, hands, and fine texture.
 - Measure cold load, warm generation, peak accelerator memory, peak system memory, and PNG transfer time.
 - Verify cancel, timeout, out-of-memory, corrupt-package, and disconnected-peer behavior.
+- Verify that one eligible requester can run locally, one eligible remote
+  machine is rejected, requester-plus-remote execution is split, multiple peers
+  on one machine do not count as multiple machines, and no failure path
+  collapses onto a sole remote machine.
+- Compare the stage-split output against the pinned monolithic reference for the
+  same prompt, seed, dimensions, and preset before enabling multi-machine image
+  generation.
 - Keep GGUF names, quantization terms, component paths, and runtime flags out of the everyday UI.

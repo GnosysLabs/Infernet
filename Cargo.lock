@@ -2355,6 +2355,7 @@ dependencies = [
  "libp2p",
  "libp2p-stream",
  "libp2p-swarm-test",
+ "png 0.18.1",
  "serde",
  "serde_json",
  "sha2",
@@ -2396,6 +2397,7 @@ name = "infernet-ui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "fs2",
  "futures",
  "if-addrs",

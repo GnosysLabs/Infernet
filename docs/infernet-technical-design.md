@@ -4,10 +4,13 @@ Date: 2026-07-08
 
 ## Goal
 
-Infernet is a peer-to-peer split-inference system for running models that no
-single participating machine can hold alone. A model is divided into layer
+Infernet is a peer-to-peer split-inference system. A model is divided into layer
 ranges. Each peer owns one or more ranges, executes only those layers, and
-forwards activation tensors to the next peer in the route.
+forwards activation tensors to the next peer in the route. Whenever at least two
+distinct eligible physical machines are available, the scheduler must split the
+request across at least two of them. Local-only execution is valid only when the
+requesting machine is itself the sole eligible machine; another user's entire
+request is never routed to one remote machine.
 
 The first implementation must prove the core claim with a tiny transformer-like
 model split across four independent nodes. Performance, economics, and
@@ -300,7 +303,7 @@ Sources:
 3. Router queries local discovery or DHT provider records for peers hosting each
    required layer range.
 4. Router constructs a route that covers `[0, layer_count)` exactly once with
-   contiguous ranges.
+   contiguous ranges and obeys the physical-machine distribution rule.
 5. Client tokenizes prompt and creates the first activation request.
 6. Peer 0 executes its local layer range.
 7. Peer 0 forwards the resulting activation request to peer 1 over
@@ -313,7 +316,7 @@ Sources:
 For generation, route stickiness is required. Each peer owning layers with
 attention stores the KV cache for those layers and that invocation. If a peer
 fails mid-session, the first fallback should recompute the session on a new
-route. KV transfer can come later.
+route that still obeys the same distribution rule. KV transfer can come later.
 
 ### First Demo Runtime
 
@@ -332,6 +335,10 @@ protocol invariants:
 - no process owns all 12 layers;
 - every process rejects requests outside its assigned layer range;
 - route must cover every layer once, in order;
+- duplicate peer identities on one host count as one physical machine;
+- two or more eligible physical machines must produce a split route;
+- local-only execution is allowed only for the sole eligible requester, never a
+  sole remote machine serving another user's whole request;
 - activation frames are forwarded between processes;
 - final trace proves all four nodes participated.
 
@@ -341,8 +348,14 @@ Phase 1 route construction:
 
 - Input: model manifest and a list of node advertisements.
 - Filter advertisements by `model_id`, runtime compatibility, and expiry.
+- Group duplicate peer identities by physical machine.
 - Build interval coverage from `0..layer_count`.
-- Prefer fewer hops and lower advertised latency.
+- Require a split across at least two eligible physical machines whenever two or
+  more are available.
+- Permit a single-machine route only for the sole eligible requester; reject a
+  sole remote machine for another user's whole request.
+- Prefer fewer hops and lower advertised latency only after satisfying those
+  constraints.
 - Reject routes with gaps or overlaps.
 
 Future route construction:

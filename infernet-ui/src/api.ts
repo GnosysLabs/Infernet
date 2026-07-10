@@ -2,7 +2,9 @@ import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import type { ChatHistory, ChatMessage } from "./chatHistory";
 import type {
+  GenerateImageResponse,
   GridSnapshot,
+  ImageRuntimeStatus,
   LocalIdentity,
   LocalNodeActivitySnapshot,
   ModelImportProgress,
@@ -103,6 +105,25 @@ export async function getGridSnapshot(
 
 export async function runDistributedInference(prompt: string, modelId: string): Promise<RunDemoResponse> {
   return invoke<RunDemoResponse>("run_demo_inference", { prompt, modelId });
+}
+
+export async function getImageRuntimeStatus(): Promise<ImageRuntimeStatus> {
+  return invoke<ImageRuntimeStatus>("get_image_runtime_status");
+}
+
+export async function installOfficialModel(modelId: string): Promise<GridSnapshot> {
+  return invoke<GridSnapshot>("install_official_model", { modelId });
+}
+
+export async function installOfficialImage(): Promise<ImageRuntimeStatus> {
+  return invoke<ImageRuntimeStatus>("install_official_image");
+}
+
+export async function generateImage(
+  prompt: string,
+  seed?: number,
+): Promise<GenerateImageResponse> {
+  return invoke<GenerateImageResponse>("generate_image", { prompt, seed: seed ?? null });
 }
 
 export async function listenForProgress(

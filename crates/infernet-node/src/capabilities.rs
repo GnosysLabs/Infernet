@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "linux")]
 use std::fs;
 
-use infernet_protocol::{LLAMA_RPC_TUNNEL_PROTOCOL, LlamaRpcEndpoint, NodeCapabilities};
+use infernet_protocol::{
+    LLAMA_RPC_TUNNEL_PROTOCOL, LlamaRpcEndpoint, ModelComponentInfo, NodeCapabilities,
+};
 use sha2::{Digest, Sha256};
 
 const KIBIBYTE: u64 = 1024;
@@ -99,6 +101,7 @@ static DETECTED_HARDWARE: OnceLock<NodeCapabilities> = OnceLock::new();
 static AVAILABLE_MEMORY: OnceLock<Mutex<AvailableMemoryCache>> = OnceLock::new();
 static VRAM_CONTRIBUTION_LIMIT_BYTES: OnceLock<Mutex<Option<u64>>> = OnceLock::new();
 static LOCAL_LLAMA_RPC: OnceLock<Mutex<LocalLlamaRpcState>> = OnceLock::new();
+static LOCAL_MODEL_COMPONENTS: OnceLock<Mutex<Vec<ModelComponentInfo>>> = OnceLock::new();
 static LOCAL_INFERENCE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static LOCAL_RPC_ACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -189,6 +192,23 @@ pub fn set_local_llama_rpc_endpoint(endpoint: Option<LlamaRpcEndpoint>) -> Resul
 pub fn clear_local_llama_rpc_endpoint() {
     // Clearing cannot fail validation.
     let _ = set_local_llama_rpc_endpoint(None);
+}
+
+/// Replaces the verified model components advertised by this process. Runtime
+/// owners must clear this list whenever their local package stops verifying.
+pub fn set_local_model_components(components: Vec<ModelComponentInfo>) {
+    *LOCAL_MODEL_COMPONENTS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = components;
+}
+
+pub(crate) fn local_model_components() -> Vec<ModelComponentInfo> {
+    LOCAL_MODEL_COMPONENTS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
 }
 
 fn local_llama_rpc_endpoint() -> Option<LlamaRpcEndpoint> {

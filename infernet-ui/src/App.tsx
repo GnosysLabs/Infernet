@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import createGlobe from "cobe";
 import type { Marker } from "cobe";
 import ReactMarkdown from "react-markdown";
@@ -14,9 +22,9 @@ import {
   Image as ImageIcon,
   Laptop2,
   Layers3,
+  LoaderCircle,
   MemoryStick,
   MessageSquare,
-  PanelRightClose,
   Plus,
   Send,
   Server,
@@ -26,16 +34,22 @@ import {
 } from "lucide-react";
 import {
   emptySnapshot,
+  generateImage,
   getGridSnapshot,
+  getImageRuntimeStatus,
   getLocalNodeActivity,
   getVramContributionSettings,
+  installOfficialImage,
+  installOfficialModel,
   listenForProgress,
   listenForModelImportProgress,
   runDistributedInference,
   setVramContribution,
 } from "./api";
 import type {
+  GenerateImageResponse,
   GridSnapshot,
+  ImageRuntimeStatus,
   LocalNodeActivitySnapshot,
   MachineView,
   ModelImportProgress,
@@ -49,7 +63,7 @@ import { buildConversationPrompt } from "./conversationContext";
 import { usePersistentChatHistory } from "./usePersistentChatHistory";
 
 type PrimaryMode = "chat" | "image";
-type Page = PrimaryMode | "network" | "downloads" | "settings";
+type Page = PrimaryMode | "activity" | "network" | "downloads" | "settings";
 type TransferStatus = "active" | "complete" | "error";
 type TransferActivity = ModelImportProgress & {
   id: string;
@@ -59,15 +73,17 @@ type TransferActivity = ModelImportProgress & {
 };
 type NodeJournalEntry = {
   id: string;
-  kind: "completion" | "contribution" | "model" | "sharing" | "error";
+  kind: "completion" | "contribution" | "image" | "model" | "sharing" | "error";
   title: string;
   detail?: string;
   occurredAt: number;
 };
+type RequiredSetupErrors = Partial<Record<"chat" | "image" | "status", string>>;
 
 const DEFAULT_PROMPT = "";
 const COMPOSER_MAX_HEIGHT = 160;
 const INFERNET_CHAT_MODEL_ID = "infernet-chat-v1";
+const INFERNET_IMAGE_MODEL_ID = "infernet-image-v1";
 const UNSAVED_RESPONSE_ERROR = "The response is visible, but Infernet couldn’t save it. Keep the app open if you need to copy it.";
 const MARKDOWN_COMPONENTS: Components = {
   a: ({ node: _node, ...props }) => (
@@ -97,7 +113,6 @@ const EMPTY_LOCAL_NODE_ACTIVITY: LocalNodeActivitySnapshot = {
 export default function App() {
   const [page, setPage] = useState<Page>("chat");
   const [primaryMode, setPrimaryMode] = useState<PrimaryMode>("chat");
-  const [activityOpen, setActivityOpen] = useState(false);
   const {
     history: chatHistory,
     ready: chatHistoryReady,
@@ -127,6 +142,12 @@ export default function App() {
   const [lastError, setLastError] = useState<string | null>(null);
   const [transferActivities, setTransferActivities] = useState<TransferActivity[]>([]);
   const [connectionGraceExpired, setConnectionGraceExpired] = useState(false);
+  const [snapshotChecked, setSnapshotChecked] = useState(false);
+  const [imageStatusChecked, setImageStatusChecked] = useState(false);
+  const [imageRuntimeStatus, setImageRuntimeStatus] = useState<ImageRuntimeStatus | null>(null);
+  const [requiredSetupRunning, setRequiredSetupRunning] = useState(false);
+  const [requiredSetupErrors, setRequiredSetupErrors] = useState<RequiredSetupErrors>({});
+  const requiredSetupStartedRef = useRef(false);
 
   const activeThread = chatHistory.threads.find(
     (thread) => thread.id === chatHistory.activeThreadId,
@@ -144,6 +165,12 @@ export default function App() {
     () => officialModels.find((model) => model.modelId === selectedModel),
     [officialModels, selectedModel],
   );
+  const chatModelView = officialModels.find((model) => model.modelId === INFERNET_CHAT_MODEL_ID);
+  const chatModelInstalled = Boolean(
+    chatModelView?.installed
+    || snapshot.distribution.installedModels.includes(INFERNET_CHAT_MODEL_ID),
+  );
+  const imageModelInstalled = Boolean(imageRuntimeStatus?.verified);
   const activeTransfers = transferActivities.filter((activity) => activity.status === "active").length;
   const connectionPending = !snapshot.localPeerId
     || Boolean(selectedModelView?.installed && !selectedModelView.runnable);
@@ -196,8 +223,66 @@ export default function App() {
       setSelectedModel(nextSelectedModel);
     } catch (error) {
       setLastError(String(error));
+    } finally {
+      setSnapshotChecked(true);
     }
   }, []);
+
+  const beginRequiredSetup = useCallback(async () => {
+    if (requiredSetupRunning) return;
+
+    requiredSetupStartedRef.current = true;
+    setRequiredSetupRunning(true);
+    setRequiredSetupErrors({});
+
+    const tasks: Promise<void>[] = [];
+    if (!chatModelInstalled) {
+      tasks.push(
+        installOfficialModel(INFERNET_CHAT_MODEL_ID)
+          .then((next) => {
+            setSnapshot(next);
+            setSelectedModel(INFERNET_CHAT_MODEL_ID);
+          })
+          .catch((error) => {
+            setRequiredSetupErrors((current) => ({ ...current, chat: String(error) }));
+          }),
+      );
+    }
+    if (!imageModelInstalled) {
+      tasks.push(
+        installOfficialImage()
+          .then(setImageRuntimeStatus)
+          .catch((error) => {
+            setRequiredSetupErrors((current) => ({ ...current, image: imageErrorMessage(error) }));
+          }),
+      );
+    }
+
+    await Promise.all(tasks);
+
+    const [nextSnapshot, nextImageStatus] = await Promise.allSettled([
+      getGridSnapshot(4000, INFERNET_CHAT_MODEL_ID),
+      getImageRuntimeStatus(),
+    ]);
+    if (nextSnapshot.status === "fulfilled") {
+      setSnapshot(nextSnapshot.value);
+      setSelectedModel(INFERNET_CHAT_MODEL_ID);
+    } else {
+      setRequiredSetupErrors((current) => ({
+        ...current,
+        status: "Infernet couldn’t confirm the local model status. Try again.",
+      }));
+    }
+    if (nextImageStatus.status === "fulfilled") {
+      setImageRuntimeStatus(nextImageStatus.value);
+    } else {
+      setRequiredSetupErrors((current) => ({
+        ...current,
+        status: "Infernet couldn’t confirm the local model status. Try again.",
+      }));
+    }
+    setRequiredSetupRunning(false);
+  }, [chatModelInstalled, imageModelInstalled, requiredSetupRunning]);
 
   useEffect(() => {
     let disposed = false;
@@ -281,6 +366,25 @@ export default function App() {
   }, [refreshSnapshot, selectedModel]);
 
   useEffect(() => {
+    let disposed = false;
+    getImageRuntimeStatus()
+      .then((next) => {
+        if (!disposed) setImageRuntimeStatus(next);
+      })
+      .catch((error) => {
+        if (!disposed) {
+          setRequiredSetupErrors((current) => ({ ...current, status: imageErrorMessage(error) }));
+        }
+      })
+      .finally(() => {
+        if (!disposed) setImageStatusChecked(true);
+      });
+    return () => {
+      disposed = true;
+    };
+  }, []);
+
+  useEffect(() => {
     if (!connectionPending) {
       setConnectionGraceExpired(false);
       return;
@@ -354,25 +458,34 @@ export default function App() {
     let disposed = false;
     let unlisten: (() => void) | undefined;
     listenForModelImportProgress((event) => {
-      if (!isOfficialModelId(event.modelId)) {
+      const isChatModel = isOfficialModelId(event.modelId);
+      const isImageModel = isOfficialImageModelId(event.modelId);
+      if (!isChatModel && !isImageModel) {
         return;
       }
       setTransferActivities((current) => upsertTransferActivity(current, event));
       const normalizedStage = event.stage.trim().toLowerCase();
-      if (normalizedStage === "ready") {
+      const isReady = isChatModel
+        ? normalizedStage === "ready"
+        : normalizedStage === "image package ready";
+      if (isReady) {
         appendJournalEntry({
           id: `model-ready-${event.modelId}`,
           kind: "model",
-          title: "You prepared Infernet Chat",
-          detail: "The verified model is ready to use and share.",
+          title: isImageModel ? "You prepared Infernet Image" : "You prepared Infernet Chat",
+          detail: isImageModel
+            ? "The verified image package is ready to use and share."
+            : "The verified model is ready to use and share.",
           occurredAt: Date.now(),
         });
       } else if (normalizedStage.includes("failed") || normalizedStage.includes("error")) {
         appendJournalEntry({
           id: `model-error-${event.modelId}-${Date.now()}`,
           kind: "error",
-          title: "A model task couldn’t finish",
-          detail: friendlyActivityError(event.detail),
+          title: isImageModel
+            ? "Infernet Image setup couldn’t finish"
+            : "A model task couldn’t finish",
+          detail: isImageModel ? event.detail : friendlyActivityError(event.detail),
           occurredAt: Date.now(),
         });
       }
@@ -389,6 +502,24 @@ export default function App() {
       unlisten?.();
     };
   }, [appendJournalEntry]);
+
+  useEffect(() => {
+    if (!snapshotChecked || !imageStatusChecked) {
+      return;
+    }
+    if (chatModelInstalled && imageModelInstalled) {
+      requiredSetupStartedRef.current = false;
+      return;
+    }
+    if (requiredSetupStartedRef.current) return;
+    void beginRequiredSetup();
+  }, [
+    beginRequiredSetup,
+    chatModelInstalled,
+    imageModelInstalled,
+    imageStatusChecked,
+    snapshotChecked,
+  ]);
 
   async function createNewThread() {
     if (!chatHistoryReady) return;
@@ -463,7 +594,7 @@ export default function App() {
     }
 
     if (!selectedModelView) {
-      setLastError("Install Infernet Chat before sending a message.");
+      setLastError("Infernet Chat is not available on this computer.");
       return;
     }
     if (!selectedModelView.runnable) {
@@ -511,8 +642,27 @@ export default function App() {
     }
   }
 
+  const requiredSetupComplete = snapshotChecked
+    && imageStatusChecked
+    && chatModelInstalled
+    && imageModelInstalled;
+
+  if (!requiredSetupComplete) {
+    return (
+      <RequiredModelsOnboarding
+        checking={!snapshotChecked || !imageStatusChecked}
+        chatInstalled={chatModelInstalled}
+        imageStatus={imageRuntimeStatus}
+        transfers={transferActivities}
+        running={requiredSetupRunning}
+        errors={requiredSetupErrors}
+        onRetry={() => void beginRequiredSetup()}
+      />
+    );
+  }
+
   return (
-    <div className={activityOpen ? "app-shell activity-open" : "app-shell"}>
+    <div className="app-shell">
       <Sidebar
         threads={chatHistory.threads}
         activeThreadId={chatHistory.activeThreadId}
@@ -534,14 +684,12 @@ export default function App() {
           chatTitle={activeThread?.title ?? "New chat"}
           networkNodeCount={snapshot.machines.filter((machine) => machine.connectionStatus !== "unreachable").length}
           networkReadyCount={snapshot.machines.filter((machine) => machine.rpcReady && machine.connectionStatus !== "unreachable").length}
-          activityOpen={activityOpen}
           hasActiveWork={
             localNodeActivity.computeActive
             || localNodeActivity.sharingActive
             || activeTransfers > 0
           }
           onNavigate={setPage}
-          onToggleActivity={() => setActivityOpen((open) => !open)}
         />
 
         {page === "chat" ? (
@@ -578,19 +726,176 @@ export default function App() {
           <NetworkPage snapshot={snapshot} />
         ) : null}
 
-        {page === "settings" ? <SettingsPage /> : null}
-      </main>
+        {page === "activity" ? (
+          <ActivityPage
+            snapshot={snapshot}
+            transferActivities={transferActivities}
+            localNodeActivity={localNodeActivity}
+            localJournal={localJournal}
+          />
+        ) : null}
 
-      {activityOpen ? (
-        <ActivitySidebar
-          snapshot={snapshot}
-          transferActivities={transferActivities}
-          localNodeActivity={localNodeActivity}
-          localJournal={localJournal}
-          onClose={() => setActivityOpen(false)}
-        />
-      ) : null}
+        {page === "settings" ? (
+          <SettingsPage snapshot={snapshot} imageRuntimeStatus={imageRuntimeStatus} />
+        ) : null}
+      </main>
     </div>
+  );
+}
+
+function RequiredModelsOnboarding({
+  checking,
+  chatInstalled,
+  imageStatus,
+  transfers,
+  running,
+  errors,
+  onRetry,
+}: {
+  checking: boolean;
+  chatInstalled: boolean;
+  imageStatus: ImageRuntimeStatus | null;
+  transfers: TransferActivity[];
+  running: boolean;
+  errors: RequiredSetupErrors;
+  onRetry: () => void;
+}) {
+  const chatTransfer = transfers.find((item) => item.modelId === INFERNET_CHAT_MODEL_ID);
+  const imageTransfer = transfers.find((item) => item.modelId === INFERNET_IMAGE_MODEL_ID);
+  const imageInstalled = Boolean(imageStatus?.verified);
+  const hasError = Boolean(errors.chat || errors.image || errors.status);
+
+  return (
+    <main className="required-setup-screen" aria-busy={checking || running}>
+      <section className="required-setup-panel" aria-labelledby="required-setup-title">
+        <div className="required-setup-heading">
+          <span className="section-eyebrow">First-time setup</span>
+          <h1 id="required-setup-title">Preparing Infernet</h1>
+          <p>
+            Chat and image models are required. Infernet downloads and verifies both packages
+            before the rest of the app becomes available.
+          </p>
+        </div>
+
+        <div className="required-model-list" aria-live="polite">
+          <RequiredModelSetupRow
+            icon={<MessageSquare size={20} />}
+            name="Infernet Chat"
+            packageNote="Official chat model"
+            installed={chatInstalled}
+            checking={checking}
+            running={running}
+            transfer={chatTransfer}
+            error={errors.chat}
+          />
+          <RequiredModelSetupRow
+            icon={<ImageIcon size={20} />}
+            name="Infernet Image"
+            packageNote="Official image model"
+            installed={imageInstalled}
+            checking={checking}
+            running={running}
+            transfer={imageTransfer}
+            downloadedBytes={imageStatus?.downloadedBytes}
+            totalBytes={imageStatus?.totalBytes}
+            error={errors.image}
+          />
+        </div>
+
+        <div className={hasError ? "required-setup-footer error" : "required-setup-footer"}>
+          <div>
+            <strong>
+              {hasError
+                ? "Setup needs another try"
+                : checking
+                  ? "Checking this computer"
+                  : "Keep Infernet open while setup finishes"}
+            </strong>
+            <span>
+              {errors.status
+                ?? (hasError
+                  ? "Completed downloads are kept, so retrying resumes where possible."
+                  : "Each package is checked against its official pinned release.")}
+            </span>
+          </div>
+          {hasError && !running ? (
+            <button type="button" className="secondary-button" onClick={onRetry}>
+              Try again
+            </button>
+          ) : null}
+        </div>
+      </section>
+    </main>
+  );
+}
+
+function RequiredModelSetupRow({
+  icon,
+  name,
+  packageNote,
+  installed,
+  checking,
+  running,
+  transfer,
+  downloadedBytes: fallbackDownloadedBytes = 0,
+  totalBytes: fallbackTotalBytes = 0,
+  error,
+}: {
+  icon: ReactNode;
+  name: string;
+  packageNote: string;
+  installed: boolean;
+  checking: boolean;
+  running: boolean;
+  transfer?: TransferActivity;
+  downloadedBytes?: number;
+  totalBytes?: number;
+  error?: string;
+}) {
+  const downloadedBytes = transfer?.downloadedBytes ?? fallbackDownloadedBytes;
+  const totalBytes = transfer?.totalBytes ?? fallbackTotalBytes;
+  const progress = installed
+    ? 100
+    : totalBytes > 0
+      ? Math.min(100, (downloadedBytes / totalBytes) * 100)
+      : 0;
+  const indeterminate = !installed && !error && (checking || running) && totalBytes === 0;
+  const status = installed
+    ? "Downloaded and verified"
+    : error
+      ? "Download paused"
+      : checking
+        ? "Checking this computer…"
+        : transfer?.status === "active"
+          ? humanTransferStage(transfer.stage)
+          : running
+            ? "Starting download…"
+            : "Waiting to download";
+  const detail = installed
+    ? totalBytes > 0
+      ? formatBytes(totalBytes)
+      : packageNote
+    : error
+      ? imageErrorMessage(error)
+      : totalBytes > 0
+        ? `${formatProgressPercent(progress)}% · ${formatBytes(downloadedBytes)} of ${formatBytes(totalBytes)}`
+        : packageNote;
+
+  return (
+    <article className={error ? "required-model-row error" : "required-model-row"}>
+      <div className="required-model-icon" aria-hidden="true">{icon}</div>
+      <div className="required-model-copy">
+        <div className="required-model-title">
+          <strong>{name}</strong>
+          <span className={installed ? "model-state ready" : error ? "model-state error" : "model-state"}>
+            <i aria-hidden="true" />
+            {status}
+          </span>
+        </div>
+        <ProgressBar progress={progress} indeterminate={indeterminate} />
+        <small>{detail}</small>
+      </div>
+    </article>
   );
 }
 
@@ -833,19 +1138,15 @@ function AppHeader({
   chatTitle,
   networkNodeCount,
   networkReadyCount,
-  activityOpen,
   hasActiveWork,
   onNavigate,
-  onToggleActivity,
 }: {
   page: Page;
   chatTitle: string;
   networkNodeCount: number;
   networkReadyCount: number;
-  activityOpen: boolean;
   hasActiveWork: boolean;
   onNavigate: (page: Page) => void;
-  onToggleActivity: () => void;
 }) {
   return (
     <header className="app-header">
@@ -876,15 +1177,15 @@ function AppHeader({
           onClick={() => onNavigate("settings")}
         />
         <button
-          className={activityOpen ? "activity-toggle active" : "activity-toggle"}
-          aria-label="Activity"
-          aria-expanded={activityOpen}
-          aria-controls="activity-sidebar"
-          onClick={onToggleActivity}
+          className={page === "activity" ? "activity-toggle active" : "activity-toggle"}
+          type="button"
+          aria-label={hasActiveWork ? "Activity, active work" : "Activity"}
+          aria-current={page === "activity" ? "page" : undefined}
+          title="Activity"
+          onClick={() => onNavigate("activity")}
         >
           <Activity size={16} />
-          <span>Activity</span>
-          {hasActiveWork ? <i aria-label="Active work" /> : null}
+          {hasActiveWork ? <i aria-hidden="true" /> : null}
         </button>
       </div>
     </header>
@@ -1048,7 +1349,7 @@ function ChatPage({
                 ? "Establishing connection"
                 : model
                   ? "Model is not ready"
-                  : "Install Infernet Chat first"}
+                  : "Infernet Chat is unavailable"}
             disabled={!canSend}
             aria-label="Message Infernet"
           />
@@ -1077,6 +1378,30 @@ function ImagePage({
   focusRequest: number;
 }) {
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const generationEpochRef = useRef(0);
+  const [runtimeStatus, setRuntimeStatus] = useState<ImageRuntimeStatus | null>(null);
+  const [runtimeLoading, setRuntimeLoading] = useState(true);
+  const [generating, setGenerating] = useState(false);
+  const [result, setResult] = useState<GenerateImageResponse | null>(null);
+  const [imageError, setImageError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let disposed = false;
+    setRuntimeLoading(true);
+    getImageRuntimeStatus()
+      .then((next) => {
+        if (!disposed) setRuntimeStatus(next);
+      })
+      .catch((error) => {
+        if (!disposed) setImageError(imageErrorMessage(error));
+      })
+      .finally(() => {
+        if (!disposed) setRuntimeLoading(false);
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [focusRequest]);
 
   useLayoutEffect(() => {
     const input = inputRef.current;
@@ -1084,24 +1409,114 @@ function ImagePage({
     resizeComposerInput(input);
   }, [prompt]);
 
+  useLayoutEffect(() => {
+    const input = inputRef.current;
+    if (!input || typeof ResizeObserver === "undefined") return;
+    let previousWidth = input.clientWidth;
+    const observer = new ResizeObserver(([entry]) => {
+      const nextWidth = entry.contentRect.width;
+      if (nextWidth === previousWidth) return;
+      previousWidth = nextWidth;
+      resizeComposerInput(input);
+    });
+    observer.observe(input);
+    return () => observer.disconnect();
+  }, []);
+
   useEffect(() => {
-    if (focusRequest > 0) inputRef.current?.focus();
+    if (focusRequest <= 0) return;
+    generationEpochRef.current += 1;
+    setResult(null);
+    setImageError(null);
+    inputRef.current?.focus();
   }, [focusRequest]);
 
+  const operationBusy = generating || Boolean(runtimeStatus?.busy);
+  const canGenerate = Boolean(
+    runtimeStatus?.runtimeAvailable && runtimeStatus.verified && !operationBusy,
+  );
+  const runtimeNote = runtimeLoading
+    ? "Checking the image runtime…"
+    : generating
+      ? "Generating a 1024 × 1024 image with the verified package."
+      : runtimeStatus?.status ?? "Infernet Image is unavailable.";
+
+  async function runImageGeneration() {
+    const cleanPrompt = prompt.trim();
+    if (!cleanPrompt || !canGenerate) return;
+    const generationEpoch = generationEpochRef.current;
+    setGenerating(true);
+    setImageError(null);
+    setResult(null);
+    try {
+      const next = await generateImage(cleanPrompt);
+      if (generationEpochRef.current === generationEpoch) setResult(next);
+    } catch (error) {
+      if (generationEpochRef.current === generationEpoch) {
+        setImageError(imageErrorMessage(error));
+      }
+    } finally {
+      setGenerating(false);
+      getImageRuntimeStatus().then(setRuntimeStatus).catch(() => undefined);
+    }
+  }
+
   return (
-    <section className="image-screen">
+    <section className="image-screen" aria-busy={operationBusy}>
       <div className="image-workspace">
-        <div className="empty-image-hero">
-          <div className="image-mode-mark" aria-hidden="true">
-            <ImageIcon size={24} />
+        {result ? (
+          <figure className="image-result">
+            <div className="image-result-frame">
+              <img
+                src={result.imageDataUrl}
+                alt={`Generated image for: ${result.prompt.slice(0, 180)}`}
+                decoding="async"
+              />
+            </div>
+            <figcaption>
+              <p>{result.prompt}</p>
+              <dl className="image-result-meta">
+                <div>
+                  <dt>Seed</dt>
+                  <dd>{result.seed}</dd>
+                </div>
+                <div>
+                  <dt>Size</dt>
+                  <dd>{result.width} × {result.height}</dd>
+                </div>
+                <div>
+                  <dt>Steps</dt>
+                  <dd>{result.steps}</dd>
+                </div>
+                <div>
+                  <dt>Time</dt>
+                  <dd>{formatDuration(result.durationMs)}</dd>
+                </div>
+              </dl>
+            </figcaption>
+          </figure>
+        ) : (
+          <div className="empty-image-hero" aria-live="polite">
+            <div className={generating ? "image-mode-mark working" : "image-mode-mark"} aria-hidden="true">
+              {generating ? <LoaderCircle size={24} /> : <ImageIcon size={24} />}
+            </div>
+            <span>Infernet Image</span>
+            <h2>{generating ? "Creating your image" : "What do you want to make?"}</h2>
+            <p>
+              {generating
+                ? "Infernet is running the verified Z‑Image Turbo edition. Keep the app open while it finishes."
+                : "Describe a scene, subject, or style. Infernet Image will use the official Z‑Image Turbo edition."}
+            </p>
+
           </div>
-          <span>Infernet Image</span>
-          <h2>What do you want to make?</h2>
-          <p>
-            Describe a scene, subject, or style. Infernet Image will use the official
-            Z-Image Turbo edition.
-          </p>
-        </div>
+        )}
+
+        {imageError ? (
+          <div className="chat-error image-error" role="alert">
+            <strong>Infernet Image couldn’t finish.</strong>
+            <span>{imageError}</span>
+          </div>
+        ) : null}
       </div>
 
       <div className="image-composer-dock">
@@ -1111,27 +1526,39 @@ function ImagePage({
             rows={1}
             value={prompt}
             onChange={(event) => setPrompt(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+                event.preventDefault();
+                void runImageGeneration();
+              }
+            }}
+            maxLength={4000}
             placeholder="Describe an image"
             aria-label="Describe an image"
             aria-describedby="image-runtime-note"
           />
           <button
-            className="send-button"
+            className={generating ? "send-button image-generating" : "send-button"}
             type="button"
-            disabled
+            disabled={!canGenerate || !prompt.trim()}
             aria-label="Generate image"
-            title="Image runtime not connected"
+            title={runtimeStatus?.verified ? undefined : runtimeStatus?.status}
+            onClick={() => void runImageGeneration()}
           >
-            <ImageIcon size={18} />
-            <span>Generate</span>
+            {generating ? <LoaderCircle size={18} /> : <ImageIcon size={18} />}
+            <span>{generating ? "Generating…" : "Generate"}</span>
           </button>
         </div>
-        <p id="image-runtime-note" className="image-runtime-note" role="status">
-          Image generation is not connected to a runtime in this build yet.
+        <p id="image-runtime-note" className="image-runtime-note" role="status" aria-live="polite">
+          {runtimeNote}
         </p>
       </div>
     </section>
   );
+}
+
+function imageErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function resizeComposerInput(input: HTMLTextAreaElement) {
@@ -1169,18 +1596,16 @@ function MarkdownMessage({ text }: { text: string }) {
   );
 }
 
-function ActivitySidebar({
+function ActivityPage({
   snapshot,
   transferActivities,
   localNodeActivity,
   localJournal,
-  onClose,
 }: {
   snapshot: GridSnapshot;
   transferActivities: TransferActivity[];
   localNodeActivity: LocalNodeActivitySnapshot;
   localJournal: NodeJournalEntry[];
-  onClose: () => void;
 }) {
   const localMachine = snapshot.machines.find((machine) => machine.isLocal);
   const activeTransfer = transferActivities.find((activity) => activity.status === "active");
@@ -1208,7 +1633,12 @@ function ActivitySidebar({
         title: humanTransferStage(activeTransfer.stage),
         detail: transferStageDescription(activeTransfer.stage, activeTransfer.status),
       }
-    : currentTask?.kind === "chatCompletion"
+    : currentTask?.kind === "imageGeneration"
+      ? {
+          title: "Creating an image",
+          detail: "Your computer is running the verified Infernet Image package.",
+        }
+      : currentTask?.kind === "chatCompletion"
       ? {
           title: "Fulfilling a chat completion",
           detail: "Your node is coordinating this response.",
@@ -1245,8 +1675,19 @@ function ActivitySidebar({
         kind: "error",
         title: entry.kind === "chatCompletion"
           ? "A chat completion couldn’t finish"
-          : "A compute task couldn’t finish",
+          : entry.kind === "imageGeneration"
+            ? "An image couldn’t finish"
+            : "A compute task couldn’t finish",
         detail: duration === "—" ? undefined : `Your node worked for ${duration}.`,
+        occurredAt: entry.completedAtUnixMs,
+      };
+    }
+    if (entry.kind === "imageGeneration") {
+      return {
+        id: entry.id,
+        kind: "image",
+        title: "You created an image",
+        detail: duration === "—" ? undefined : `Completed in ${duration}.`,
         occurredAt: entry.completedAtUnixMs,
       };
     }
@@ -1270,93 +1711,93 @@ function ActivitySidebar({
     .slice(-50);
 
   return (
-    <aside className="activity-sidebar" id="activity-sidebar" aria-label="Your node activity">
-      <div className="activity-sidebar-header">
-        <div>
-          <span>Your node</span>
-          <h2>{deviceName}</h2>
+    <section className="activity-screen" aria-label="Your node activity">
+      <div className="activity-page-content">
+        <header className="activity-page-header">
+          <div>
+            <span>Your node</span>
+            <h2>{deviceName}</h2>
+          </div>
+        </header>
+
+        <div className="activity-page-grid">
+          <section className={isWorking ? "node-hud working" : "node-hud"} aria-live="polite">
+            <div className="node-current-work">
+              <span className={isWorking ? "activity-pulse active" : "activity-pulse"} />
+              <div>
+                <span className="node-now-label">Now</span>
+                <strong>{currentWork.title}</strong>
+                <p>{currentWork.detail}</p>
+              </div>
+            </div>
+
+            {activeTransfer ? <MachineTransferProgress activity={activeTransfer} /> : null}
+
+            <dl className="node-facts">
+              <ActivityDataRow
+                label="Compute"
+                value={computeActive
+                  ? "In use"
+                  : computeReady
+                    ? `${machineBackendLabel(computeBackend)} ready`
+                    : "Unavailable"}
+              />
+              <ActivityDataRow
+                label="Memory"
+                value={totalMemoryBytes > 0
+                  ? `${formatBytes(availableMemoryBytes)} free of ${formatBytes(totalMemoryBytes)}`
+                  : "Checking"}
+              />
+              <ActivityDataRow
+                label="Model"
+                value={activeTransfer
+                  ? "Preparing locally"
+                  : modelStored
+                    ? "Stored and shareable"
+                    : "Compute only"}
+              />
+              <ActivityDataRow label="Network" value={isStarting ? "Starting" : "Connected"} />
+            </dl>
+          </section>
+
+          <section className="node-journal" aria-labelledby="node-journal-title">
+            <div className="node-journal-heading">
+              <strong id="node-journal-title">Journal</strong>
+              <span>This session</span>
+            </div>
+            {journal.length === 0 ? (
+              <div className="node-journal-empty">
+                <Activity size={17} />
+                <span>Your node’s completed work will appear here.</span>
+              </div>
+            ) : (
+              <ol className="node-journal-list" aria-live="polite" aria-relevant="additions">
+                {journal.map((entry) => (
+                  <li className={`node-journal-entry ${entry.kind}`} key={entry.id}>
+                    <span className="node-journal-marker" aria-hidden="true">
+                      <NodeJournalIcon kind={entry.kind} />
+                    </span>
+                    <div>
+                      <strong>{entry.title}</strong>
+                      {entry.detail ? <p>{entry.detail}</p> : null}
+                      <time dateTime={new Date(entry.occurredAt).toISOString()}>
+                        {formatJournalTime(entry.occurredAt)}
+                      </time>
+                    </div>
+                  </li>
+                ))}
+              </ol>
+            )}
+          </section>
         </div>
-        <button className="icon-button" aria-label="Close activity" onClick={onClose}>
-          <PanelRightClose size={18} />
-        </button>
       </div>
-
-      <div className="activity-sidebar-scroll">
-        <section className={isWorking ? "node-hud working" : "node-hud"} aria-live="polite">
-          <div className="node-current-work">
-            <span className={isWorking ? "activity-pulse active" : "activity-pulse"} />
-            <div>
-              <span className="node-now-label">Now</span>
-              <strong>{currentWork.title}</strong>
-              <p>{currentWork.detail}</p>
-            </div>
-          </div>
-
-          {activeTransfer ? <MachineTransferProgress activity={activeTransfer} /> : null}
-
-          <dl className="node-facts">
-            <ActivityDataRow
-              label="Compute"
-              value={computeActive
-                ? "In use"
-                : computeReady
-                  ? `${machineBackendLabel(computeBackend)} ready`
-                  : "Unavailable"}
-            />
-            <ActivityDataRow
-              label="Memory"
-              value={totalMemoryBytes > 0
-                ? `${formatBytes(availableMemoryBytes)} free of ${formatBytes(totalMemoryBytes)}`
-                : "Checking"}
-            />
-            <ActivityDataRow
-              label="Model"
-              value={activeTransfer
-                ? "Preparing locally"
-                : modelStored
-                  ? "Stored and shareable"
-                  : "Compute only"}
-            />
-            <ActivityDataRow label="Network" value={isStarting ? "Starting" : "Connected"} />
-          </dl>
-        </section>
-
-        <section className="node-journal" aria-labelledby="node-journal-title">
-          <div className="node-journal-heading">
-            <strong id="node-journal-title">Journal</strong>
-            <span>This session</span>
-          </div>
-          {journal.length === 0 ? (
-            <div className="node-journal-empty">
-              <Activity size={17} />
-              <span>Your node’s completed work will appear here.</span>
-            </div>
-          ) : (
-            <ol className="node-journal-list" aria-live="polite" aria-relevant="additions">
-              {journal.map((entry) => (
-                <li className={`node-journal-entry ${entry.kind}`} key={entry.id}>
-                  <span className="node-journal-marker" aria-hidden="true">
-                    <NodeJournalIcon kind={entry.kind} />
-                  </span>
-                  <div>
-                    <strong>{entry.title}</strong>
-                    {entry.detail ? <p>{entry.detail}</p> : null}
-                    <time dateTime={new Date(entry.occurredAt).toISOString()}>
-                      {formatJournalTime(entry.occurredAt)}
-                    </time>
-                  </div>
-                </li>
-              ))}
-            </ol>
-          )}
-        </section>
-      </div>
-    </aside>
+    </section>
   );
 }
 
 function NodeJournalIcon({ kind }: { kind: NodeJournalEntry["kind"] }) {
   if (kind === "completion") return <MessageSquare size={13} />;
+  if (kind === "image") return <ImageIcon size={13} />;
   if (kind === "model") return <Download size={13} />;
   if (kind === "sharing") return <Server size={13} />;
   if (kind === "error") return <Activity size={13} />;
@@ -1408,7 +1849,7 @@ function MachineStatusCard({
       ? { className: "error", label: "Model host offline" }
     : machine.hostedComponentCount > 0
       ? { className: "ready", label: "Hosting and sharing" }
-      : { className: "muted", label: "Compute only" };
+      : { className: "muted", label: "Model unavailable" };
   const modelDetail = localTransfer
     ? "The verified package will be shared after the download finishes."
     : unreachable && machine.hostedComponentCount > 0
@@ -1416,7 +1857,7 @@ function MachineStatusCard({
     : machine.hostedComponentCount > 0
       ? "Infernet Chat is verified and available for other computers to download while Infernet stays open."
       : supportedBackend
-        ? "No full model download needed. This computer receives only its assigned model data in memory during a request."
+        ? "This computer has not completed the required model setup."
         : "This computer can discover the network, but it cannot run a distributed model segment.";
   return (
     <div className="machine-row">
@@ -2100,8 +2541,8 @@ function DownloadsPage({
             <span className="section-eyebrow">Network model</span>
             <strong>Infernet Chat</strong>
             <p>
-              One computer hosts the verified 14.4 GB package. Compute-only computers do not need
-              the full model on disk.
+              Every Infernet computer downloads the verified package during required setup and can
+              share it with the network while the app is open.
             </p>
           </div>
           <span className={`network-model-status ${
@@ -2170,7 +2611,7 @@ function DownloadsPage({
         <div className="local-model-list">
           {localModels.length === 0 ? (
             <div className="empty-state compact">
-              No model is stored here. That is normal for compute-only computers.
+              Required model setup has not finished on this computer.
             </div>
           ) : (
             localModels.map((item) => (
@@ -2213,7 +2654,13 @@ function DownloadsPage({
   );
 }
 
-function SettingsPage() {
+function SettingsPage({
+  snapshot,
+  imageRuntimeStatus,
+}: {
+  snapshot: GridSnapshot;
+  imageRuntimeStatus: ImageRuntimeStatus | null;
+}) {
   const [settings, setSettings] = useState<VramContributionSettings | null>(null);
   const [draftBytes, setDraftBytes] = useState(0);
   const [status, setStatus] = useState<string | null>(null);
@@ -2257,15 +2704,70 @@ function SettingsPage() {
 
   const hasAccelerator = Boolean(settings?.totalBytes);
   const contributionLabel = draftBytes === 0 ? "Off" : formatBytes(draftBytes);
+  const chatModel = snapshot.availableModels.find(
+    (model) => model.modelId === INFERNET_CHAT_MODEL_ID,
+  );
+  const chatModelBytes = snapshot.distribution.installedShards
+    .filter((shard) => shard.modelId === INFERNET_CHAT_MODEL_ID)
+    .reduce((total, shard) => total + shard.sizeBytes, 0);
 
   return (
     <section className="settings-screen">
       <div className="section-heading">
         <h2>Settings</h2>
-        <p>Control how much of this computer the network can use.</p>
+        <p>See installed models and control how much of this computer the network can use.</p>
       </div>
 
       <div className="settings-list">
+        <div className="settings-row model-settings">
+          <div className="model-settings-heading">
+            <strong>Downloaded models</strong>
+            <span>Official packages stored and verified on this computer.</span>
+          </div>
+
+          <div className="settings-model-list">
+            <div className="settings-model-row">
+              <div className="settings-model-icon" aria-hidden="true">
+                <MessageSquare size={18} />
+              </div>
+              <div>
+                <strong>Infernet Chat</strong>
+                <span>
+                  {chatModel?.quantization
+                    ? `${chatModel.quantization.toUpperCase()} · Official release`
+                    : "Official chat model"}
+                </span>
+              </div>
+              <div className="settings-model-status">
+                <strong><i aria-hidden="true" />Downloaded</strong>
+                <span>{chatModelBytes > 0 ? formatBytes(chatModelBytes) : "Verified"}</span>
+              </div>
+            </div>
+
+            <div className="settings-model-row">
+              <div className="settings-model-icon" aria-hidden="true">
+                <ImageIcon size={18} />
+              </div>
+              <div>
+                <strong>Infernet Image</strong>
+                <span>
+                  {imageRuntimeStatus?.quantization
+                    ? `${imageRuntimeStatus.quantization} · Official release`
+                    : "Official image model"}
+                </span>
+              </div>
+              <div className="settings-model-status">
+                <strong><i aria-hidden="true" />Downloaded</strong>
+                <span>
+                  {imageRuntimeStatus?.totalBytes
+                    ? formatBytes(imageRuntimeStatus.totalBytes)
+                    : "Verified"}
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+
         <div className="settings-row vram-settings">
           <div className="vram-settings-copy">
             <strong>VRAM contribution</strong>
@@ -2384,14 +2886,23 @@ function upsertTransferActivity(
 
   const id = transferActivityId(event);
   const existing = current.find((item) => item.id === id);
+  const isRestartingImageInstall = isOfficialImageModelId(event.modelId)
+    && existing?.status !== "active"
+    && status === "active";
   const activity: TransferActivity = {
     ...event,
     id,
     status,
-    startedAt: existing?.startedAt ?? updatedAt,
+    startedAt: isRestartingImageInstall ? updatedAt : existing?.startedAt ?? updatedAt,
     updatedAt,
   };
-  if (activity.status === "active" && existing && existing.status !== "active" && activity.id.endsWith(":model")) {
+  if (
+    activity.status === "active"
+    && existing
+    && existing.status !== "active"
+    && activity.id.endsWith(":model")
+    && !isOfficialImageModelId(activity.modelId)
+  ) {
     return current;
   }
   const next = current.some((item) => item.id === activity.id)
@@ -2434,6 +2945,7 @@ function transferStatus(stage: string): TransferStatus {
 function pageTitle(page: Page, chatTitle = "Chat"): string {
   if (page === "chat") return chatTitle;
   if (page === "image") return "Image";
+  if (page === "activity") return "Activity";
   if (page === "network") return "Network";
   if (page === "downloads") return "Downloads";
   return "Settings";
@@ -2534,6 +3046,9 @@ function friendlyActivityError(error: string): string {
 function humanTransferStage(stage: string): string {
   const normalized = stage.toLowerCase();
   if (normalized.includes("failed") || normalized.includes("error")) return "Couldn’t finish";
+  if (normalized.includes("verifying image package")) return "Checking image package";
+  if (normalized.includes("downloading image package")) return "Downloading image package";
+  if (normalized.includes("repairing image package")) return "Repairing image package";
   if (normalized.includes("checking file") || normalized.includes("verifying model")) return "Checking model";
   if (normalized.includes("connecting")) return "Connecting to source";
   if (normalized.includes("downloading shard")) return "Downloading part of model";
@@ -2545,9 +3060,16 @@ function humanTransferStage(stage: string): string {
 }
 
 function transferStageDescription(stage: string, status: TransferStatus): string {
-  if (status === "error") return "Infernet couldn’t complete this model task.";
-  if (status === "complete") return "This model is ready to use.";
   const normalized = stage.toLowerCase();
+  const isImagePackage = normalized.includes("image package");
+  if (status === "error") {
+    return isImagePackage
+      ? "Infernet couldn’t complete this image package task."
+      : "Infernet couldn’t complete this model task.";
+  }
+  if (status === "complete") {
+    return isImagePackage ? "Infernet Image is ready to use." : "This model is ready to use.";
+  }
   if (normalized.includes("verifying") || normalized.includes("checking")) {
     return "Confirming the model is complete and trusted.";
   }
@@ -2557,6 +3079,7 @@ function transferStageDescription(stage: string, status: TransferStatus): string
 }
 
 function modelDisplayName(snapshot: GridSnapshot, modelId: string): string {
+  if (isOfficialImageModelId(modelId)) return "Infernet Image";
   const model = snapshot.availableModels.find(
     (item) => item.modelId === modelId && isOfficialInfernetModel(item),
   );
@@ -2565,6 +3088,10 @@ function modelDisplayName(snapshot: GridSnapshot, modelId: string): string {
 
 function isOfficialModelId(modelId: string): boolean {
   return modelId === INFERNET_CHAT_MODEL_ID;
+}
+
+function isOfficialImageModelId(modelId: string): boolean {
+  return modelId === INFERNET_IMAGE_MODEL_ID;
 }
 
 function isOfficialInfernetModel(model: ModelView): boolean {

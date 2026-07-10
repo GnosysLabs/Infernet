@@ -1,5 +1,6 @@
 fn main() {
     prepare_llama_runtime();
+    prepare_stable_diffusion_runtime();
     tauri_build::build()
 }
 
@@ -35,6 +36,37 @@ fn prepare_llama_runtime() {
         }
         Err(error) => {
             eprintln!("failed to launch bundled runtime preparation script: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn prepare_stable_diffusion_runtime() {
+    println!("cargo:rerun-if-changed=../../scripts/prepare-stable-diffusion-runtime.mjs");
+    println!("cargo:rerun-if-env-changed=INFERNET_SKIP_RUNTIME_PREPARE");
+    println!("cargo:rerun-if-env-changed=INFERNET_SD_CLI");
+    println!("cargo:rerun-if-env-changed=INFERNET_SD_BUILD_JOBS");
+    println!("cargo:rerun-if-env-changed=STABLE_DIFFUSION_CPP_REF");
+    println!("cargo:rerun-if-env-changed=INFERNET_ALLOW_EXTERNAL_SD_RUNTIME");
+
+    if std::env::var("INFERNET_SKIP_RUNTIME_PREPARE").as_deref() == Ok("1") {
+        return;
+    }
+
+    let script = std::path::Path::new("../../scripts/prepare-stable-diffusion-runtime.mjs");
+    let status = std::process::Command::new("node")
+        .arg(script)
+        .arg("--quiet")
+        .status();
+
+    match status {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            eprintln!("failed to prepare bundled stable-diffusion.cpp runtime: {status}");
+            std::process::exit(1);
+        }
+        Err(error) => {
+            eprintln!("failed to launch stable-diffusion.cpp runtime preparation: {error}");
             std::process::exit(1);
         }
     }

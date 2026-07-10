@@ -25,7 +25,7 @@ use infernet_node::{
 };
 use infernet_protocol::{
     ACTIVATION_PROTOCOL, LLAMA_RPC_TUNNEL_PROTOCOL, LlamaRpcEndpoint, ModelShardInfo,
-    NodeAdvertisement, RouteHop,
+    NodeAdvertisement, NodeCapabilities, RouteHop,
 };
 use infernet_router::ShardRegistry;
 use sha2::{Digest, Sha256};
@@ -95,6 +95,8 @@ struct DiscoveryArgs {
     p2p_listen: String,
     #[arg(long, default_value_t = DEFAULT_DISCOVERY_TIMEOUT_MS)]
     discovery_timeout_ms: u64,
+    /// Manual peer descriptor: peer@multiaddr#start:end#machine=<stable-id>.
+    /// The machine suffix is required for an executable route.
     #[arg(long = "static-peer")]
     static_peers: Vec<String>,
     /// Public Circuit Relay v2 server multiaddress (repeatable).
@@ -270,7 +272,11 @@ async fn main() -> Result<()> {
         Command::Route(args) => {
             let manifest = manifest_for_model(&args.model)?;
             let registry = discover_registry(args.discovery, &manifest).await?;
-            let route = registry.route_for_model(&manifest)?;
+            let requester_machine_id = detect_node_capabilities()
+                .machine_id
+                .ok_or_else(|| anyhow!("could not determine this computer's stable identity"))?;
+            let route =
+                registry.execution_route_for_model(&manifest, &requester_machine_id)?;
             print_route(&route);
             Ok(())
         }
@@ -431,6 +437,9 @@ async fn serve(args: ServeArgs) -> Result<()> {
     discovery.p2p_listen = args.p2p_listen;
     discovery.relay_peers = args.relay_peers;
     let peer_id = discovery.peer_id().to_string();
+    let machine_id = detect_node_capabilities()
+        .machine_id
+        .ok_or_else(|| anyhow!("could not determine this computer's stable identity"))?;
 
     discovery.advertisement = Some(enrich_local_advertisement(shard_descriptor_advertisement(
         peer_id.clone(),
@@ -440,6 +449,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
     )));
 
     println!("peer_id={peer_id}");
+    println!("machine_id={machine_id}");
     println!("model={}", manifest.model_id);
     println!("runtime={}", manifest.runtime_kind.as_str());
     println!("layers={}:{}", owned_layers.start, owned_layers.end);
@@ -449,6 +459,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
         discovery,
         WorkerConfig {
             peer_id,
+            machine_id,
             model_id: manifest.model_id,
             runtime_kind: manifest.runtime_kind,
             owned_layers,
@@ -578,18 +589,49 @@ fn parse_static_peer(input: &str, manifest: &ModelManifest) -> Result<NodeAdvert
     let (peer, rest) = input
         .split_once('@')
         .ok_or_else(|| anyhow!("static peer must look like peer@multiaddr#start:end"))?;
+    let (rest, machine_id) = match rest.rsplit_once("#machine=") {
+        Some((rest, machine_id)) if !machine_id.trim().is_empty() => {
+            (rest, Some(machine_id.trim().to_owned()))
+        }
+        _ => (rest, None),
+    };
     let (address, layers) = rest
         .rsplit_once('#')
         .or_else(|| rest.rsplit_once('/'))
         .ok_or_else(|| anyhow!("static peer must include #start:end"))?;
     let layers = parse_layer_range(layers)?;
 
-    Ok(shard_descriptor_advertisement(
+    let mut advertisement = shard_descriptor_advertisement(
         peer.to_owned(),
         address.to_owned(),
         manifest,
         layers,
-    ))
+    );
+    advertisement.capabilities = machine_id.map(static_peer_capabilities);
+    Ok(advertisement)
+}
+
+fn static_peer_capabilities(machine_id: String) -> NodeCapabilities {
+    NodeCapabilities {
+        os: "manually-configured".to_owned(),
+        arch: "unknown".to_owned(),
+        compute_backend: "manual".to_owned(),
+        device_name: "Manual peer".to_owned(),
+        machine_id: Some(machine_id),
+        logical_cpu_cores: 0,
+        total_ram_bytes: 0,
+        available_ram_bytes: 0,
+        total_accelerator_memory_bytes: 0,
+        available_accelerator_memory_bytes: 0,
+        vram_contribution_limit_bytes: None,
+        unified_memory: false,
+        max_sessions: 1,
+        active_sessions: 0,
+        measured_prefill_tokens_per_second: None,
+        measured_decode_tokens_per_second: None,
+        queue_depth: 0,
+        llama_rpc: None,
+    }
 }
 
 fn shard_descriptor_advertisement(

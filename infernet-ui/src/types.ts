@@ -140,6 +140,34 @@ export interface RunDemoResponse {
   snapshot: GridSnapshot;
 }
 
+export interface ImageRuntimeStatus {
+  modelId: string;
+  releaseId: string;
+  releaseVersion: string;
+  runtimeAbi: string;
+  quantization: string;
+  runtimeAvailable: boolean;
+  busy: boolean;
+  installed: boolean;
+  verified: boolean;
+  downloadedBytes: number;
+  totalBytes: number;
+  status: string;
+}
+
+export interface GenerateImageResponse {
+  imageDataUrl: string;
+  imageId: string;
+  prompt: string;
+  seed: number;
+  width: number;
+  height: number;
+  steps: number;
+  durationMs: number;
+  releaseId: string;
+  placement: string;
+}
+
 export interface ModelImportProgress {
   modelId: string;
   stage: string;
@@ -148,7 +176,7 @@ export interface ModelImportProgress {
   totalBytes?: number | null;
 }
 
-export type LocalNodeActivityKind = "chatCompletion" | "computeContribution";
+export type LocalNodeActivityKind = "chatCompletion" | "imageGeneration" | "computeContribution";
 export type LocalNodeActivityOutcome = "success" | "error";
 
 export interface LocalNodeActivityTask {

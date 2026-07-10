@@ -3,9 +3,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub const PROTOCOL_VERSION: u32 = 1;
-/// Infernet never executes a real inference job on one physical machine.
-/// Planners and workers must reject routes below this product invariant.
-pub const MIN_INFERENCE_MACHINE_COUNT: usize = 2;
+/// A distributed Infernet job uses at least two physical machines. The only
+/// one-machine exception is execution entirely on the requester's own machine.
+pub const MIN_DISTRIBUTED_MACHINE_COUNT: usize = 2;
 pub const ACTIVATION_PROTOCOL: &str = "/infernet/activation/2";
 pub const MODEL_PROTOCOL: &str = "/infernet/model/1";
 pub const MODEL_BLOB_PROTOCOL: &str = "/infernet/model-blob/1";
@@ -19,6 +19,26 @@ pub struct ModelShardInfo {
     pub size_bytes: u64,
     pub version: String,
     pub protocol_version: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageComponentRole {
+    DiffusionTransformer,
+    TextEncoder,
+    Vae,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelComponentInfo {
+    pub release_id: String,
+    pub model_id: String,
+    pub component_id: String,
+    pub role: ImageComponentRole,
+    pub checksum: String,
+    pub size_bytes: u64,
+    pub version: String,
+    pub runtime_abi: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,11 +224,17 @@ pub struct NodeAdvertisement {
     pub hosted_shards: Vec<ShardDescriptor>,
     #[serde(default)]
     pub model_shards: Vec<ModelShardInfo>,
+    #[serde(default)]
+    pub model_components: Vec<ModelComponentInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteHop {
     pub peer_id: String,
+    /// Stable physical-machine identity for placement validation. Multiple
+    /// peer/process identities on one computer share this value.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub machine_id: String,
     pub address: String,
     pub layers: LayerRange,
 }
@@ -240,6 +266,10 @@ pub struct PromptMetadata {
 pub struct ActivationRequest {
     pub protocol_version: u32,
     pub trace_id: Uuid,
+    /// Physical machine that originated the request. This distinguishes the
+    /// sole-requester local exception from an invalid sole-remote route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_machine_id: Option<String>,
     pub model_id: String,
     pub route: Vec<RouteHop>,
     pub current_hop_index: usize,
@@ -265,6 +295,7 @@ impl ActivationRequest {
         Self {
             protocol_version: PROTOCOL_VERSION,
             trace_id: Uuid::new_v4(),
+            origin_machine_id: None,
             model_id: model_id.into(),
             route,
             current_hop_index: 0,
@@ -440,6 +471,7 @@ mod tests {
     fn activation_request_response_roundtrip_json() {
         let route = vec![RouteHop {
             peer_id: "peer-a".to_owned(),
+            machine_id: "machine-a".to_owned(),
             address: "/ip4/127.0.0.1/tcp/10000".to_owned(),
             layers: LayerRange::new(0, 3).unwrap(),
         }];
@@ -455,6 +487,7 @@ mod tests {
                 rpc_worker_peer_ids: Vec::new(),
             }),
         );
+        request.origin_machine_id = Some("machine-a".to_owned());
         request.trace.push(TraceEvent {
             peer_id: "peer-a".to_owned(),
             layers: LayerRange::new(0, 3).unwrap(),
@@ -565,6 +598,7 @@ mod tests {
             capabilities: Some(capabilities),
             hosted_shards: Vec::new(),
             model_shards: Vec::new(),
+            model_components: Vec::new(),
         };
 
         let bytes = serde_json::to_vec(&advertisement).unwrap();

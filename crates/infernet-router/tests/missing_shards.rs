@@ -22,6 +22,7 @@ fn advertisement(peer_id: &str, model_id: &str, layers: LayerRange) -> NodeAdver
             seed_manifest: None,
         }],
         model_shards: Vec::new(),
+        model_components: Vec::new(),
     }
 }
 

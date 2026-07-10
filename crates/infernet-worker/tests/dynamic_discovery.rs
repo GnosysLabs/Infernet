@@ -28,7 +28,7 @@ fn dynamic_discovery_smoke_test() {
     let mut workers = Vec::new();
     let mut static_peers = Vec::new();
 
-    for layers in ["0:3", "3:6", "6:9", "9:12"] {
+    for (index, layers) in ["0:3", "3:6", "6:9", "9:12"].into_iter().enumerate() {
         let port = free_tcp_port();
         let log_path = std::env::temp_dir().join(format!(
             "infernet-dynamic-worker-{port}-{}.log",
@@ -36,6 +36,7 @@ fn dynamic_discovery_smoke_test() {
         ));
         let stdout = fs::File::create(&log_path).unwrap();
         let child = Command::new(binary)
+            .env("INFERNET_MACHINE_ID", format!("distributed-worker-{index}"))
             .args([
                 "serve",
                 "--model",
@@ -56,6 +57,7 @@ fn dynamic_discovery_smoke_test() {
     }
 
     let mut command = Command::new(binary);
+    command.env("INFERNET_MACHINE_ID", "distributed-requester");
     command.args([
         "infer",
         "--model",
@@ -88,6 +90,70 @@ fn dynamic_discovery_smoke_test() {
 }
 
 #[test]
+fn sole_local_route_waits_for_the_discovery_window() {
+    let binary = env!("CARGO_BIN_EXE_infernet-worker");
+    let topic = format!(
+        "infernet/test/sole-local/{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let port = free_tcp_port();
+    let log_path = std::env::temp_dir().join(format!("infernet-sole-local-{port}.log"));
+    let stdout = fs::File::create(&log_path).unwrap();
+    let child = Command::new(binary)
+        .env("INFERNET_MACHINE_ID", "sole-local-machine")
+        .args([
+            "serve",
+            "--model",
+            "grid-demo-12",
+            "--layers",
+            "0:12",
+            "--topic",
+            &topic,
+            "--p2p-listen",
+            &format!("/ip4/127.0.0.1/tcp/{port}"),
+        ])
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _worker = ChildGuard(child);
+    let static_peer = wait_for_static_peer(&log_path, "0:12");
+
+    let started = Instant::now();
+    let output = Command::new(binary)
+        .env("INFERNET_MACHINE_ID", "sole-local-machine")
+        .args([
+            "infer",
+            "--model",
+            "grid-demo-12",
+            "--prompt",
+            "local exception",
+            "--topic",
+            &topic,
+            "--static-peer",
+            &static_peer,
+            "--discovery-timeout-ms",
+            "1000",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "local inference failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(850),
+        "sole-local inference returned before its discovery window closed"
+    );
+}
+
+#[test]
 fn unreachable_next_hop_reports_forwarding_error() {
     let binary = env!("CARGO_BIN_EXE_infernet-worker");
     let topic = format!(
@@ -107,6 +173,7 @@ fn unreachable_next_hop_reports_forwarding_error() {
     let port = free_tcp_port();
     let stdout = fs::File::create(&log_path).unwrap();
     let child = Command::new(binary)
+        .env("INFERNET_MACHINE_ID", "unreachable-live-worker")
         .args([
             "serve",
             "--model",
@@ -129,13 +196,14 @@ fn unreachable_next_hop_reports_forwarding_error() {
         .to_peer_id()
         .to_string();
     let fake_peer = format!(
-        "{}@/ip4/127.0.0.1/tcp/9/p2p/{}#3:12",
+        "{}@/ip4/127.0.0.1/tcp/9/p2p/{}#3:12#machine=fake-remote-machine",
         fake_peer_id, fake_peer_id
     );
 
     thread::sleep(Duration::from_secs(4));
 
     let output = Command::new(binary)
+        .env("INFERNET_MACHINE_ID", "unreachable-requester")
         .args([
             "infer",
             "--model",
@@ -165,8 +233,69 @@ fn unreachable_next_hop_reports_forwarding_error() {
     assert!(
         stderr.contains("forward to")
             || stderr.contains("activation request to")
-            || stderr.contains("remote activation error"),
+            || stderr.contains("remote activation error")
+            || stderr.contains("no valid execution placement"),
         "expected libp2p forwarding error, got stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn one_remote_machine_never_receives_the_whole_request() {
+    let binary = env!("CARGO_BIN_EXE_infernet-worker");
+    let topic = format!(
+        "infernet/test/sole-remote/{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let port = free_tcp_port();
+    let log_path = std::env::temp_dir().join(format!("infernet-sole-remote-{port}.log"));
+    let stdout = fs::File::create(&log_path).unwrap();
+    let child = Command::new(binary)
+        .env("INFERNET_MACHINE_ID", "sole-remote-worker")
+        .args([
+            "serve",
+            "--model",
+            "grid-demo-12",
+            "--layers",
+            "0:12",
+            "--topic",
+            &topic,
+            "--p2p-listen",
+            &format!("/ip4/127.0.0.1/tcp/{port}"),
+        ])
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _worker = ChildGuard(child);
+    let static_peer = wait_for_static_peer(&log_path, "0:12");
+
+    let output = Command::new(binary)
+        .env("INFERNET_MACHINE_ID", "sole-remote-requester")
+        .args([
+            "infer",
+            "--model",
+            "grid-demo-12",
+            "--prompt",
+            "this must not run remotely",
+            "--topic",
+            &topic,
+            "--static-peer",
+            &static_peer,
+            "--discovery-timeout-ms",
+            "1000",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no valid execution placement")
+            || stderr.contains("second eligible physical machine"),
+        "expected sole-remote placement rejection, got stderr:\n{stderr}"
     );
 }
 
@@ -178,12 +307,17 @@ fn wait_for_static_peer(log: &std::path::Path, layers: &str) -> String {
                 .lines()
                 .find_map(|line| line.strip_prefix("peer_id="))
                 .map(str::to_owned);
+            let machine_id = contents
+                .lines()
+                .find_map(|line| line.strip_prefix("machine_id="))
+                .map(str::to_owned);
             let address = contents
                 .lines()
                 .find_map(|line| line.strip_prefix("libp2p_listen=/ip4/127.0.0.1"))
                 .map(|suffix| format!("/ip4/127.0.0.1{suffix}"));
-            if let (Some(peer_id), Some(address)) = (peer_id, address) {
-                return format!("{peer_id}@{address}#{layers}");
+            if let (Some(peer_id), Some(machine_id), Some(address)) = (peer_id, machine_id, address)
+            {
+                return format!("{peer_id}@{address}#{layers}#machine={machine_id}");
             }
         }
         thread::sleep(Duration::from_millis(100));

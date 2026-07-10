@@ -8,6 +8,11 @@ computer is one node in that grid. An official Infernet model can be present as
 many physical layer shards spread across many machines, and the scheduler builds
 an ordered route through the peers that can execute those layers.
 
+Execution is split across distinct eligible physical machines whenever at least
+two are available. A local-only route is allowed only when the requesting
+computer is itself the sole eligible machine. Infernet never sends another
+user's entire request to one remote machine as a fallback.
+
 The user experience should feel like a normal AI chat app. The network exists
 under the surface. Users choose an official model and send a message; Infernet
 discovers peers, verifies available shards, downloads only the executable shards
@@ -72,7 +77,10 @@ In the target architecture:
 - Downloaders immediately become seeders.
 - The network can route inference through the machines that collectively cover
   the model.
-- No single participating node needs to possess the whole model forever.
+- When multiple eligible physical machines are available, the route divides the
+  request between at least two of them.
+- A sole eligible machine may run locally only for its own request; a lone remote
+  machine never receives another user's whole request.
 
 Today, the prototype has the first version of that loop:
 
@@ -157,6 +165,12 @@ the first activation request to the first peer in that route. Each peer:
 2. loads/evaluates its local contiguous layer range
 3. records trace information
 4. forwards the activation to the next peer
+
+Peer identities from the same physical machine count as one execution machine.
+With two or more eligible physical machines, a valid route must split work across
+at least two of them. If the requester is the only eligible machine, it may run
+the request locally. If the only eligible machine is remote, the request waits or
+fails instead of routing the complete inference there.
 
 The final peer samples one token and returns it through the request chain. The
 client passes that token through the same sticky route until generation ends;
@@ -311,6 +325,12 @@ HTTP file server.
 
 The router builds an ordered sequence of peers for a requested model.
 
+It first groups eligible peer identities by physical machine. Distribution is a
+route requirement whenever at least two eligible machines are available; hop
+count and latency are optimized only after that requirement is satisfied. A
+single-machine route is valid only when that machine is the requester itself and
+no other eligible machine is available.
+
 It uses only `hosted_shards` that are executable:
 
 - model id must match
@@ -390,8 +410,8 @@ Required for development:
 - C++ compiler toolchain
 
 Infernet downloads official llama.cpp prebuilt binaries when available, but the
-Infernet split-layer bridge is an Infernet patch and may need to be built
-locally. Setup does not silently install OS-level build tools.
+Infernet split-layer bridge and pinned stable-diffusion.cpp image runtime may
+need to be built locally. Setup does not silently install OS-level build tools.
 
 Windows:
 
@@ -419,6 +439,51 @@ sudo apt-get install -y git cmake build-essential
 
 If a bridge dependency is missing, `npm run prepare-runtime` fails instead of
 launching a degraded app.
+
+### Preparing bundled runtimes
+
+Prepare both the chat and image sidecars:
+
+```sh
+npm --prefix infernet-ui run prepare-runtime
+```
+
+To prepare only the image runtime:
+
+```sh
+npm --prefix infernet-ui run prepare-image-runtime
+```
+
+The image preparation script checks out stable-diffusion.cpp commit
+`cc734292286f85f9c48305d94d7fd22f42838522`, reuses the incremental build under
+`target/stable-diffusion.cpp-runtime`, and installs the Tauri sidecar as
+`infernet-ui/src-tauri/binaries/sd-cli-<target-triple>`. On Apple Silicon it
+builds a static arm64 executable with Metal enabled. Native Linux and Windows
+hosts retain a CPU build path; cross-target preparation requires a separately
+verified native executable from the target platform.
+
+The build plan can be inspected without changing files:
+
+```sh
+node scripts/prepare-stable-diffusion-runtime.mjs --dry-run
+```
+
+On first launch, the desktop app blocks access to chat, image generation, and
+settings while it downloads and verifies both official model packages. The
+7,850,198,884-byte Z-Image package resumes partial downloads and must match all
+three pinned SHA-256 checksums before onboarding completes. Requester-local
+image generation is allowed only after a discovery window confirms this
+computer is the sole eligible physical machine. If another eligible machine is
+online, the current build refuses the request until the role-scoped
+multi-machine image runtime is connected.
+
+An external development binary is accepted only with an explicit opt-in:
+
+```sh
+INFERNET_ALLOW_EXTERNAL_SD_RUNTIME=1 \
+INFERNET_SD_CLI=/path/to/sd-cli \
+npm --prefix infernet-ui run prepare-image-runtime
+```
 
 ## Running The Desktop App
 
@@ -614,8 +679,10 @@ sure every machine trusts the same Infernet release manifest.
 ### A route is missing `0:N`
 
 No peer is advertising executable shard coverage for those layers. Adding a
-model name is not enough. At least one peer must have verified `.infershard`
-packages for the required layer ranges.
+model name is not enough. The eligible execution set must collectively have
+verified `.infershard` packages for the required layer ranges. If that set has
+only one machine, it is usable only when it is the requester itself; one remote
+host is not a valid whole-request route.
 
 ### An official model download reaches 100% and keeps working
 

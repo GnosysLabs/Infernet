@@ -247,9 +247,10 @@ impl ModelManifest {
         let target_layers = match self.runtime_kind {
             RuntimeKind::Demo => 3,
             // Until partial-graph execution is proven for each llama.cpp architecture,
-            // keep imported GGUF models in one executable package. This avoids
-            // duplicating global tensors into every transformer-layer shard and also
-            // gives unsupported split architectures a correct full-model fallback.
+            // keep imported GGUF models in one executable compatibility package. This
+            // avoids duplicating global tensors into every transformer-layer shard; it
+            // is a storage decision, not permission to send a whole request to one
+            // remote machine instead of splitting across eligible physical machines.
             RuntimeKind::LlamaCpp => self.layer_count,
         };
 
