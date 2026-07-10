@@ -41,7 +41,7 @@ const runtimeLockPath = resolve(
   "llama.cpp-runtime",
   `.infernet-llama-runtime-${targetTriple}.lock`,
 );
-const runtimePatchVersion = "infernet-persistent-local-layer-workers-v10";
+const runtimePatchVersion = "infernet-persistent-local-layer-workers-v12";
 const buildRoot = resolve(repoRoot, "target", "llama.cpp-runtime");
 const sourceDir = join(buildRoot, "llama.cpp");
 const downloadDir = join(buildRoot, "downloads");
@@ -524,6 +524,9 @@ function patchModelLoader() {
   loader = replaceOnce(loader,
     "        if (!t_meta) {\n            if (flags & TENSOR_NOT_REQUIRED) {\n                return nullptr;\n            }\n            throw std::runtime_error(format(\"missing tensor '%s'\", tn.str().c_str()));\n        }\n",
     "        if (!t_meta) {\n            if ((flags & TENSOR_SKIP) || (flags & TENSOR_NOT_REQUIRED)) {\n                return nullptr;\n            }\n            throw std::runtime_error(format(\"missing tensor '%s'\", tn.str().c_str()));\n        }\n");
+  loader = replaceOnce(loader,
+    "            n_created++;\n\n            return nullptr;\n        }\n",
+    "            if (!(flags & TENSOR_SKIP)) {\n                n_created++;\n            }\n\n            return nullptr;\n        }\n");
   writeFileSync(loaderPath, loader);
 
   const modelPath = join(sourceDir, "src", "llama-model.cpp");
@@ -641,6 +644,9 @@ function patchGemma4Model() {
     "    output = create_tensor(tn(LLM_TENSOR_OUTPUT, \"weight\"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);\n",
     "    const bool infernet_partial = params.infernet_partial;\n    const int infernet_start = infernet_partial ? (int) params.infernet_layer_start : 0;\n    const int infernet_end = infernet_partial ? std::min((int) params.infernet_layer_end, n_layer) : n_layer;\n    const bool infernet_needs_output = !infernet_partial || infernet_end >= n_layer;\n    auto infernet_layer_flags = [&](int il) { return infernet_partial && (il < infernet_start || il >= infernet_end) ? TENSOR_SKIP : 0; };\n\n    output = create_tensor(tn(LLM_TENSOR_OUTPUT, \"weight\"), {n_embd, n_vocab}, infernet_needs_output ? TENSOR_NOT_REQUIRED : TENSOR_SKIP);\n");
   text = replaceOnce(text,
+    "    if (output == NULL) {\n        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, \"weight\"), {n_embd, n_vocab}, TENSOR_DUPLICATED);\n    }\n",
+    "    if (output == NULL && infernet_needs_output) {\n        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, \"weight\"), {n_embd, n_vocab}, TENSOR_DUPLICATED);\n    }\n");
+  text = replaceOnce(text,
     "    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, \"weight\"), {n_embd, n_vocab}, 0);\n",
     "    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, \"weight\"), {n_embd, n_vocab}, 0);\n");
   text = replaceOnce(text,
@@ -676,6 +682,15 @@ function patchGemma4Model() {
     .replaceAll("{n_embd,   n_ff}, 0)", "{n_embd,   n_ff}, flags)")
     .replaceAll("{  n_ff, n_embd}, 0)", "{  n_ff, n_embd}, flags)")
     .replaceAll("{n_embd}, 0)", "{n_embd}, flags)");
+  text = text
+    .replaceAll("{n_embd,   n_ff_cur}, 0)", "{n_embd,   n_ff_cur}, flags)")
+    .replaceAll("{n_ff_cur, n_embd}, 0)", "{n_ff_cur, n_embd}, flags)")
+    .replaceAll(
+      "tn(LLM_TENSOR_FFN_GATE_INP, \"weight\", i), {n_embd, n_expert}, TENSOR_NOT_REQUIRED)",
+      "tn(LLM_TENSOR_FFN_GATE_INP, \"weight\", i), {n_embd, n_expert}, TENSOR_NOT_REQUIRED | flags)"
+    )
+    .replaceAll("{n_embd, n_ff_exp, n_expert}, 0)", "{n_embd, n_ff_exp, n_expert}, flags)")
+    .replaceAll("{n_ff_exp, n_embd, n_expert}, 0)", "{n_ff_exp, n_embd, n_expert}, flags)");
   text = replaceAll(
     text,
     "        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, \"weight\", i), {n_embd}, flags);\n\n        // note: use_alternative_attention (v_proj is optional, if it's not present, use k_proj)\n        const int flags = infernet_layer_flags(i);\n",
