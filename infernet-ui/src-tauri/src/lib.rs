@@ -2866,12 +2866,26 @@ fn emit_model_import_progress(
     downloaded_bytes: u64,
     total_bytes: Option<u64>,
 ) {
+    let model_id = model_id.into();
+    let stage = stage.into();
+    let detail = detail.into();
+    if let Some(total_bytes) = total_bytes {
+        let percent = if total_bytes == 0 {
+            0
+        } else {
+            downloaded_bytes.saturating_mul(100) / total_bytes
+        };
+        println!(
+            "model_download_progress model_id={} stage={} downloaded_bytes={} total_bytes={} percent={}",
+            model_id, stage, downloaded_bytes, total_bytes, percent
+        );
+    }
     let _ = app.emit(
         "infernet-model-import-progress",
         ModelImportProgress {
-            model_id: model_id.into(),
-            stage: stage.into(),
-            detail: detail.into(),
+            model_id,
+            stage,
+            detail,
             downloaded_bytes,
             total_bytes,
         },

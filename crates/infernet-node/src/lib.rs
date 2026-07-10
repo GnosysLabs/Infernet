@@ -3863,20 +3863,12 @@ fn handle_grid_event(
             }
             registry.merge(observed);
         }
-        SwarmEvent::Behaviour(GridBehaviourEvent::Identify(identify::Event::Error {
-            peer_id,
-            error,
-            ..
-        })) => {
-            eprintln!("libp2p_identify_failed peer_id={peer_id} error={error}");
-        }
-        SwarmEvent::Behaviour(GridBehaviourEvent::Ping(ping::Event {
-            peer,
-            result: Err(error),
-            ..
-        })) => {
-            eprintln!("libp2p_ping_failed peer_id={peer} error={error}");
-        }
+        // Public networks inevitably contain stale and incompatible peers.
+        // Identify/Ping negotiation failures are expected compatibility
+        // signals, not actionable application errors, so keep them out of the
+        // user-facing development console.
+        SwarmEvent::Behaviour(GridBehaviourEvent::Identify(identify::Event::Error { .. })) => {}
+        SwarmEvent::Behaviour(GridBehaviourEvent::Ping(ping::Event { result: Err(_), .. })) => {}
         SwarmEvent::Behaviour(GridBehaviourEvent::Gossipsub(gossipsub::Event::Message {
             message,
             ..
