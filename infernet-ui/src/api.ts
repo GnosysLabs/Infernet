@@ -27,6 +27,9 @@ export const emptySnapshot: GridSnapshot = {
     maxStorageBytes: 0,
     currentUploads: 0,
     currentDownloads: 0,
+    bytesServed: 0,
+    chunksServed: 0,
+    lastServedUnixMs: null,
     replicationHealth: [],
   },
 };

@@ -34,7 +34,10 @@ export interface PeerView {
 export interface MachineView {
   peerId: string;
   shortPeerId: string;
+  machineId?: string | null;
   isLocal: boolean;
+  connectionStatus: "connected" | "reconnecting" | "unreachable";
+  lastSeenSeconds: number;
   computeBackend: string;
   deviceName: string;
   logicalCpuCores: number;
@@ -100,6 +103,9 @@ export interface DistributionSnapshot {
   maxStorageBytes: number;
   currentUploads: number;
   currentDownloads: number;
+  bytesServed: number;
+  chunksServed: number;
+  lastServedUnixMs?: number | null;
   replicationHealth: ReplicationHealthView[];
 }
 

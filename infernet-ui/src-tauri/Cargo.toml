@@ -19,6 +19,7 @@ infernet-node.workspace = true
 infernet-protocol.workspace = true
 infernet-router.workspace = true
 futures.workspace = true
+if-addrs.workspace = true
 libp2p.workspace = true
 serde.workspace = true
 serde_json.workspace = true

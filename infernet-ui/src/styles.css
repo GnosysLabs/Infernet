@@ -1937,10 +1937,100 @@ summary:focus-visible {
 .machine-row-main span:not(.machine-backend),
 .machine-capacity span,
 .machine-role,
+.machine-model-detail,
+.machine-transfer-progress small,
 .machine-row code {
   color: var(--muted);
   font-size: 10px;
   line-height: 1.35;
+}
+
+.machine-state-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.machine-state,
+.network-model-status {
+  border: 1px solid rgba(114, 132, 153, 0.22);
+  border-radius: 6px;
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  font-weight: 720;
+  line-height: 1;
+  padding: 5px 7px;
+  white-space: nowrap;
+}
+
+.machine-state i,
+.network-model-status i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #6f8092;
+  flex: none;
+}
+
+.machine-state.connected,
+.machine-state.ready,
+.network-model-status.available {
+  border-color: rgba(86, 211, 143, 0.25);
+  background: rgba(86, 211, 143, 0.07);
+  color: #91e4b6;
+}
+
+.machine-state.connected i,
+.machine-state.ready i,
+.network-model-status.available i {
+  background: var(--success);
+}
+
+.machine-state.serving {
+  border-color: rgba(34, 184, 173, 0.3);
+  background: rgba(34, 184, 173, 0.09);
+  color: #8be0da;
+}
+
+.machine-state.serving i {
+  background: var(--accent);
+  box-shadow: 0 0 0 3px rgba(34, 184, 173, 0.12);
+}
+
+.machine-state.waiting,
+.network-model-status.downloading {
+  border-color: rgba(246, 190, 83, 0.28);
+  background: rgba(246, 190, 83, 0.07);
+  color: #e9c982;
+}
+
+.machine-state.waiting i,
+.network-model-status.downloading i {
+  background: #e2ad4c;
+}
+
+.machine-state.error,
+.network-model-status.missing {
+  border-color: rgba(255, 116, 107, 0.28);
+  background: rgba(255, 116, 107, 0.07);
+  color: #ffaaa4;
+}
+
+.machine-state.error i,
+.network-model-status.missing i {
+  background: var(--danger);
+}
+
+.machine-model-detail {
+  margin: 0;
+}
+
+.machine-transfer-progress {
+  display: grid;
+  gap: 6px;
 }
 
 .machine-role {
@@ -2133,7 +2223,82 @@ summary:focus-visible {
   background: var(--surface);
   display: grid;
   gap: 13px;
+  margin-top: 16px;
   padding: 18px;
+}
+
+.network-model-panel {
+  display: grid;
+  gap: 16px;
+}
+
+.network-model-heading {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 18px;
+}
+
+.network-model-heading > div {
+  display: grid;
+  gap: 6px;
+}
+
+.network-model-heading strong {
+  color: var(--text);
+  font-size: 17px;
+}
+
+.network-model-heading p {
+  max-width: 66ch;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 0;
+}
+
+.network-machine-list {
+  grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
+}
+
+.model-serving-summary {
+  align-items: center;
+  background: rgba(31, 196, 187, 0.06);
+  border: 1px solid rgba(31, 196, 187, 0.18);
+  border-radius: 14px;
+  display: flex;
+  justify-content: space-between;
+  margin-top: 18px;
+  padding: 12px 14px;
+}
+
+.model-serving-summary > span {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+}
+
+.serving-pulse {
+  align-items: center;
+  display: flex;
+  gap: 9px;
+}
+
+.serving-pulse i {
+  background: var(--text-muted);
+  border-radius: 999px;
+  height: 8px;
+  width: 8px;
+}
+
+.serving-pulse.active i {
+  animation: networkPulse 1.4s ease-in-out infinite;
+  background: var(--accent);
+  box-shadow: 0 0 0 5px rgba(31, 196, 187, 0.12);
+}
+
+@keyframes networkPulse {
+  0%, 100% { opacity: 0.55; transform: scale(0.88); }
+  50% { opacity: 1; transform: scale(1.12); }
 }
 
 .storage-overview-heading {
@@ -2314,6 +2479,14 @@ summary:focus-visible {
 
   .local-model-row {
     grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .network-model-heading {
+    grid-template-columns: 1fr;
+  }
+
+  .network-model-status {
+    justify-self: start;
   }
 
   .local-model-meta {

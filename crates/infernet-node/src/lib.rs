@@ -2,18 +2,21 @@ pub mod capabilities;
 pub mod llama_server_runtime;
 pub mod model_distribution;
 pub mod rpc_runtime;
+pub mod rpc_tunnel;
 
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::mem;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{fs, io};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -36,10 +39,14 @@ use infernet_runtime::{DemoRuntime, LayerRuntime, activation_checksum};
 use libp2p::{
     Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
     core::{connection::ConnectedPoint, transport::ListenerId},
-    gossipsub, identity, mdns,
+    dcutr, gossipsub, identify, identity, mdns,
     multiaddr::Protocol,
-    noise, request_response,
-    swarm::{NetworkBehaviour, SwarmEvent},
+    noise, ping, relay, request_response,
+    swarm::{
+        NetworkBehaviour, SwarmEvent,
+        behaviour::toggle::Toggle,
+        dial_opts::{DialOpts, PeerCondition},
+    },
     tcp, yamux,
 };
 pub use model_distribution::{
@@ -59,8 +66,9 @@ use tokio::time::{Instant, interval, sleep};
 
 pub use capabilities::{
     PINNED_GGML_RPC_PROTOCOL_VERSION, clear_local_llama_rpc_endpoint,
-    configured_llama_rpc_endpoint, detect_node_capabilities, set_local_inference_active,
-    set_local_llama_rpc_endpoint, set_local_rpc_active, validate_llama_rpc_endpoint,
+    configured_llama_rpc_endpoint, detect_node_capabilities, local_llama_rpc_target,
+    set_local_inference_active, set_local_llama_rpc_endpoint, set_local_rpc_active,
+    validate_llama_rpc_endpoint,
 };
 pub use llama_server_runtime::{
     LlamaServerCompletion, LlamaServerConfig, complete_with_persistent_llama_server,
@@ -70,8 +78,13 @@ pub use rpc_runtime::{
     INFERNET_LLAMA_RPC_RUNTIME_ABI, LLAMA_RPC_DEFAULT_PORT, LLAMA_RPC_PROTOCOL_VERSION,
     LlamaRpcServer, LlamaRpcServerConfig, find_llama_rpc_server_binary, spawn_llama_rpc_server,
 };
+pub use rpc_tunnel::{
+    RPC_TUNNEL_PROTOCOL, RpcTunnelAdmission, RpcTunnelAdmissionLimits, RpcTunnelProxy,
+    RpcTunnelProxyConfig, RpcTunnelTicket, RpcTunnelWorker, RpcTunnelWorkerConfig,
+};
 
 pub type ModelDistributionReadiness = oneshot::Sender<std::result::Result<String, String>>;
+pub type ModelDistributionRegistryObserver = Arc<dyn Fn(ShardRegistry) + Send + Sync>;
 
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
@@ -93,10 +106,24 @@ pub struct DiscoveryConfig {
     pub publish_interval: Duration,
     pub advertise_listen_addresses: bool,
     pub dial_discovered_peers: bool,
+    /// Enable local mDNS discovery. Long-lived desktop services generally
+    /// enable it; one-shot fetch/infer swarms may disable it to avoid spawning
+    /// short-lived interface watchers.
+    pub enable_mdns: bool,
     pub relay_advertisements: bool,
+    /// Run a Circuit Relay v2 hop service. This is intended for explicitly
+    /// deployed public bootstrap nodes, never ordinary desktop nodes.
+    pub relay_server: bool,
+    /// Public relay server multiaddresses. Each address must end in the
+    /// relay's `/p2p/<peer-id>` component. A reservation is maintained on
+    /// every configured relay while direct TCP/QUIC paths remain enabled.
+    pub relay_peers: Vec<String>,
     /// Explicitly trusted llama.cpp RPC backends selected by the caller for
     /// this request. These are validated again before they cross the network.
     pub rpc_endpoints: Vec<String>,
+    /// Authenticated worker identities selected for RPC-over-libp2p. The
+    /// coordinator creates loopback proxies for these peers.
+    pub rpc_worker_peer_ids: Vec<String>,
     /// Exact route selected alongside `rpc_endpoints`. This prevents a second
     /// discovery pass from switching coordinators after the RPC plan is built.
     pub planned_route: Option<Vec<RouteHop>>,
@@ -113,8 +140,12 @@ impl DiscoveryConfig {
             publish_interval: Duration::from_millis(750),
             advertise_listen_addresses: true,
             dial_discovered_peers: true,
+            enable_mdns: true,
             relay_advertisements: false,
+            relay_server: false,
+            relay_peers: Vec::new(),
             rpc_endpoints: Vec::new(),
+            rpc_worker_peer_ids: Vec::new(),
             planned_route: None,
         }
     }
@@ -129,6 +160,31 @@ impl DiscoveryConfig {
     ) -> Result<()> {
         self.rpc_endpoints =
             normalize_trusted_rpc_endpoints(&endpoints.into_iter().collect::<Vec<_>>())?;
+        Ok(())
+    }
+
+    pub fn set_rpc_worker_peer_ids(
+        &mut self,
+        peers: impl IntoIterator<Item = String>,
+    ) -> Result<()> {
+        let mut normalized = Vec::new();
+        let mut seen = HashSet::new();
+        for peer in peers {
+            let peer = peer.trim();
+            peer.parse::<PeerId>()
+                .with_context(|| format!("invalid RPC worker peer id {peer}"))?;
+            if seen.insert(peer.to_owned()) {
+                normalized.push(peer.to_owned());
+            }
+        }
+        if normalized.len() > MAX_TRUSTED_RPC_ENDPOINTS {
+            bail!(
+                "distributed RPC requested {} workers; maximum is {}",
+                normalized.len(),
+                MAX_TRUSTED_RPC_ENDPOINTS
+            );
+        }
+        self.rpc_worker_peer_ids = normalized;
         Ok(())
     }
 
@@ -192,9 +248,131 @@ pub struct ModelSourceFetchResult {
     pub size_bytes: u64,
 }
 
+/// Process-wide counters for model bytes accepted by the libp2p response
+/// behaviour for serving to peers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ModelServingTelemetry {
+    pub bytes_served: u64,
+    pub chunks_served: u64,
+    pub last_activity_unix_ms: Option<u64>,
+}
+
+struct ModelServingTelemetryCounters {
+    bytes_served: AtomicU64,
+    chunks_served: AtomicU64,
+    last_activity_unix_ms: AtomicU64,
+}
+
+impl ModelServingTelemetryCounters {
+    const fn new() -> Self {
+        Self {
+            bytes_served: AtomicU64::new(0),
+            chunks_served: AtomicU64::new(0),
+            last_activity_unix_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn record_chunk(&self, bytes: u64, activity_unix_ms: u64) {
+        if bytes == 0 {
+            return;
+        }
+        self.bytes_served.fetch_add(bytes, Ordering::Relaxed);
+        self.chunks_served.fetch_add(1, Ordering::Relaxed);
+        self.last_activity_unix_ms
+            .store(activity_unix_ms, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> ModelServingTelemetry {
+        let last_activity_unix_ms = self.last_activity_unix_ms.load(Ordering::Relaxed);
+        ModelServingTelemetry {
+            bytes_served: self.bytes_served.load(Ordering::Relaxed),
+            chunks_served: self.chunks_served.load(Ordering::Relaxed),
+            last_activity_unix_ms: (last_activity_unix_ms != 0).then_some(last_activity_unix_ms),
+        }
+    }
+}
+
+static MODEL_SERVING_TELEMETRY: ModelServingTelemetryCounters =
+    ModelServingTelemetryCounters::new();
+
+struct PersistentRpcTunnelSet {
+    worker_peer_ids: Vec<String>,
+    endpoints: Vec<String>,
+    _proxies: Vec<RpcTunnelProxy>,
+}
+
+static PERSISTENT_RPC_TUNNELS: OnceLock<Mutex<Option<PersistentRpcTunnelSet>>> = OnceLock::new();
+
+/// Returns process-wide model serving totals. The counters are monotonic for
+/// the lifetime of the process and include both full-source and shard chunks.
+pub fn model_serving_telemetry() -> ModelServingTelemetry {
+    MODEL_SERVING_TELEMETRY.snapshot()
+}
+
+async fn ensure_persistent_rpc_tunnels(
+    control: libp2p_stream::Control,
+    worker_peer_ids: &[String],
+) -> Result<Vec<String>> {
+    let state = PERSISTENT_RPC_TUNNELS.get_or_init(|| Mutex::new(None));
+    if let Some(existing) = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .filter(|existing| existing.worker_peer_ids == worker_peer_ids)
+    {
+        return Ok(existing.endpoints.clone());
+    }
+
+    let mut proxies = Vec::with_capacity(worker_peer_ids.len());
+    let mut endpoints = Vec::with_capacity(worker_peer_ids.len());
+    for peer_id in worker_peer_ids {
+        let peer = peer_id
+            .parse::<PeerId>()
+            .with_context(|| format!("invalid selected RPC worker peer id {peer_id}"))?;
+        let proxy = RpcTunnelProxy::bind(
+            control.clone(),
+            RpcTunnelProxyConfig::new(peer, RpcTunnelTicket::default()),
+        )
+        .await
+        .with_context(|| format!("failed to start RPC tunnel proxy for worker {peer_id}"))?;
+        endpoints.push(proxy.llama_cpp_endpoint());
+        proxies.push(proxy);
+    }
+
+    *state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PersistentRpcTunnelSet {
+        worker_peer_ids: worker_peer_ids.to_vec(),
+        endpoints: endpoints.clone(),
+        _proxies: proxies,
+    });
+    Ok(endpoints)
+}
+
+pub fn stop_persistent_rpc_tunnels() {
+    if let Some(state) = PERSISTENT_RPC_TUNNELS.get() {
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+}
+
+fn model_serving_now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
 const MODEL_BLOB_CHUNK_BYTES: u32 = 4 * 1024 * 1024;
 const MODEL_BLOB_HEADER_MAX_BYTES: usize = 64 * 1024;
 const MODEL_FETCH_PEER_RETRY_COOLDOWN: Duration = Duration::from_secs(5);
+const IDENTIFY_PROTOCOL: &str = "/infernet/identify/1";
+const IDENTIFY_AGENT: &str = concat!("infernet/", env!("CARGO_PKG_VERSION"));
+const PUBLIC_RELAY_RESERVATION_DURATION: Duration = Duration::from_secs(2 * 60 * 60);
+const PUBLIC_RELAY_CIRCUIT_DURATION: Duration = Duration::from_secs(2 * 60 * 60);
+const PUBLIC_RELAY_MAX_CIRCUIT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const LLAMA_BRIDGE_EXECUTION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const LLAMA_BRIDGE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const LLAMA_BRIDGE_MAX_LIBRARY_THREADS: usize = 4;
@@ -213,11 +391,17 @@ impl Drop for RemoveFileOnDrop {
 
 #[derive(NetworkBehaviour)]
 struct GridBehaviour {
+    relay_client: relay::client::Behaviour,
+    relay_server: Toggle<relay::Behaviour>,
+    dcutr: dcutr::Behaviour,
+    identify: identify::Behaviour,
+    ping: ping::Behaviour,
     gossipsub: gossipsub::Behaviour,
-    mdns: mdns::tokio::Behaviour,
+    mdns: Toggle<mdns::tokio::Behaviour>,
     activation: request_response::json::Behaviour<ActivationRequest, ActivationResponse>,
     model: request_response::json::Behaviour<ModelShardRequest, ModelShardResponse>,
     blob: request_response::Behaviour<ModelBlobCodec>,
+    rpc_tunnel: libp2p_stream::Behaviour,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -485,9 +669,14 @@ pub async fn run_worker_node(mut discovery: DiscoveryConfig, worker: WorkerConfi
     let mut registry = ShardRegistry::new();
     registry.extend(discovery.static_peers.clone());
 
-    let mut swarm = build_grid_swarm(discovery.keypair.clone(), &topic)?;
+    let mut swarm = build_grid_swarm(
+        discovery.keypair.clone(),
+        &topic,
+        discovery.relay_server,
+        discovery.enable_mdns,
+    )?;
     add_static_peer_addresses(&mut swarm, &discovery.static_peers);
-    listen_on(&mut swarm, &discovery.p2p_listen)?;
+    start_grid_listeners(&mut swarm, &discovery)?;
     let shard_cache = worker
         .shard_cache
         .clone()
@@ -563,7 +752,7 @@ pub async fn run_model_distribution_node(
     cache_config: ShardCacheConfig,
 ) -> Result<()> {
     let mut readiness = None;
-    run_model_distribution_node_inner(discovery, cache_config, &mut readiness).await
+    run_model_distribution_node_inner(discovery, cache_config, &mut readiness, None).await
 }
 
 pub async fn run_model_distribution_node_with_readiness(
@@ -572,7 +761,34 @@ pub async fn run_model_distribution_node_with_readiness(
     readiness: ModelDistributionReadiness,
 ) -> Result<()> {
     let mut readiness = Some(readiness);
-    let result = run_model_distribution_node_inner(discovery, cache_config, &mut readiness).await;
+    let result =
+        run_model_distribution_node_inner(discovery, cache_config, &mut readiness, None).await;
+
+    if let Err(error) = &result {
+        signal_model_distribution_readiness(&mut readiness, Err(format!("{error:#}")));
+    }
+
+    result
+}
+
+/// Runs the long-lived model service and publishes its current peer registry
+/// to the owner. Desktop clients use this instead of creating a second swarm
+/// for every UI refresh, which otherwise causes visible connection churn and
+/// can race active model transfers.
+pub async fn run_model_distribution_node_with_readiness_and_registry(
+    discovery: DiscoveryConfig,
+    cache_config: ShardCacheConfig,
+    readiness: ModelDistributionReadiness,
+    registry_observer: ModelDistributionRegistryObserver,
+) -> Result<()> {
+    let mut readiness = Some(readiness);
+    let result = run_model_distribution_node_inner(
+        discovery,
+        cache_config,
+        &mut readiness,
+        Some(&registry_observer),
+    )
+    .await;
 
     if let Err(error) = &result {
         signal_model_distribution_readiness(&mut readiness, Err(format!("{error:#}")));
@@ -585,10 +801,12 @@ async fn run_model_distribution_node_inner(
     mut discovery: DiscoveryConfig,
     cache_config: ShardCacheConfig,
     readiness: &mut Option<ModelDistributionReadiness>,
+    registry_observer: Option<&ModelDistributionRegistryObserver>,
 ) -> Result<()> {
     let topic = gossipsub::IdentTopic::new(discovery.topic.clone());
     let mut registry = ShardRegistry::new();
     registry.extend(discovery.static_peers.clone());
+    notify_registry_observer(registry_observer, &registry);
     let shard_cache = ShardCache::new(cache_config)?;
     let peer_id = discovery.peer_id().to_string();
 
@@ -597,9 +815,16 @@ async fn run_model_distribution_node_inner(
     }
     refresh_advertisement_model_shards(&mut discovery.advertisement, Some(&shard_cache))?;
 
-    let mut swarm = build_grid_swarm(discovery.keypair.clone(), &topic)?;
+    let mut swarm = build_grid_swarm(
+        discovery.keypair.clone(),
+        &topic,
+        discovery.relay_server,
+        discovery.enable_mdns,
+    )?;
     add_static_peer_addresses(&mut swarm, &discovery.static_peers);
-    let listener_id = listen_on(&mut swarm, &discovery.p2p_listen)?;
+    let listener_id = start_grid_listeners(&mut swarm, &discovery)?;
+    let rpc_tunnel_control = swarm.behaviour().rpc_tunnel.new_control();
+    let _rpc_tunnel_worker = start_local_rpc_tunnel_worker(&swarm)?;
 
     let mut publish_interval = interval(discovery.publish_interval);
     let mut static_peer_dial_interval = interval(Duration::from_secs(10));
@@ -696,16 +921,53 @@ async fn run_model_distribution_node_inner(
                                 &mut pending_forwards,
                                 &local_completion_sender,
                                 &mut pending_local_activations,
+                                rpc_tunnel_control.clone(),
                             )?;
                         }
                     }
                 }
+                notify_registry_observer(registry_observer, &registry);
 
                 if let Some(address) = ready_address {
                     signal_model_distribution_readiness(readiness, Ok(address));
                 }
             }
         }
+    }
+}
+
+fn start_local_rpc_tunnel_worker(swarm: &Swarm<GridBehaviour>) -> Result<Option<RpcTunnelWorker>> {
+    let Some(endpoint) = local_llama_rpc_target().filter(|endpoint| endpoint.ready) else {
+        return Ok(None);
+    };
+    let host = endpoint
+        .host
+        .parse::<IpAddr>()
+        .with_context(|| format!("invalid process-local RPC host {}", endpoint.host))?;
+    let target = SocketAddr::new(host, endpoint.port);
+    if !target.ip().is_loopback() {
+        bail!("refusing non-loopback RPC tunnel target {target}");
+    }
+    let admission = RpcTunnelAdmission::allow_authenticated_peers(RpcTunnelAdmissionLimits {
+        max_sessions: 1,
+        max_sessions_per_peer: 1,
+    })?;
+    let mut control = swarm.behaviour().rpc_tunnel.new_control();
+    let incoming = control
+        .accept(RPC_TUNNEL_PROTOCOL)
+        .map_err(|_| anyhow!("RPC tunnel protocol was already registered"))?;
+    Ok(Some(RpcTunnelWorker::spawn(
+        incoming,
+        RpcTunnelWorkerConfig::new(target, admission),
+    )?))
+}
+
+fn notify_registry_observer(
+    observer: Option<&ModelDistributionRegistryObserver>,
+    registry: &ShardRegistry,
+) {
+    if let Some(observer) = observer {
+        observer(registry.clone());
     }
 }
 
@@ -726,9 +988,14 @@ pub async fn discover_for(mut config: DiscoveryConfig, timeout: Duration) -> Res
         registry.upsert(advertisement);
     }
 
-    let mut swarm = build_grid_swarm(config.keypair.clone(), &topic)?;
+    let mut swarm = build_grid_swarm(
+        config.keypair.clone(),
+        &topic,
+        config.relay_server,
+        config.enable_mdns,
+    )?;
     add_static_peer_addresses(&mut swarm, &config.static_peers);
-    listen_on(&mut swarm, &config.p2p_listen)?;
+    start_grid_listeners(&mut swarm, &config)?;
 
     let deadline = Instant::now() + timeout;
 
@@ -753,7 +1020,7 @@ pub async fn discover_for(mut config: DiscoveryConfig, timeout: Duration) -> Res
 }
 
 pub async fn fetch_model_shard_over_libp2p(
-    mut config: DiscoveryConfig,
+    config: DiscoveryConfig,
     cache_config: ShardCacheConfig,
     model_id: String,
     layers: LayerRange,
@@ -761,8 +1028,32 @@ pub async fn fetch_model_shard_over_libp2p(
     version: Option<String>,
     discovery_timeout: Duration,
 ) -> Result<ModelFetchResult> {
+    fetch_model_shard_over_libp2p_with_progress(
+        config,
+        cache_config,
+        model_id,
+        layers,
+        checksum,
+        version,
+        discovery_timeout,
+        |_, _| {},
+    )
+    .await
+}
+
+pub async fn fetch_model_shard_over_libp2p_with_progress(
+    mut config: DiscoveryConfig,
+    cache_config: ShardCacheConfig,
+    model_id: String,
+    layers: LayerRange,
+    checksum: Option<String>,
+    version: Option<String>,
+    discovery_timeout: Duration,
+    mut on_progress: impl FnMut(u64, u64) + Send,
+) -> Result<ModelFetchResult> {
     let cache = ShardCache::new(cache_config)?;
     if let Some(record) = cache.find(&model_id, layers, checksum.as_deref(), version.as_deref())? {
+        on_progress(record.info.size_bytes, record.info.size_bytes);
         return Ok(ModelFetchResult {
             shard: record.info.clone(),
             source_peer_id: "local-cache".to_owned(),
@@ -780,31 +1071,41 @@ pub async fn fetch_model_shard_over_libp2p(
     }
     refresh_advertisement_model_shards(&mut config.advertisement, Some(&cache))?;
 
-    let mut swarm = build_grid_swarm(config.keypair.clone(), &topic)?;
+    let mut swarm = build_grid_swarm(
+        config.keypair.clone(),
+        &topic,
+        config.relay_server,
+        config.enable_mdns,
+    )?;
     add_static_peer_addresses(&mut swarm, &config.static_peers);
-    listen_on(&mut swarm, &config.p2p_listen)?;
+    start_grid_listeners(&mut swarm, &config)?;
 
     let deadline = Instant::now() + discovery_timeout;
     let mut publish_interval = interval(config.publish_interval);
     let partial_dir = cache.config().root.join("tmp");
     fs::create_dir_all(&partial_dir)
         .with_context(|| format!("failed to create {}", partial_dir.display()))?;
+    let partial_identity = sanitize_path_segment(checksum.as_deref().unwrap_or("unresolved"));
     let partial_path = partial_dir.join(format!(
         "{}-{}-{}-{}.gguf.partial",
         sanitize_path_segment(&model_id),
         layers.start,
         layers.end,
-        uuid::Uuid::new_v4()
+        &partial_identity[..partial_identity.len().min(16)]
     ));
-    let _ = fs::remove_file(&partial_path);
-    let _partial_cleanup = RemoveFileOnDrop(partial_path.clone());
-    let mut downloaded_bytes = 0_u64;
+    // Keep a content-addressed partial file across restarts. The completed
+    // package is still SHA-256 verified before entering the cache, so resume
+    // never weakens package integrity.
+    let mut downloaded_bytes = fs::metadata(&partial_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
     let mut pending_request: Option<(
         request_response::OutboundRequestId,
         ModelShardCandidate,
         u64,
     )> = None;
     let mut failed_peers = HashMap::<String, Instant>::new();
+    let mut progress_started = false;
 
     loop {
         if pending_request.is_none() {
@@ -834,6 +1135,19 @@ pub async fn fetch_model_shard_over_libp2p(
                         candidate.shard.size_bytes,
                         cache.config().max_storage_bytes
                     );
+                }
+                if downloaded_bytes > candidate.shard.size_bytes {
+                    fs::remove_file(&partial_path).with_context(|| {
+                        format!(
+                            "failed to reset oversized partial {}",
+                            partial_path.display()
+                        )
+                    })?;
+                    downloaded_bytes = 0;
+                }
+                if !progress_started {
+                    on_progress(downloaded_bytes, candidate.shard.size_bytes);
+                    progress_started = true;
                 }
                 let request = ModelBlobRequest::new_shard(
                     model_id.clone(),
@@ -940,13 +1254,22 @@ pub async fn fetch_model_shard_over_libp2p(
                                 }
                                 append_source_chunk(&partial_path, &response.payload)?;
                                 downloaded_bytes = next_downloaded;
+                                on_progress(downloaded_bytes, candidate.shard.size_bytes);
 
                                 if downloaded_bytes >= candidate.shard.size_bytes {
-                                    let cache_record = cache.store_downloaded_file(
+                                    let cache_record = match cache.store_downloaded_file(
                                         &candidate.shard,
                                         &partial_path,
                                         candidate.seed_manifest.clone(),
-                                    )?;
+                                    ) {
+                                        Ok(record) => record,
+                                        Err(error) => {
+                                            // A complete file that fails its final digest must not
+                                            // poison every future resume attempt.
+                                            let _ = fs::remove_file(&partial_path);
+                                            return Err(error);
+                                        }
+                                    };
                                     refresh_advertisement_model_shards(&mut config.advertisement, Some(&cache))?;
                                     publish_local_advertisement(
                                         &mut swarm,
@@ -1047,9 +1370,14 @@ pub async fn fetch_model_source_over_libp2p(
     }
     refresh_advertisement_model_shards(&mut config.advertisement, Some(&cache))?;
 
-    let mut swarm = build_grid_swarm(config.keypair.clone(), &topic)?;
+    let mut swarm = build_grid_swarm(
+        config.keypair.clone(),
+        &topic,
+        config.relay_server,
+        config.enable_mdns,
+    )?;
     add_static_peer_addresses(&mut swarm, &config.static_peers);
-    listen_on(&mut swarm, &config.p2p_listen)?;
+    start_grid_listeners(&mut swarm, &config)?;
 
     let deadline = Instant::now() + discovery_timeout;
     let mut publish_interval = interval(config.publish_interval);
@@ -1290,8 +1618,10 @@ pub async fn infer_over_libp2p(
     hidden_size: usize,
     discovery_timeout: Duration,
 ) -> Result<InferenceResult> {
-    let rpc_endpoints = normalize_trusted_rpc_endpoints(&config.rpc_endpoints)?;
-    if !rpc_endpoints.is_empty() {
+    if !config.rpc_endpoints.is_empty() {
+        bail!("raw RPC endpoints cannot cross the network; select authenticated worker peers");
+    }
+    if !config.rpc_worker_peer_ids.is_empty() {
         validate_rpc_model_manifest(&manifest)?;
     }
 
@@ -1299,9 +1629,14 @@ pub async fn infer_over_libp2p(
     let mut registry = ShardRegistry::new();
     registry.extend(config.static_peers.clone());
 
-    let mut swarm = build_grid_swarm(config.keypair.clone(), &topic)?;
+    let mut swarm = build_grid_swarm(
+        config.keypair.clone(),
+        &topic,
+        config.relay_server,
+        config.enable_mdns,
+    )?;
     add_static_peer_addresses(&mut swarm, &config.static_peers);
-    listen_on(&mut swarm, &config.p2p_listen)?;
+    start_grid_listeners(&mut swarm, &config)?;
 
     let route = if let Some(route) = config.planned_route.clone() {
         validate_planned_route(&route, &manifest, &config.static_peers)?;
@@ -1332,7 +1667,8 @@ pub async fn infer_over_libp2p(
         Some(PromptMetadata {
             prompt,
             demo_mode,
-            rpc_endpoints,
+            rpc_endpoints: Vec::new(),
+            rpc_worker_peer_ids: config.rpc_worker_peer_ids.clone(),
         }),
     );
     let first_hop = request
@@ -1368,18 +1704,16 @@ fn normalize_trusted_rpc_endpoints(endpoints: &[String]) -> Result<Vec<String>> 
     for endpoint in endpoints {
         let endpoint = endpoint.trim();
         let (host, port) = endpoint.split_once(':').ok_or_else(|| {
-            anyhow!("llama RPC endpoint must use the private IPv4 host:port form")
+            anyhow!("llama RPC endpoint must use the loopback IPv4 host:port form")
         })?;
         if host.is_empty() || port.is_empty() || port.contains(':') {
-            bail!("llama RPC endpoint must use the private IPv4 host:port form");
+            bail!("llama RPC endpoint must use the loopback IPv4 host:port form");
         }
         let host = host.parse::<Ipv4Addr>().with_context(|| {
-            format!("llama RPC endpoint {endpoint:?} must use a private IPv4 address")
+            format!("llama RPC endpoint {endpoint:?} must use a loopback IPv4 address")
         })?;
         if !is_trusted_rpc_ipv4(host) {
-            bail!(
-                "llama RPC endpoint {endpoint:?} is not on a private LAN, link-local, or Tailscale address"
-            );
+            bail!("llama RPC endpoint {endpoint:?} is not process-local loopback");
         }
         if !port.bytes().all(|byte| byte.is_ascii_digit()) {
             bail!("llama RPC endpoint {endpoint:?} has an invalid port");
@@ -1438,9 +1772,7 @@ fn validate_planned_route(
 }
 
 fn is_trusted_rpc_ipv4(address: Ipv4Addr) -> bool {
-    let [first, second, _, _] = address.octets();
-    let carrier_grade_nat = first == 100 && (64..=127).contains(&second);
-    address.is_private() || address.is_link_local() || carrier_grade_nat
+    address.is_loopback()
 }
 
 fn validate_rpc_model_manifest(manifest: &ModelManifest) -> Result<()> {
@@ -2588,6 +2920,7 @@ fn handle_cached_activation_event(
     pending_forwards: &mut HashMap<request_response::OutboundRequestId, PendingOutbound>,
     completion_sender: &mpsc::UnboundedSender<CompletedLocalActivation>,
     pending_local_activations: &mut HashMap<uuid::Uuid, PendingLocalActivation>,
+    rpc_tunnel_control: libp2p_stream::Control,
 ) -> Result<()> {
     match network_event {
         ActivationNetworkEvent::Request { request, channel } => {
@@ -2601,6 +2934,7 @@ fn handle_cached_activation_event(
                 pending_forwards,
                 completion_sender,
                 pending_local_activations,
+                rpc_tunnel_control,
             )?;
         }
         ActivationNetworkEvent::Response {
@@ -2652,6 +2986,7 @@ fn handle_cached_activation_request(
     pending_forwards: &mut HashMap<request_response::OutboundRequestId, PendingOutbound>,
     completion_sender: &mpsc::UnboundedSender<CompletedLocalActivation>,
     pending_local_activations: &mut HashMap<uuid::Uuid, PendingLocalActivation>,
+    rpc_tunnel_control: libp2p_stream::Control,
 ) -> Result<()> {
     let trace_id = request.trace_id;
     if request
@@ -2676,6 +3011,25 @@ fn handle_cached_activation_request(
                 trace_id,
                 peer_id.to_owned(),
                 "the model coordinator is already processing a request".to_owned(),
+                request.trace,
+            ),
+        );
+        return Ok(());
+    }
+
+    if request
+        .prompt
+        .as_ref()
+        .is_some_and(|prompt| !prompt.rpc_endpoints.is_empty())
+    {
+        send_response(
+            swarm,
+            channel,
+            ActivationResponse::failure(
+                trace_id,
+                peer_id.to_owned(),
+                "raw RPC endpoints are forbidden; use authenticated Infernet worker identities"
+                    .to_owned(),
                 request.trace,
             ),
         );
@@ -2709,9 +3063,46 @@ fn handle_cached_activation_request(
     );
     let completion_sender = completion_sender.clone();
     let peer_id = peer_id.to_owned();
+    let worker_peer_ids = request
+        .prompt
+        .as_ref()
+        .map(|prompt| prompt.rpc_worker_peer_ids.clone())
+        .unwrap_or_default();
     set_local_inference_active(true);
-    tokio::task::spawn_blocking(move || {
-        let outcome = process_local_activation_steps(&worker, &peer_id, request);
+    tokio::spawn(async move {
+        let trace_id = request.trace_id;
+        let failure_trace = request.trace.clone();
+        let outcome = match ensure_persistent_rpc_tunnels(rpc_tunnel_control, &worker_peer_ids)
+            .await
+        {
+            Ok(endpoints) => {
+                let mut request = request;
+                if let Some(prompt) = request.prompt.as_mut() {
+                    prompt.rpc_endpoints = endpoints;
+                    prompt.rpc_worker_peer_ids.clear();
+                }
+                let processing_peer_id = peer_id.clone();
+                match tokio::task::spawn_blocking(move || {
+                    process_local_activation_steps(&worker, &processing_peer_id, request)
+                })
+                .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(error) => LocalActivationOutcome::Response(ActivationResponse::failure(
+                        trace_id,
+                        peer_id,
+                        format!("local inference task failed: {error}"),
+                        failure_trace,
+                    )),
+                }
+            }
+            Err(error) => LocalActivationOutcome::Response(ActivationResponse::failure(
+                trace_id,
+                peer_id,
+                format!("failed to prepare distributed RPC tunnels: {error:#}"),
+                failure_trace,
+            )),
+        };
         let _ = completion_sender.unbounded_send(CompletedLocalActivation { job_id, outcome });
     });
 
@@ -3152,47 +3543,14 @@ fn send_activation_request(
 
 fn send_activation_request_with_relays(
     swarm: &mut Swarm<GridBehaviour>,
-    activation_relays: &[NodeAdvertisement],
+    _activation_relays: &[NodeAdvertisement],
     hop: &RouteHop,
     request: ActivationRequest,
 ) -> Result<request_response::OutboundRequestId> {
-    let local_peer_id = swarm.local_peer_id().to_string();
-    let relay_hop = activation_relay_hop(&local_peer_id, activation_relays, hop);
-    let send_hop = relay_hop.as_ref().unwrap_or(hop);
-    if send_hop.peer_id != hop.peer_id {
-        println!(
-            "activation_relay target_peer={} relay_peer={} trace_id={}",
-            hop.peer_id, send_hop.peer_id, request.trace_id
-        );
-    }
-    send_activation_request(swarm, send_hop, request)
-}
-
-fn activation_relay_hop(
-    local_peer_id: &str,
-    activation_relays: &[NodeAdvertisement],
-    target_hop: &RouteHop,
-) -> Option<RouteHop> {
-    if route_hop_is_loopback(target_hop) {
-        return None;
-    }
-
-    activation_relays
-        .iter()
-        .filter(|relay| relay.peer_id != local_peer_id && relay.peer_id != target_hop.peer_id)
-        .find_map(|relay| {
-            relay.addresses.first().map(|address| RouteHop {
-                peer_id: relay.peer_id.clone(),
-                address: address.clone(),
-                layers: target_hop.layers,
-            })
-        })
-}
-
-fn route_hop_is_loopback(hop: &RouteHop) -> bool {
-    hop.address.contains("/ip4/127.")
-        || hop.address.contains("/ip6/::1")
-        || hop.address.contains("/ip6/0:0:0:0:0:0:0:1")
+    // Circuit Relay v2 and DCUtR are transport-level connections to the exact
+    // target PeerId. Never substitute an arbitrary bootstrap peer as an
+    // application-level activation hop.
+    send_activation_request(swarm, hop, request)
 }
 
 fn send_model_blob_request(
@@ -3256,11 +3614,19 @@ fn send_model_blob_response(
     channel: request_response::ResponseChannel<ModelBlobResponse>,
     response: ModelBlobResponse,
 ) {
-    if let Err(response) = swarm.behaviour_mut().blob.send_response(channel, response) {
-        eprintln!(
-            "failed to send model blob response request_id={} offset={} error={:?}",
-            response.request_id, response.offset, response.error
-        );
+    let served_bytes = response
+        .error
+        .is_none()
+        .then_some(response.payload.len() as u64)
+        .unwrap_or(0);
+    match swarm.behaviour_mut().blob.send_response(channel, response) {
+        Ok(()) => MODEL_SERVING_TELEMETRY.record_chunk(served_bytes, model_serving_now_unix_ms()),
+        Err(response) => {
+            eprintln!(
+                "failed to send model blob response request_id={} offset={} error={:?}",
+                response.request_id, response.offset, response.error
+            );
+        }
     }
 }
 
@@ -3317,7 +3683,6 @@ fn handle_grid_event(
         SwarmEvent::Behaviour(GridBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
             if dial_discovered_peers {
                 for (peer_id, address) in peers {
-                    swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                     swarm.add_peer_address(peer_id, address);
                 }
             }
@@ -3329,6 +3694,70 @@ fn handle_grid_event(
                     .gossipsub
                     .remove_explicit_peer(&peer_id);
             }
+        }
+        SwarmEvent::Behaviour(GridBehaviourEvent::RelayClient(
+            relay::client::Event::ReservationReqAccepted {
+                relay_peer_id,
+                renewal,
+                ..
+            },
+        )) => {
+            println!(
+                "libp2p_relay_reserved peer_id={} renewal={}",
+                relay_peer_id, renewal
+            );
+        }
+        SwarmEvent::Behaviour(GridBehaviourEvent::RelayServer(
+            relay::Event::ReservationReqAccepted {
+                src_peer_id,
+                renewed,
+            },
+        )) => {
+            println!(
+                "libp2p_relay_client_reserved peer_id={} renewal={}",
+                src_peer_id, renewed
+            );
+        }
+        SwarmEvent::Behaviour(GridBehaviourEvent::Dcutr(event)) => match event.result {
+            Ok(_) => println!("libp2p_direct_upgrade peer_id={}", event.remote_peer_id),
+            Err(error) => eprintln!(
+                "libp2p_direct_upgrade_failed peer_id={} error={error}",
+                event.remote_peer_id
+            ),
+        },
+        SwarmEvent::Behaviour(GridBehaviourEvent::Identify(identify::Event::Received {
+            peer_id,
+            info,
+            ..
+        })) => {
+            let mut observed = empty_advertisement(peer_id.to_string(), String::new());
+            for address in info.listen_addrs.into_iter().take(32) {
+                let address = match address.iter().last() {
+                    Some(Protocol::P2p(address_peer_id)) if address_peer_id != peer_id => continue,
+                    Some(Protocol::P2p(_)) => address,
+                    _ => address.with(Protocol::P2p(peer_id)),
+                };
+                let address_text = address.to_string();
+                if !observed.addresses.contains(&address_text) {
+                    observed.addresses.push(address_text);
+                }
+                swarm.add_peer_address(peer_id, address);
+            }
+            registry.merge(observed);
+        }
+        SwarmEvent::Behaviour(GridBehaviourEvent::Identify(identify::Event::Error {
+            peer_id,
+            error,
+            ..
+        })) => {
+            eprintln!("libp2p_identify_failed peer_id={peer_id} error={error}");
+        }
+        SwarmEvent::Behaviour(GridBehaviourEvent::Ping(ping::Event {
+            peer,
+            result: Err(error),
+            ..
+        })) => {
+            eprintln!("libp2p_ping_failed peer_id={peer} error={error}");
         }
         SwarmEvent::Behaviour(GridBehaviourEvent::Gossipsub(gossipsub::Event::Message {
             message,
@@ -3466,6 +3895,8 @@ fn handle_grid_event(
 fn build_grid_swarm(
     keypair: identity::Keypair,
     topic: &gossipsub::IdentTopic,
+    relay_server_enabled: bool,
+    enable_mdns: bool,
 ) -> Result<Swarm<GridBehaviour>> {
     let peer_id = keypair.public().to_peer_id();
     let mut swarm = SwarmBuilder::with_existing_identity(keypair)
@@ -3475,13 +3906,32 @@ fn build_grid_swarm(
             noise::Config::new,
             yamux::Config::default,
         )?
+        .with_quic()
         .with_dns()?
-        .with_behaviour(|key| {
+        .with_relay_client(noise::Config::new, yamux::Config::default)?
+        .with_behaviour(|key, relay_client| {
+            let relay_server = relay_server_enabled
+                .then(|| relay::Behaviour::new(peer_id, public_relay_server_config()))
+                .into();
+            let dcutr = dcutr::Behaviour::new(peer_id);
+            let identify = identify::Behaviour::new(
+                identify::Config::new_with_signed_peer_record(IDENTIFY_PROTOCOL.to_owned(), key)
+                    .with_agent_version(IDENTIFY_AGENT.to_owned())
+                    .with_push_listen_addr_updates(true),
+            );
+            let ping = ping::Behaviour::new(
+                ping::Config::new()
+                    .with_interval(Duration::from_secs(15))
+                    .with_timeout(Duration::from_secs(20)),
+            );
             let gossipsub = gossipsub::Behaviour::new(
                 gossipsub::MessageAuthenticity::Signed(key.clone()),
                 gossipsub::Config::default(),
             )?;
-            let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?;
+            let mdns = enable_mdns
+                .then(|| mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id))
+                .transpose()?
+                .into();
             let activation = request_response::json::Behaviour::new(
                 [(
                     StreamProtocol::new(ACTIVATION_PROTOCOL),
@@ -3509,11 +3959,17 @@ fn build_grid_swarm(
             );
 
             Ok(GridBehaviour {
+                relay_client,
+                relay_server,
+                dcutr,
+                identify,
+                ping,
                 gossipsub,
                 mdns,
                 activation,
                 model,
                 blob,
+                rpc_tunnel: libp2p_stream::Behaviour::new(),
             })
         })?
         .build();
@@ -3523,6 +3979,22 @@ fn build_grid_swarm(
     Ok(swarm)
 }
 
+fn public_relay_server_config() -> relay::Config {
+    relay::Config {
+        max_reservations: 4_096,
+        max_reservations_per_peer: 4,
+        reservation_duration: PUBLIC_RELAY_RESERVATION_DURATION,
+        max_circuits: 2_048,
+        max_circuits_per_peer: 16,
+        max_circuit_duration: PUBLIC_RELAY_CIRCUIT_DURATION,
+        // A model is transferred as authenticated libp2p streams. The relay
+        // default (128 KiB) is intentionally tiny and would sever the first
+        // model chunk, so public Infernet relays allow a full verified package.
+        max_circuit_bytes: PUBLIC_RELAY_MAX_CIRCUIT_BYTES,
+        ..relay::Config::default()
+    }
+}
+
 fn listen_on(swarm: &mut Swarm<GridBehaviour>, listen: &str) -> Result<ListenerId> {
     let p2p_listen = listen
         .parse::<Multiaddr>()
@@ -3530,6 +4002,122 @@ fn listen_on(swarm: &mut Swarm<GridBehaviour>, listen: &str) -> Result<ListenerI
     swarm
         .listen_on(p2p_listen)
         .with_context(|| format!("failed to start libp2p listener on {listen}"))
+}
+
+fn start_grid_listeners(
+    swarm: &mut Swarm<GridBehaviour>,
+    config: &DiscoveryConfig,
+) -> Result<ListenerId> {
+    let direct_address = config
+        .p2p_listen
+        .parse::<Multiaddr>()
+        .with_context(|| format!("invalid libp2p listen address {}", config.p2p_listen))?;
+    let direct_listener = listen_on(swarm, &config.p2p_listen)?;
+
+    if let Some(quic_address) = quic_listen_address(&direct_address) {
+        swarm
+            .listen_on(quic_address.clone())
+            .with_context(|| format!("failed to start libp2p QUIC listener on {quic_address}"))?;
+    }
+
+    if config.relay_server {
+        add_relay_server_external_addresses(swarm, config)?;
+    }
+
+    // The relay client associates one reservation with one direct relay
+    // connection. Starting two listeners for the same PeerId (for example an
+    // IP and DNS spelling of one bootstrap) can replace the first reservation
+    // inside libp2p, so reserve once per relay identity.
+    let mut seen_relays = HashSet::new();
+    for relay_peer in &config.relay_peers {
+        let (relay_peer_id, circuit_address) = relay_circuit_listen_address(relay_peer)?;
+        if !seen_relays.insert(relay_peer_id) {
+            continue;
+        }
+        swarm
+            .behaviour_mut()
+            .gossipsub
+            .add_explicit_peer(&relay_peer_id);
+        swarm
+            .listen_on(circuit_address.clone())
+            .with_context(|| format!("failed to reserve Infernet relay {circuit_address}"))?;
+        println!("libp2p_relay_reserving={circuit_address}");
+    }
+
+    Ok(direct_listener)
+}
+
+fn quic_listen_address(address: &Multiaddr) -> Option<Multiaddr> {
+    let mut quic = Multiaddr::empty();
+    let mut converted = false;
+    for protocol in address.iter() {
+        if converted {
+            // TCP encapsulations such as WebSocket cannot be mechanically
+            // translated into QUIC listen addresses.
+            return None;
+        }
+        match protocol {
+            Protocol::Tcp(port) => {
+                quic.push(Protocol::Udp(port));
+                quic.push(Protocol::QuicV1);
+                converted = true;
+            }
+            protocol => quic.push(protocol),
+        }
+    }
+    converted.then_some(quic)
+}
+
+fn relay_circuit_listen_address(relay_peer: &str) -> Result<(PeerId, Multiaddr)> {
+    let relay_address = relay_peer
+        .parse::<Multiaddr>()
+        .with_context(|| format!("invalid Infernet relay multiaddress {relay_peer}"))?;
+    if relay_address
+        .iter()
+        .any(|protocol| matches!(protocol, Protocol::P2pCircuit))
+    {
+        bail!(
+            "Infernet relay address must identify the relay itself, without /p2p-circuit: {relay_peer}"
+        );
+    }
+    let Some(Protocol::P2p(relay_peer_id)) = relay_address.iter().last() else {
+        bail!("Infernet relay address must end in /p2p/<relay-peer-id>: {relay_peer}");
+    };
+    if relay_address.iter().count() < 2 {
+        bail!("Infernet relay address is missing a transport: {relay_peer}");
+    }
+
+    Ok((relay_peer_id, relay_address.with(Protocol::P2pCircuit)))
+}
+
+fn add_relay_server_external_addresses(
+    swarm: &mut Swarm<GridBehaviour>,
+    config: &DiscoveryConfig,
+) -> Result<()> {
+    let local_peer_id = *swarm.local_peer_id();
+    let Some(advertisement) = config.advertisement.as_ref() else {
+        return Ok(());
+    };
+    for address in &advertisement.addresses {
+        let mut address = address
+            .parse::<Multiaddr>()
+            .with_context(|| format!("invalid relay server public address {address}"))?;
+        if address
+            .iter()
+            .any(|protocol| matches!(protocol, Protocol::P2pCircuit))
+        {
+            continue;
+        }
+        match address.iter().last() {
+            Some(Protocol::P2p(peer_id)) if peer_id != local_peer_id => {
+                bail!("relay server public address identifies {peer_id}, expected {local_peer_id}");
+            }
+            Some(Protocol::P2p(_)) => {}
+            _ => address.push(Protocol::P2p(local_peer_id)),
+        }
+        swarm.add_external_address(address);
+    }
+    Ok(())
 }
 
 fn publish_advertisement(
@@ -3606,6 +4194,30 @@ fn add_static_peer_addresses(
 ) {
     for advertisement in advertisements {
         add_advertisement_addresses(swarm, advertisement);
+
+        let Ok(peer_id) = advertisement.peer_id.parse::<PeerId>() else {
+            continue;
+        };
+        let dial_addresses = advertisement
+            .addresses
+            .iter()
+            .filter_map(|address| address.parse::<Multiaddr>().ok())
+            .collect::<Vec<_>>();
+        if dial_addresses.is_empty() {
+            continue;
+        }
+
+        // Configured bootstrap/static peers form the initial network mesh, so
+        // they are the only advertisements that should proactively connect.
+        // Periodic calls are harmless because peer-aware dialing is rejected
+        // while already connected or dialing.
+        swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+        let dial = DialOpts::peer_id(peer_id)
+            .condition(PeerCondition::DisconnectedAndNotDialing)
+            .addresses(dial_addresses)
+            .extend_addresses_through_behaviour()
+            .build();
+        let _ = swarm.dial(dial);
     }
 }
 
@@ -3617,11 +4229,9 @@ fn add_advertisement_addresses(
         return;
     };
 
-    swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
     for address in &advertisement.addresses {
         if let Ok(address) = address.parse::<Multiaddr>() {
-            swarm.add_peer_address(peer_id, address.clone());
-            let _ = swarm.dial(address);
+            swarm.add_peer_address(peer_id, address);
         }
     }
 }
@@ -3742,9 +4352,37 @@ fn hop_addresses(hop: &RouteHop) -> Result<Vec<Multiaddr>> {
         return Ok(Vec::new());
     }
 
-    Ok(vec![hop.address.parse::<Multiaddr>().with_context(
-        || format!("invalid route multiaddr {}", hop.address),
-    )?])
+    let mut address = hop
+        .address
+        .parse::<Multiaddr>()
+        .with_context(|| format!("invalid route multiaddr {}", hop.address))?;
+
+    // `request_response::send_request_with_addresses` already receives the
+    // destination PeerId separately. Its explicit dial addresses therefore
+    // must not repeat that PeerId as a trailing `/p2p/...` component. Keeping
+    // it causes libp2p to discard the otherwise-valid direct address and fall
+    // back to unrelated observed addresses (for example a stale private-IP
+    // address), which breaks worker-to-worker forwarding.
+    if let Some(Protocol::P2p(address_peer_id)) = address.iter().last() {
+        let route_peer_id = hop
+            .peer_id
+            .parse::<PeerId>()
+            .with_context(|| format!("invalid libp2p peer id {}", hop.peer_id))?;
+        if address_peer_id != route_peer_id {
+            bail!(
+                "route multiaddr identifies peer {}, expected {}",
+                address_peer_id,
+                route_peer_id
+            );
+        }
+        address.pop();
+    }
+
+    if address.is_empty() {
+        bail!("route multiaddr {} has no transport", hop.address);
+    }
+
+    Ok(vec![address])
 }
 
 fn sleep_until(deadline: Instant) -> tokio::time::Sleep {
@@ -3803,13 +4441,6 @@ mod tests {
             address: String::new(),
             layers: LayerRange::new(start, end).unwrap(),
         }
-    }
-
-    fn relay(peer_id: &str) -> NodeAdvertisement {
-        empty_advertisement(
-            peer_id.to_owned(),
-            format!("/ip4/203.0.113.10/tcp/9777/p2p/{peer_id}"),
-        )
     }
 
     fn official_rpc_fixture() -> (
@@ -3875,6 +4506,7 @@ mod tests {
                 prompt: "hello".to_owned(),
                 demo_mode: false,
                 rpc_endpoints: vec!["192.168.1.20:50052".to_owned()],
+                rpc_worker_peer_ids: Vec::new(),
             }),
         );
         let worker = WorkerConfig {
@@ -3899,23 +4531,170 @@ mod tests {
     }
 
     #[test]
+    fn discovery_config_does_not_accidentally_run_a_public_relay() {
+        let discovery = DiscoveryConfig::new("infernet/test");
+        assert!(!discovery.relay_server);
+        assert!(discovery.relay_peers.is_empty());
+    }
+
+    #[test]
+    fn tcp_listeners_get_a_matching_quic_fallback() {
+        let tcp = "/ip4/0.0.0.0/tcp/9777".parse::<Multiaddr>().unwrap();
+        assert_eq!(
+            quic_listen_address(&tcp).unwrap().to_string(),
+            "/ip4/0.0.0.0/udp/9777/quic-v1"
+        );
+
+        let websocket = "/ip4/0.0.0.0/tcp/9777/ws".parse::<Multiaddr>().unwrap();
+        assert!(quic_listen_address(&websocket).is_none());
+    }
+
+    #[test]
+    fn relay_peer_address_becomes_a_circuit_listener() {
+        let relay_peer_id = identity::Keypair::generate_ed25519().public().to_peer_id();
+        let address = format!("/dns4/relay.example/tcp/9777/p2p/{relay_peer_id}");
+        let (parsed_peer_id, circuit) = relay_circuit_listen_address(&address).unwrap();
+
+        assert_eq!(parsed_peer_id, relay_peer_id);
+        assert_eq!(circuit.to_string(), format!("{address}/p2p-circuit"));
+        assert!(relay_circuit_listen_address("/dns4/relay.example/tcp/9777").is_err());
+        assert!(relay_circuit_listen_address(&format!("{address}/p2p-circuit")).is_err());
+    }
+
+    #[test]
+    fn public_relay_can_carry_a_full_model_transfer() {
+        let config = public_relay_server_config();
+        assert!(config.max_circuit_bytes >= 14_400_000_000);
+        assert!(config.max_circuit_duration >= Duration::from_secs(60 * 60));
+        assert!(config.reservation_duration >= config.max_circuit_duration);
+    }
+
+    #[tokio::test]
+    async fn relay_server_behaviour_is_explicitly_toggled() {
+        let topic = gossipsub::IdentTopic::new("infernet/test/relay-toggle");
+        let disabled =
+            build_grid_swarm(identity::Keypair::generate_ed25519(), &topic, false, true).unwrap();
+        assert!(!disabled.behaviour().relay_server.is_enabled());
+
+        let enabled =
+            build_grid_swarm(identity::Keypair::generate_ed25519(), &topic, true, true).unwrap();
+        assert!(enabled.behaviour().relay_server.is_enabled());
+    }
+
+    #[tokio::test]
+    async fn arbitrary_advertisements_do_not_queue_unsolicited_dials() {
+        let topic = gossipsub::IdentTopic::new("infernet/test/single-dial");
+        let mut swarm =
+            build_grid_swarm(identity::Keypair::generate_ed25519(), &topic, false, false).unwrap();
+        let remote_peer_id = identity::Keypair::generate_ed25519().public().to_peer_id();
+        let advertisement = empty_advertisement(
+            remote_peer_id.to_string(),
+            format!("/ip4/127.0.0.1/tcp/9/p2p/{remote_peer_id}"),
+        );
+
+        add_advertisement_addresses(&mut swarm, &advertisement);
+        add_advertisement_addresses(&mut swarm, &advertisement);
+
+        assert_eq!(
+            swarm
+                .network_info()
+                .connection_counters()
+                .num_pending_outgoing(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_static_peer_updates_queue_only_one_dial() {
+        let topic = gossipsub::IdentTopic::new("infernet/test/static-single-dial");
+        let mut swarm =
+            build_grid_swarm(identity::Keypair::generate_ed25519(), &topic, false, false).unwrap();
+        let remote_peer_id = identity::Keypair::generate_ed25519().public().to_peer_id();
+        let advertisement = empty_advertisement(
+            remote_peer_id.to_string(),
+            format!("/ip4/127.0.0.1/tcp/9/p2p/{remote_peer_id}"),
+        );
+
+        add_static_peer_addresses(&mut swarm, std::slice::from_ref(&advertisement));
+        add_static_peer_addresses(&mut swarm, std::slice::from_ref(&advertisement));
+
+        assert_eq!(
+            swarm
+                .network_info()
+                .connection_counters()
+                .num_pending_outgoing(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_client_obtains_a_real_circuit_listen_address() {
+        let topic = gossipsub::IdentTopic::new(format!(
+            "infernet/test/relay-reservation/{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut relay =
+            build_grid_swarm(identity::Keypair::generate_ed25519(), &topic, true, false).unwrap();
+        let relay_peer_id = *relay.local_peer_id();
+        let relay_listener = listen_on(&mut relay, "/ip4/127.0.0.1/tcp/0").unwrap();
+        let relay_transport_address = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let SwarmEvent::NewListenAddr {
+                    listener_id,
+                    address,
+                } = relay.select_next_some().await
+                    && listener_id == relay_listener
+                {
+                    break address;
+                }
+            }
+        })
+        .await
+        .expect("relay did not start listening");
+        let relay_public_address = relay_transport_address.with(Protocol::P2p(relay_peer_id));
+        relay.add_external_address(relay_public_address.clone());
+
+        let mut client =
+            build_grid_swarm(identity::Keypair::generate_ed25519(), &topic, false, false).unwrap();
+        let client_peer_id = *client.local_peer_id();
+        let circuit_listener = client
+            .listen_on(relay_public_address.with(Protocol::P2pCircuit))
+            .unwrap();
+
+        let circuit_address = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                tokio::select! {
+                    _ = relay.select_next_some() => {}
+                    event = client.select_next_some() => {
+                        if let SwarmEvent::NewListenAddr { listener_id, address } = event
+                            && listener_id == circuit_listener
+                            && address.iter().any(|protocol| matches!(protocol, Protocol::P2pCircuit))
+                        {
+                            break address;
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("client did not obtain a relay reservation");
+
+        assert!(matches!(
+            circuit_address.iter().last(),
+            Some(Protocol::P2p(peer_id)) if peer_id == client_peer_id
+        ));
+    }
+
+    #[test]
     fn trusted_rpc_endpoints_are_canonicalized_and_deduplicated() {
         let endpoints = normalize_trusted_rpc_endpoints(&[
-            " 192.168.1.20:50052 ".to_owned(),
-            "192.168.1.20:50052".to_owned(),
-            "100.64.2.3:6000".to_owned(),
-            "169.254.10.8:50052".to_owned(),
+            " 127.0.0.1:50052 ".to_owned(),
+            "127.0.0.1:50052".to_owned(),
+            "127.0.0.2:6000".to_owned(),
         ])
         .unwrap();
 
-        assert_eq!(
-            endpoints,
-            [
-                "192.168.1.20:50052",
-                "100.64.2.3:6000",
-                "169.254.10.8:50052",
-            ]
-        );
+        assert_eq!(endpoints, ["127.0.0.1:50052", "127.0.0.2:6000"]);
     }
 
     #[test]
@@ -3923,10 +4702,12 @@ mod tests {
         for endpoint in [
             "8.8.8.8:50052",
             "worker.example.com:50052",
-            "127.0.0.1:50052",
+            "192.168.1.20:50052",
+            "100.64.2.3:6000",
+            "169.254.10.8:50052",
             "[::1]:50052",
-            "192.168.1.20:0",
-            "192.168.1.20:not-a-port",
+            "127.0.0.1:0",
+            "127.0.0.1:not-a-port",
         ] {
             assert!(
                 normalize_trusted_rpc_endpoints(&[endpoint.to_owned()]).is_err(),
@@ -4165,31 +4946,6 @@ mod tests {
                 .unwrap()
                 .contains("route requested LayerRange")
         );
-    }
-
-    #[test]
-    fn activation_relay_selected_for_non_loopback_remote_hop() {
-        let target = RouteHop {
-            peer_id: "peer-b".to_owned(),
-            address: "/ip4/10.0.0.2/tcp/9777/p2p/peer-b".to_owned(),
-            layers: LayerRange::new(0, 3).unwrap(),
-        };
-
-        let relay = activation_relay_hop("peer-a", &[relay("relay-peer")], &target).unwrap();
-
-        assert_eq!(relay.peer_id, "relay-peer");
-        assert_eq!(relay.layers, target.layers);
-    }
-
-    #[test]
-    fn activation_relay_skips_loopback_target() {
-        let target = RouteHop {
-            peer_id: "peer-b".to_owned(),
-            address: "/ip4/127.0.0.1/tcp/9777/p2p/peer-b".to_owned(),
-            layers: LayerRange::new(0, 3).unwrap(),
-        };
-
-        assert!(activation_relay_hop("peer-a", &[relay("relay-peer")], &target).is_none());
     }
 
     #[tokio::test]
