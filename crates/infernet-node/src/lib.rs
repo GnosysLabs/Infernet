@@ -675,8 +675,11 @@ pub async fn run_worker_node(mut discovery: DiscoveryConfig, worker: WorkerConfi
         discovery.relay_server,
         discovery.enable_mdns,
     )?;
-    add_static_peer_addresses(&mut swarm, &discovery.static_peers);
+    // Reserve relay circuits before dialing the same bootstrap as a static
+    // peer. Starting the static dial first races libp2p's relay listener and
+    // can permanently leave this node without a circuit address.
     start_grid_listeners(&mut swarm, &discovery)?;
+    add_static_peer_addresses(&mut swarm, &discovery.static_peers, &discovery.relay_peers);
     let shard_cache = worker
         .shard_cache
         .clone()
@@ -690,7 +693,7 @@ pub async fn run_worker_node(mut discovery: DiscoveryConfig, worker: WorkerConfi
     loop {
         tokio::select! {
             _ = static_peer_dial_interval.tick(), if !discovery.static_peers.is_empty() => {
-                add_static_peer_addresses(&mut swarm, &discovery.static_peers);
+                add_static_peer_addresses(&mut swarm, &discovery.static_peers, &discovery.relay_peers);
             }
             _ = publish_interval.tick(), if discovery.advertisement.is_some() => {
                 refresh_advertisement_model_shards(
@@ -821,8 +824,10 @@ async fn run_model_distribution_node_inner(
         discovery.relay_server,
         discovery.enable_mdns,
     )?;
-    add_static_peer_addresses(&mut swarm, &discovery.static_peers);
+    // The relay listener must own the first dial to a shared
+    // bootstrap/relay peer so its reservation cannot lose a dial race.
     let listener_id = start_grid_listeners(&mut swarm, &discovery)?;
+    add_static_peer_addresses(&mut swarm, &discovery.static_peers, &discovery.relay_peers);
     let rpc_tunnel_control = swarm.behaviour().rpc_tunnel.new_control();
     let _rpc_tunnel_worker = start_local_rpc_tunnel_worker(&swarm)?;
 
@@ -845,7 +850,7 @@ async fn run_model_distribution_node_inner(
                 )?;
             }
             _ = static_peer_dial_interval.tick(), if !discovery.static_peers.is_empty() => {
-                add_static_peer_addresses(&mut swarm, &discovery.static_peers);
+                add_static_peer_addresses(&mut swarm, &discovery.static_peers, &discovery.relay_peers);
             }
             _ = publish_interval.tick() => {
                 refresh_advertisement_model_shards(&mut discovery.advertisement, Some(&shard_cache))?;
@@ -994,8 +999,8 @@ pub async fn discover_for(mut config: DiscoveryConfig, timeout: Duration) -> Res
         config.relay_server,
         config.enable_mdns,
     )?;
-    add_static_peer_addresses(&mut swarm, &config.static_peers);
     start_grid_listeners(&mut swarm, &config)?;
+    add_static_peer_addresses(&mut swarm, &config.static_peers, &config.relay_peers);
 
     let deadline = Instant::now() + timeout;
 
@@ -1077,8 +1082,8 @@ pub async fn fetch_model_shard_over_libp2p_with_progress(
         config.relay_server,
         config.enable_mdns,
     )?;
-    add_static_peer_addresses(&mut swarm, &config.static_peers);
     start_grid_listeners(&mut swarm, &config)?;
+    add_static_peer_addresses(&mut swarm, &config.static_peers, &config.relay_peers);
 
     let deadline = Instant::now() + discovery_timeout;
     let mut publish_interval = interval(config.publish_interval);
@@ -1376,8 +1381,8 @@ pub async fn fetch_model_source_over_libp2p(
         config.relay_server,
         config.enable_mdns,
     )?;
-    add_static_peer_addresses(&mut swarm, &config.static_peers);
     start_grid_listeners(&mut swarm, &config)?;
+    add_static_peer_addresses(&mut swarm, &config.static_peers, &config.relay_peers);
 
     let deadline = Instant::now() + discovery_timeout;
     let mut publish_interval = interval(config.publish_interval);
@@ -1635,8 +1640,8 @@ pub async fn infer_over_libp2p(
         config.relay_server,
         config.enable_mdns,
     )?;
-    add_static_peer_addresses(&mut swarm, &config.static_peers);
     start_grid_listeners(&mut swarm, &config)?;
+    add_static_peer_addresses(&mut swarm, &config.static_peers, &config.relay_peers);
 
     let route = if let Some(route) = config.planned_route.clone() {
         validate_planned_route(&route, &manifest, &config.static_peers)?;
@@ -4191,13 +4196,29 @@ fn update_listen_address(
 fn add_static_peer_addresses(
     swarm: &mut Swarm<GridBehaviour>,
     advertisements: &[NodeAdvertisement],
+    relay_peers: &[String],
 ) {
-    for advertisement in advertisements {
-        add_advertisement_addresses(swarm, advertisement);
+    let relay_peer_ids = relay_peers
+        .iter()
+        .filter_map(|address| address.parse::<Multiaddr>().ok())
+        .filter_map(|address| match address.iter().last() {
+            Some(Protocol::P2p(peer_id)) => Some(peer_id),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
 
+    for advertisement in advertisements {
         let Ok(peer_id) = advertisement.peer_id.parse::<PeerId>() else {
             continue;
         };
+        // The relay behaviour owns this peer's addresses and connection.
+        // Feeding the same peer into gossipsub/request-response discovery can
+        // schedule a competing normal dial before the reservation is sent.
+        if relay_peer_ids.contains(&peer_id) {
+            continue;
+        }
+
+        add_advertisement_addresses(swarm, advertisement);
         let dial_addresses = advertisement
             .addresses
             .iter()
@@ -4212,6 +4233,9 @@ fn add_static_peer_addresses(
         // Periodic calls are harmless because peer-aware dialing is rejected
         // while already connected or dialing.
         swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+        // A relay listener must establish and own its reservation connection.
+        // Issuing a normal static dial to that same PeerId races the relay
+        // behaviour and can leave the client connected but without a circuit.
         let dial = DialOpts::peer_id(peer_id)
             .condition(PeerCondition::DisconnectedAndNotDialing)
             .addresses(dial_addresses)
@@ -4615,8 +4639,8 @@ mod tests {
             format!("/ip4/127.0.0.1/tcp/9/p2p/{remote_peer_id}"),
         );
 
-        add_static_peer_addresses(&mut swarm, std::slice::from_ref(&advertisement));
-        add_static_peer_addresses(&mut swarm, std::slice::from_ref(&advertisement));
+        add_static_peer_addresses(&mut swarm, std::slice::from_ref(&advertisement), &[]);
+        add_static_peer_addresses(&mut swarm, std::slice::from_ref(&advertisement), &[]);
 
         assert_eq!(
             swarm
@@ -4624,6 +4648,30 @@ mod tests {
                 .connection_counters()
                 .num_pending_outgoing(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn static_bootstrap_that_is_also_a_relay_does_not_race_reservation() {
+        let topic = gossipsub::IdentTopic::new("infernet/test/static-relay-no-race");
+        let mut swarm =
+            build_grid_swarm(identity::Keypair::generate_ed25519(), &topic, false, false).unwrap();
+        let relay_peer_id = identity::Keypair::generate_ed25519().public().to_peer_id();
+        let relay_address = format!("/ip4/127.0.0.1/tcp/9/p2p/{relay_peer_id}");
+        let advertisement = empty_advertisement(relay_peer_id.to_string(), relay_address.clone());
+
+        add_static_peer_addresses(
+            &mut swarm,
+            std::slice::from_ref(&advertisement),
+            &[relay_address],
+        );
+
+        assert_eq!(
+            swarm
+                .network_info()
+                .connection_counters()
+                .num_pending_outgoing(),
+            0
         );
     }
 
