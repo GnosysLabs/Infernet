@@ -1115,11 +1115,12 @@ pub async fn fetch_model_shard_over_libp2p_with_progress(
         ModelShardCandidate,
         u64,
     )> = None;
+    let mut pending_dial: Option<ModelShardCandidate> = None;
     let mut failed_peers = HashMap::<String, Instant>::new();
     let mut progress_started = false;
 
     loop {
-        if pending_request.is_none() && relay_ready {
+        if pending_request.is_none() && pending_dial.is_none() && relay_ready {
             if let Some(candidate) = select_model_shard_candidate(
                 &registry,
                 &local_peer_id,
@@ -1167,9 +1168,24 @@ pub async fn fetch_model_shard_over_libp2p_with_progress(
                     downloaded_bytes,
                     MODEL_BLOB_CHUNK_BYTES,
                 );
-                let request_id =
-                    send_model_blob_request(&mut swarm, &candidate.advertisement, request)?;
-                pending_request = Some((request_id, candidate, downloaded_bytes));
+                let candidate_peer_id = candidate
+                    .advertisement
+                    .peer_id
+                    .parse::<PeerId>()
+                    .with_context(|| {
+                        format!(
+                            "invalid model seed peer id {}",
+                            candidate.advertisement.peer_id
+                        )
+                    })?;
+                if swarm.is_connected(&candidate_peer_id) {
+                    let request_id =
+                        send_model_blob_request(&mut swarm, &candidate.advertisement, request)?;
+                    pending_request = Some((request_id, candidate, downloaded_bytes));
+                } else {
+                    dial_model_blob_peer(&mut swarm, &candidate.advertisement)?;
+                    pending_dial = Some(candidate);
+                }
             }
         }
 
@@ -1191,6 +1207,47 @@ pub async fn fetch_model_shard_over_libp2p_with_progress(
                     ))
                 ) {
                     relay_ready = true;
+                }
+                let connected_pending_seed = match (&event, pending_dial.as_ref()) {
+                    (
+                        SwarmEvent::ConnectionEstablished { peer_id, .. },
+                        Some(candidate),
+                    ) => candidate.advertisement.peer_id == peer_id.to_string(),
+                    _ => false,
+                };
+                let failed_pending_seed = match (&event, pending_dial.as_ref()) {
+                    (
+                        SwarmEvent::OutgoingConnectionError {
+                            peer_id: Some(peer_id),
+                            ..
+                        },
+                        Some(candidate),
+                    ) => candidate.advertisement.peer_id == peer_id.to_string(),
+                    _ => false,
+                };
+                if connected_pending_seed {
+                    if let Some(candidate) = pending_dial.take() {
+                        let request = ModelBlobRequest::new_shard(
+                            model_id.clone(),
+                            layers,
+                            candidate.shard.checksum.clone(),
+                            downloaded_bytes,
+                            MODEL_BLOB_CHUNK_BYTES,
+                        );
+                        let request_id = send_model_blob_request(
+                            &mut swarm,
+                            &candidate.advertisement,
+                            request,
+                        )?;
+                        pending_request = Some((request_id, candidate, downloaded_bytes));
+                    }
+                } else if failed_pending_seed {
+                    if let Some(candidate) = pending_dial.take() {
+                        record_model_fetch_peer_failure(
+                            &mut failed_peers,
+                            candidate.advertisement.peer_id,
+                        );
+                    }
                 }
                 if let Some(network_event) = handle_grid_event(
                     &mut swarm,
@@ -3607,6 +3664,37 @@ fn send_model_blob_request(
     };
 
     Ok(request_id)
+}
+
+fn dial_model_blob_peer(
+    swarm: &mut Swarm<GridBehaviour>,
+    advertisement: &NodeAdvertisement,
+) -> Result<()> {
+    let peer_id = advertisement
+        .peer_id
+        .parse::<PeerId>()
+        .with_context(|| format!("invalid libp2p peer id {}", advertisement.peer_id))?;
+    let addresses = advertisement
+        .addresses
+        .iter()
+        .filter_map(|address| address.parse::<Multiaddr>().ok())
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        bail!(
+            "model seed {} has no dialable address",
+            advertisement.peer_id
+        );
+    }
+
+    let dial = DialOpts::peer_id(peer_id)
+        .condition(PeerCondition::DisconnectedAndNotDialing)
+        .addresses(addresses)
+        .extend_addresses_through_behaviour()
+        .build();
+    swarm
+        .dial(dial)
+        .with_context(|| format!("failed to dial model seed {}", advertisement.peer_id))?;
+    Ok(())
 }
 
 fn send_response(
