@@ -13,7 +13,7 @@ use std::{
 };
 
 use execution_plan::{ExecutionParticipantView, plan_rpc_execution, rpc_endpoint_is_usable};
-use futures::channel::oneshot;
+use futures::{StreamExt, channel::oneshot};
 use infernet_model::{
     LayerRange, ModelManifest, OfficialComponentKind, OfficialModelRelease, RuntimeKind,
     SeedShardManifest, ShardDescriptor,
@@ -24,10 +24,11 @@ use infernet_node::{
     PAYLOAD_KIND_GGUF_SHARD, PAYLOAD_KIND_INFERNET_SHARD, ShardCache, ShardCacheConfig,
     clear_local_llama_rpc_endpoint, detect_node_capabilities, empty_advertisement,
     enrich_local_advertisement, fetch_model_shard_over_libp2p_with_progress,
-    find_llama_rpc_server_binary, infer_over_libp2p, is_executable_shard_record,
-    load_or_generate_keypair, local_capability_advertisement, model_serving_telemetry,
+    find_llama_rpc_server_binary, import_seed_model_from_file_consuming_verified,
+    infer_over_libp2p, is_executable_shard_record, load_or_generate_keypair,
+    local_capability_advertisement, model_serving_telemetry,
     run_model_distribution_node_with_readiness_and_registry, seed_manifest_for_network,
-    set_local_inference_active, set_local_llama_rpc_endpoint, set_local_rpc_active,
+    set_local_inference_active, set_local_llama_rpc_endpoint, set_local_rpc_active, sha256_file,
     spawn_llama_rpc_server, stop_persistent_llama_server, stop_persistent_rpc_tunnels,
 };
 use infernet_protocol::{
@@ -40,6 +41,7 @@ use infernet_router::{
 use libp2p::{Multiaddr, PeerId, identity, multiaddr::Protocol};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
+use tokio::io::AsyncWriteExt;
 
 use peer_presence::{ConnectionStatus, PeerPresence, PresenceRecord, PresenceSnapshot};
 
@@ -383,14 +385,52 @@ async fn install_official_model(
         discover_registry(&app, &state, &cache_config, DEFAULT_DISCOVERY_TIMEOUT_MS).await?;
     let manifest = manifest_for_model(Some(&model_id), &cache_config, Some(&registry))
         .map_err(|error| error.to_string())?;
-    if advertised_model_record_plan(&registry, &manifest.model_id).is_empty() {
-        return Err(
-            "The verified Infernet Chat release is not being seeded by an online machine yet."
-                .to_owned(),
+    if let Err(https_error) =
+        acquire_official_model_over_https(&app, &cache_config, &manifest).await
+    {
+        eprintln!("official HTTPS model acquisition failed: {https_error}");
+        let p2p_plan = advertised_model_record_plan(&registry, &manifest.model_id);
+        if p2p_plan.is_empty() {
+            emit_model_import_progress(
+                &app,
+                &manifest.model_id,
+                "Download failed",
+                format!("HTTPS failed and no P2P seed is online: {https_error}"),
+                0,
+                None,
+            );
+            return Err(format!(
+                "The official model download failed, and no P2P seed is online: {https_error}"
+            ));
+        }
+        let release = OfficialModelRelease::infernet_chat_v1_compatibility();
+        let full_layers =
+            LayerRange::new(0, manifest.layer_count).map_err(|error| error.to_string())?;
+        let (_, total_bytes) = release
+            .components
+            .iter()
+            .find(|component| component.layers == Some(full_layers))
+            .map(|component| (component.sha256.as_str(), component.size_bytes))
+            .ok_or_else(|| "official release has no downloadable component".to_owned())?;
+        let (partial_path, _) =
+            official_release_download_paths(&cache_config, &release, full_layers);
+        let downloaded_bytes = std::fs::metadata(partial_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        emit_model_import_progress(
+            &app,
+            &manifest.model_id,
+            "Downloading shard",
+            format!(
+                "layers {}:{} · P2P fallback",
+                full_layers.start, full_layers.end
+            ),
+            downloaded_bytes,
+            Some(total_bytes),
         );
+        acquire_advertised_model_records(&app, &state, &cache_config, &manifest, &registry, true)
+            .await?;
     }
-    acquire_advertised_model_records(&app, &state, &cache_config, &manifest, &registry, true)
-        .await?;
     collect_snapshot(
         &app,
         &state,
@@ -669,6 +709,273 @@ fn trusted_launch_registry(registry: ShardRegistry) -> ShardRegistry {
         trusted.upsert(advertisement);
     }
     trusted
+}
+
+fn official_release_download_url(release: &OfficialModelRelease) -> String {
+    format!(
+        "https://huggingface.co/{}/resolve/{}/{}",
+        release.upstream.repository, release.upstream.revision, release.upstream.artifact
+    )
+}
+
+fn official_release_download_paths(
+    cache_config: &ShardCacheConfig,
+    release: &OfficialModelRelease,
+    layers: LayerRange,
+) -> (PathBuf, PathBuf) {
+    let checksum_prefix =
+        &release.upstream.source_sha256[..release.upstream.source_sha256.len().min(16)];
+    let base = format!(
+        "{}-{}-{}-{}",
+        sanitize_download_path_segment(&release.model_id),
+        layers.start,
+        layers.end,
+        checksum_prefix
+    );
+    let temp_dir = cache_config.root.join("tmp");
+    (
+        temp_dir.join(format!("{base}.gguf.partial")),
+        temp_dir.join(format!("{base}.gguf")),
+    )
+}
+
+fn sanitize_download_path_segment(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric()
+                || character == '-'
+                || character == '_'
+                || character == '.'
+            {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn content_range_start(value: &str) -> Option<u64> {
+    value
+        .strip_prefix("bytes ")?
+        .split_once('-')?
+        .0
+        .parse()
+        .ok()
+}
+
+async fn acquire_official_model_over_https(
+    app: &AppHandle,
+    cache_config: &ShardCacheConfig,
+    manifest: &ModelManifest,
+) -> anyhow::Result<()> {
+    let release = OfficialModelRelease::infernet_chat_v1_compatibility();
+    release.validate_for_model(manifest)?;
+    let full_layers = LayerRange::new(0, manifest.layer_count)?;
+    let component = release
+        .components
+        .iter()
+        .find(|component| {
+            component.kind == OfficialComponentKind::Transformer
+                && component.layers == Some(full_layers)
+        })
+        .ok_or_else(|| anyhow::anyhow!("official release has no full-model component"))?;
+    let cache = ShardCache::new(cache_config.clone())?;
+    if cache
+        .find(
+            &manifest.model_id,
+            full_layers,
+            Some(&component.sha256),
+            Some(&release.version),
+        )?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    let (partial_path, completed_path) =
+        official_release_download_paths(cache_config, &release, full_layers);
+    let temp_dir = partial_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("official download has no temporary directory"))?;
+    tokio::fs::create_dir_all(temp_dir).await?;
+
+    if tokio::fs::metadata(&completed_path)
+        .await
+        .is_ok_and(|metadata| metadata.len() != component.size_bytes)
+    {
+        tokio::fs::remove_file(&completed_path).await?;
+    }
+
+    let mut downloaded_bytes = tokio::fs::metadata(&completed_path)
+        .await
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    if downloaded_bytes == 0 {
+        downloaded_bytes = tokio::fs::metadata(&partial_path)
+            .await
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+    }
+    if downloaded_bytes > component.size_bytes {
+        tokio::fs::remove_file(&partial_path).await?;
+        downloaded_bytes = 0;
+    }
+
+    let progress_detail = format!(
+        "layers {}:{} · Hugging Face",
+        full_layers.start, full_layers.end
+    );
+    emit_model_import_progress(
+        app,
+        &manifest.model_id,
+        "Downloading shard",
+        progress_detail.clone(),
+        downloaded_bytes,
+        Some(component.size_bytes),
+    );
+
+    if downloaded_bytes < component.size_bytes {
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(20))
+            .user_agent(concat!("infernet/", env!("CARGO_PKG_VERSION")))
+            .build()?;
+        let mut request = client.get(official_release_download_url(&release));
+        if downloaded_bytes > 0 {
+            request = request.header(reqwest::header::RANGE, format!("bytes={downloaded_bytes}-"));
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE
+            && downloaded_bytes == component.size_bytes
+        {
+            // The partial file completed before the previous process exited.
+        } else if !status.is_success() {
+            return Err(anyhow::anyhow!(
+                "Hugging Face returned HTTP {}",
+                status.as_u16()
+            ));
+        } else {
+            let append = downloaded_bytes > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT;
+            if append {
+                let range_start = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_RANGE)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(content_range_start);
+                if range_start != Some(downloaded_bytes) {
+                    return Err(anyhow::anyhow!(
+                        "Hugging Face returned an invalid resume range"
+                    ));
+                }
+            } else if downloaded_bytes > 0 {
+                // The origin ignored Range. Restart safely instead of appending
+                // a complete response to the existing partial file.
+                downloaded_bytes = 0;
+            }
+
+            let mut options = tokio::fs::OpenOptions::new();
+            options.create(true).write(true);
+            if append {
+                options.append(true);
+            } else {
+                options.truncate(true);
+            }
+            let mut file = options.open(&partial_path).await?;
+            let mut stream = response.bytes_stream();
+            let mut last_progress_emit = downloaded_bytes;
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                let next_downloaded = downloaded_bytes
+                    .checked_add(chunk.len() as u64)
+                    .ok_or_else(|| anyhow::anyhow!("official model download size overflow"))?;
+                if next_downloaded > component.size_bytes {
+                    return Err(anyhow::anyhow!(
+                        "Hugging Face download exceeded the pinned model size"
+                    ));
+                }
+                file.write_all(&chunk).await?;
+                downloaded_bytes = next_downloaded;
+                if downloaded_bytes == component.size_bytes
+                    || downloaded_bytes.saturating_sub(last_progress_emit)
+                        >= MODEL_PROGRESS_EMIT_BYTES
+                {
+                    emit_model_import_progress(
+                        app,
+                        &manifest.model_id,
+                        "Downloading shard",
+                        progress_detail.clone(),
+                        downloaded_bytes,
+                        Some(component.size_bytes),
+                    );
+                    last_progress_emit = downloaded_bytes;
+                }
+            }
+            file.flush().await?;
+        }
+    }
+
+    if downloaded_bytes != component.size_bytes {
+        return Err(anyhow::anyhow!(
+            "Hugging Face download ended at {} of {} bytes",
+            downloaded_bytes,
+            component.size_bytes
+        ));
+    }
+
+    if !tokio::fs::try_exists(&completed_path).await? {
+        tokio::fs::rename(&partial_path, &completed_path).await?;
+    }
+    emit_model_import_progress(
+        app,
+        &manifest.model_id,
+        "Verifying download",
+        "Checking the official model checksum",
+        component.size_bytes,
+        Some(component.size_bytes),
+    );
+
+    let checksum_path = completed_path.clone();
+    let actual_checksum =
+        tokio::task::spawn_blocking(move || sha256_file(&checksum_path)).await??;
+    if actual_checksum != component.sha256 {
+        let _ = tokio::fs::remove_file(&completed_path).await;
+        return Err(anyhow::anyhow!(
+            "official model checksum mismatch; expected {}, got {}",
+            component.sha256,
+            actual_checksum
+        ));
+    }
+
+    let import_cache_config = cache_config.clone();
+    let import_manifest = manifest.clone();
+    let import_version = release.version.clone();
+    let import_checksum = actual_checksum.clone();
+    tokio::task::spawn_blocking(move || {
+        let cache = ShardCache::new(import_cache_config)?;
+        import_seed_model_from_file_consuming_verified(
+            &cache,
+            &completed_path,
+            &import_manifest,
+            import_version,
+            import_checksum,
+        )
+    })
+    .await??;
+
+    emit_model_import_progress(
+        app,
+        &manifest.model_id,
+        "Shard ready",
+        format!(
+            "layers {}:{} · verified HTTPS",
+            full_layers.start, full_layers.end
+        ),
+        component.size_bytes,
+        Some(component.size_bytes),
+    );
+    Ok(())
 }
 
 async fn acquire_advertised_model_records(
@@ -3664,5 +3971,25 @@ mod tests {
         assert_eq!(config.static_peers[0].addresses.len(), 1);
         assert!(config.static_peers[0].addresses[0].contains("/tcp/"));
         assert!(config.static_peers[0].addresses[0].contains("/p2p-circuit/"));
+    }
+
+    #[test]
+    fn official_https_download_is_revision_pinned_and_resumable_by_p2p() {
+        let release = OfficialModelRelease::infernet_chat_v1_compatibility();
+        let layers = LayerRange::new(0, 30).unwrap();
+        let cache = ShardCacheConfig::new("/tmp/infernet-official-download-test");
+        let (partial, completed) = official_release_download_paths(&cache, &release, layers);
+
+        assert_eq!(
+            official_release_download_url(&release),
+            "https://huggingface.co/google/gemma-4-26B-A4B-it-qat-q4_0-gguf/resolve/dfc00409adc70be497fee9c90bfe76b3ee130f2e/gemma-4-26B_q4_0-it.gguf"
+        );
+        assert!(partial.ends_with("tmp/infernet-chat-v1-0-30-4c856523d61d7792.gguf.partial"));
+        assert!(completed.ends_with("tmp/infernet-chat-v1-0-30-4c856523d61d7792.gguf"));
+        assert_eq!(
+            content_range_start("bytes 4194304-8388607/14439361440"),
+            Some(4_194_304)
+        );
+        assert_eq!(content_range_start("invalid"), None);
     }
 }
