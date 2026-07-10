@@ -1083,10 +1083,16 @@ pub async fn fetch_model_shard_over_libp2p_with_progress(
         config.enable_mdns,
     )?;
     start_grid_listeners(&mut swarm, &config)?;
-    add_static_peer_addresses(&mut swarm, &config.static_peers, &config.relay_peers);
+    // A download request must own the target dial. Proactively dialing every
+    // discovered seed here races request-response and produces an immediate
+    // `DialFailure` while the correct connection is still in progress.
+    for advertisement in &config.static_peers {
+        add_advertisement_addresses(&mut swarm, advertisement);
+    }
 
     let deadline = Instant::now() + discovery_timeout;
     let mut publish_interval = interval(config.publish_interval);
+    let mut relay_ready = config.relay_peers.is_empty();
     let partial_dir = cache.config().root.join("tmp");
     fs::create_dir_all(&partial_dir)
         .with_context(|| format!("failed to create {}", partial_dir.display()))?;
@@ -1113,7 +1119,7 @@ pub async fn fetch_model_shard_over_libp2p_with_progress(
     let mut progress_started = false;
 
     loop {
-        if pending_request.is_none() {
+        if pending_request.is_none() && relay_ready {
             if let Some(candidate) = select_model_shard_candidate(
                 &registry,
                 &local_peer_id,
@@ -1178,6 +1184,14 @@ pub async fn fetch_model_shard_over_libp2p_with_progress(
                 )?;
             }
             event = swarm.select_next_some() => {
+                if matches!(
+                    &event,
+                    SwarmEvent::Behaviour(GridBehaviourEvent::RelayClient(
+                        relay::client::Event::ReservationReqAccepted { .. }
+                    ))
+                ) {
+                    relay_ready = true;
+                }
                 if let Some(network_event) = handle_grid_event(
                     &mut swarm,
                     event,
@@ -1382,10 +1396,13 @@ pub async fn fetch_model_source_over_libp2p(
         config.enable_mdns,
     )?;
     start_grid_listeners(&mut swarm, &config)?;
-    add_static_peer_addresses(&mut swarm, &config.static_peers, &config.relay_peers);
+    for advertisement in &config.static_peers {
+        add_advertisement_addresses(&mut swarm, advertisement);
+    }
 
     let deadline = Instant::now() + discovery_timeout;
     let mut publish_interval = interval(config.publish_interval);
+    let mut relay_ready = config.relay_peers.is_empty();
     let partial_path = final_path.with_extension("gguf.partial");
     if let Some(parent) = final_path.parent() {
         fs::create_dir_all(parent)
@@ -1401,7 +1418,7 @@ pub async fn fetch_model_source_over_libp2p(
     on_progress(downloaded_bytes, total_size_bytes);
 
     loop {
-        if pending_request.is_none() {
+        if pending_request.is_none() && relay_ready {
             if let Some(advertisement) = select_model_blob_candidate(
                 &registry,
                 &local_peer_id,
@@ -1431,6 +1448,14 @@ pub async fn fetch_model_source_over_libp2p(
                 )?;
             }
             event = swarm.select_next_some() => {
+                if matches!(
+                    &event,
+                    SwarmEvent::Behaviour(GridBehaviourEvent::RelayClient(
+                        relay::client::Event::ReservationReqAccepted { .. }
+                    ))
+                ) {
+                    relay_ready = true;
+                }
                 if let Some(network_event) = handle_grid_event(
                     &mut swarm,
                     event,
