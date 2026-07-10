@@ -77,6 +77,9 @@ const cmakeConfigureArgs = [
   `-DSD_METAL=${isMacosTarget ? "ON" : "OFF"}`,
   "-DSD_VULKAN=OFF",
 ];
+if (isWindowsTarget) {
+  cmakeConfigureArgs.push("-DCMAKE_CXX_FLAGS=/bigobj");
+}
 if (targetTriple === "aarch64-apple-darwin") {
   cmakeConfigureArgs.push("-DCMAKE_OSX_ARCHITECTURES=arm64");
 } else if (targetTriple === "x86_64-apple-darwin") {
@@ -144,24 +147,28 @@ function main() {
 }
 
 function prepareSource() {
+  let freshClone = false;
   if (!existsSync(sourceDir)) {
     mkdirSync(runtimeRoot, { recursive: true });
     run("git", ["clone", "--filter=blob:none", "--no-checkout", SOURCE_REPOSITORY, sourceDir]);
+    freshClone = true;
   } else if (!existsSync(join(sourceDir, ".git"))) {
     fail(`${relative(sourceDir)} exists but is not a git checkout`);
   }
 
-  const dirty = capture("git", ["status", "--porcelain", "--untracked-files=no"], {
-    cwd: sourceDir,
-  }).trim();
-  if (dirty) {
-    fail(
-      `${relative(sourceDir)} has local changes; preserve or remove them before preparing the runtime`,
-    );
+  if (!freshClone) {
+    const dirty = capture("git", ["status", "--porcelain", "--untracked-files=no"], {
+      cwd: sourceDir,
+    }).trim();
+    if (dirty) {
+      fail(
+        `${relative(sourceDir)} has local changes; preserve or remove them before preparing the runtime`,
+      );
+    }
   }
 
   const currentRef = capture("git", ["rev-parse", "HEAD"], { cwd: sourceDir }).trim();
-  if (currentRef !== STABLE_DIFFUSION_CPP_REF) {
+  if (freshClone || currentRef !== STABLE_DIFFUSION_CPP_REF) {
     run("git", ["fetch", "--depth", "1", "origin", STABLE_DIFFUSION_CPP_REF], {
       cwd: sourceDir,
     });
