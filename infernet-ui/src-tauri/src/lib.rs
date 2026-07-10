@@ -73,7 +73,6 @@ const UI_LISTEN_PORT: u16 = 9777;
 const OFFICIAL_CHAT_MODEL_ID: &str = "infernet-chat-v1";
 const RUNTIME_SCRATCH_BYTES_PER_PEER: u64 = 768 * 1024 * 1024;
 const CAPACITY_SAFETY_BYTES: u64 = 1024 * 1024 * 1024;
-const IMAGE_SPLIT_MIN_AVAILABLE_ACCELERATOR_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 // The transport delivers 4 MiB chunks. Forward every completed chunk so the
 // desktop progress bar reflects the live transfer instead of appearing frozen
 // until another 64 MiB has accumulated.
@@ -933,30 +932,84 @@ fn image_advertisement_is_eligible<'a>(
     local_peer_id: &str,
 ) -> Option<&'a infernet_protocol::NodeCapabilities> {
     let capabilities = advertisement.capabilities.as_ref()?;
+    image_advertisement_ineligibility_reason(advertisement, local_peer_id)
+        .is_none()
+        .then_some(capabilities)
+}
+
+fn image_advertisement_ineligibility_reason(
+    advertisement: &NodeAdvertisement,
+    local_peer_id: &str,
+) -> Option<String> {
+    let Some(capabilities) = advertisement.capabilities.as_ref() else {
+        return Some("has no current compute capability report".to_owned());
+    };
+    if capabilities
+        .machine_id
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+    {
+        return Some("has no verified physical-machine identity".to_owned());
+    }
     let expected_components = image_runtime::component_infos();
-    let remote_rpc_ready = advertisement.peer_id == local_peer_id
-        || capabilities.image_rpc.as_ref().is_some_and(|endpoint| {
-            endpoint.ready
-                && endpoint.rpc_protocol_version == LLAMA_RPC_PROTOCOL_VERSION
-                && endpoint.runtime_abi == INFERNET_IMAGE_RPC_RUNTIME_ABI
-                && endpoint.tunnel_protocol.as_deref() == Some(IMAGE_RPC_TUNNEL_PROTOCOL)
-                && matches!(endpoint.backend.as_str(), "cuda" | "metal")
-        });
-    (matches!(capabilities.compute_backend.as_str(), "cuda" | "metal")
-        && capabilities.active_sessions < capabilities.max_sessions
-        && capabilities.available_accelerator_memory_bytes
-            >= IMAGE_SPLIT_MIN_AVAILABLE_ACCELERATOR_BYTES
-        && (advertisement.peer_id == local_peer_id
-            || (!advertisement.addresses.is_empty()
-                && capabilities.vram_contribution_limit_bytes != Some(0)))
-        && remote_rpc_ready
-        && expected_components.iter().all(|expected| {
-            advertisement
-                .model_components
-                .iter()
-                .any(|actual| actual == expected)
-        }))
-    .then_some(capabilities)
+    if !expected_components.iter().all(|expected| {
+        advertisement
+            .model_components
+            .iter()
+            .any(|actual| actual == expected)
+    }) {
+        return Some("is not advertising the complete verified Infernet Image package".to_owned());
+    }
+    if !matches!(capabilities.compute_backend.as_str(), "cuda" | "metal") {
+        return Some(format!(
+            "uses the unsupported {} compute backend",
+            capabilities.compute_backend
+        ));
+    }
+    if capabilities.active_sessions >= capabilities.max_sessions {
+        return Some(format!(
+            "has no free inference session ({}/{})",
+            capabilities.active_sessions, capabilities.max_sessions
+        ));
+    }
+    if capabilities.total_accelerator_memory_bytes == 0 {
+        return Some("reports no accelerator memory capacity".to_owned());
+    }
+    if advertisement.peer_id != local_peer_id {
+        if advertisement.addresses.is_empty() {
+            return Some("has no authenticated network route".to_owned());
+        }
+        if capabilities.vram_contribution_limit_bytes == Some(0) {
+            return Some("has accelerator sharing disabled".to_owned());
+        }
+        let Some(endpoint) = capabilities.image_rpc.as_ref() else {
+            return Some("is not advertising an Infernet Image RPC worker".to_owned());
+        };
+        if !endpoint.ready {
+            return Some("has an Infernet Image RPC worker that is not ready".to_owned());
+        }
+        if endpoint.rpc_protocol_version != LLAMA_RPC_PROTOCOL_VERSION
+            || endpoint.runtime_abi != INFERNET_IMAGE_RPC_RUNTIME_ABI
+            || endpoint.tunnel_protocol.as_deref() != Some(IMAGE_RPC_TUNNEL_PROTOCOL)
+            || !matches!(endpoint.backend.as_str(), "cuda" | "metal")
+        {
+            return Some("is advertising an incompatible Infernet Image RPC worker".to_owned());
+        }
+    }
+    None
+}
+
+fn local_image_ineligibility_message(
+    advertisements: &[NodeAdvertisement],
+    local_peer_id: &str,
+) -> Option<String> {
+    let advertisement = advertisements
+        .iter()
+        .find(|advertisement| advertisement.peer_id == local_peer_id)?;
+    image_advertisement_ineligibility_reason(advertisement, local_peer_id).map(|reason| {
+        format!("This computer cannot participate in the image split because it {reason}.")
+    })
 }
 
 fn select_image_rpc_workers(
@@ -1059,12 +1112,11 @@ async fn discover_image_placement(
                     advertisements,
                 });
             }
-            Err(_) if Instant::now() >= deadline => {
-                return planned.map(|placement| DiscoveredImagePlacement {
-                    placement,
-                    remote_worker_peer_ids: Vec::new(),
-                    advertisements,
-                });
+            Err(error) if Instant::now() >= deadline => {
+                return Err(
+                    local_image_ineligibility_message(&advertisements, &local_peer_id)
+                        .unwrap_or_else(|| error.clone()),
+                );
             }
             _ => sleep(Duration::from_millis(100)).await,
         }
@@ -4353,6 +4405,33 @@ mod tests {
             plan_image_placement(&machines, "requester-machine").unwrap(),
             StableDiffusionPlacement::RequesterLocal
         );
+    }
+
+    #[test]
+    fn image_eligibility_does_not_reject_transient_memory_pressure() {
+        let mut advertisement = eligible_image_advertisement("requester-peer", "requester-machine");
+        advertisement
+            .capabilities
+            .as_mut()
+            .unwrap()
+            .available_accelerator_memory_bytes = 0;
+        advertisement.available_vram_bytes = Some(0);
+
+        assert!(image_advertisement_is_eligible(&advertisement, "requester-peer").is_some());
+    }
+
+    #[test]
+    fn image_eligibility_explains_the_actual_failed_gate() {
+        let mut advertisement = eligible_image_advertisement("requester-peer", "requester-machine");
+        advertisement.model_components.clear();
+
+        let message = local_image_ineligibility_message(
+            std::slice::from_ref(&advertisement),
+            "requester-peer",
+        )
+        .unwrap();
+
+        assert!(message.contains("complete verified Infernet Image package"));
     }
 
     #[test]
