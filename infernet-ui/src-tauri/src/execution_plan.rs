@@ -210,8 +210,17 @@ fn candidate(
         .map(|shard| shard.layers.len())
         .max()
         .unwrap_or(0);
+    let contribution_layer_capacity = capabilities
+        .vram_contribution_limit_bytes
+        .map(|limit| {
+            safe_model_memory(limit)
+                .checked_div(bytes_per_layer)
+                .unwrap_or(0) as u32
+        })
+        .unwrap_or(u32::MAX);
     let layer_capacity = (usable_memory_bytes.checked_div(bytes_per_layer)? as u32)
-        .max(resident_layer_capacity);
+        .max(resident_layer_capacity)
+        .min(contribution_layer_capacity);
     if layer_capacity == 0 {
         return None;
     }
@@ -335,7 +344,25 @@ mod tests {
 
         let plan = plan_worker_execution(&registry, &model).unwrap();
         assert_eq!(plan.route.len(), 1);
-        assert_eq!(plan.route[0].layers, LayerRange::new(0, model.layer_count).unwrap());
+        assert_eq!(
+            plan.route[0].layers,
+            LayerRange::new(0, model.layer_count).unwrap()
+        );
+    }
+
+    #[test]
+    fn contribution_limit_caps_resident_model_layers() {
+        let model = ModelManifest::infernet_chat_v1();
+        let mut registry = ShardRegistry::new();
+        let mut peer = advertisement("limited-resident-worker", 24, &model);
+        peer.hosted_shards[0].resident = true;
+        peer.capabilities
+            .as_mut()
+            .unwrap()
+            .vram_contribution_limit_bytes = Some(4 * 1024 * 1024 * 1024);
+        registry.upsert(peer);
+
+        assert!(plan_worker_execution(&registry, &model).is_err());
     }
 
     fn advertisement(peer_id: &str, memory_gib: u64, model: &ModelManifest) -> NodeAdvertisement {

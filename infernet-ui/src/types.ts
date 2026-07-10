@@ -5,6 +5,15 @@ export interface LocalIdentity {
   connectAddresses: string[];
 }
 
+export interface VramContributionSettings {
+  contributionBytes: number;
+  totalBytes: number;
+  availableBytes: number;
+  computeBackend: string;
+  deviceName: string;
+  unifiedMemory: boolean;
+}
+
 export interface ModelView {
   modelId: string;
   displayName: string;

@@ -2883,13 +2883,7 @@ fn run_persistent_infernet_worker(
         if !workers.contains_key(&key) {
             workers.insert(
                 key.clone(),
-                PersistentInfernetWorker::spawn(
-                    bridge,
-                    model_path,
-                    model_id,
-                    layers,
-                    hidden_size,
-                )?,
+                PersistentInfernetWorker::spawn(bridge, model_path, model_id, layers, hidden_size)?,
             );
         }
         let result = workers
@@ -2924,6 +2918,18 @@ pub fn persistent_infernet_worker_is_resident(model_id: &str, layers: LayerRange
                 && worker.layers == layers
                 && worker.child.try_wait().is_ok_and(|status| status.is_none())
         })
+}
+
+/// Stops every resident network worker so a reduced contribution budget takes
+/// effect before this node accepts more distributed inference work.
+pub fn stop_persistent_infernet_workers() {
+    let Some(workers) = PERSISTENT_INFERNET_WORKERS.get() else {
+        return;
+    };
+    workers
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
 }
 
 fn execute_llama_cpp_shard(

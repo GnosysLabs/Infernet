@@ -24,25 +24,23 @@ import {
   Zap,
 } from "lucide-react";
 import {
-  addManualPeer,
-  clearManualPeers,
   emptySnapshot,
   getGridSnapshot,
-  getLocalIdentity,
   getLocalNodeActivity,
-  getManualPeers,
+  getVramContributionSettings,
   listenForProgress,
   listenForModelImportProgress,
   runDistributedInference,
+  setVramContribution,
 } from "./api";
 import type {
   GridSnapshot,
-  LocalIdentity,
   LocalNodeActivitySnapshot,
   MachineView,
   ModelImportProgress,
   ModelView,
   ProgressEvent,
+  VramContributionSettings,
 } from "./types";
 import { createChatMessage } from "./chatHistory";
 import type { ChatMessage, ChatThread } from "./chatHistory";
@@ -107,7 +105,6 @@ export default function App() {
     appendMessage,
     deleteThread,
   } = usePersistentChatHistory();
-  const [identity, setIdentity] = useState<LocalIdentity | null>(null);
   const [localNodeActivity, setLocalNodeActivity] = useState<LocalNodeActivitySnapshot>(
     EMPTY_LOCAL_NODE_ACTIVITY,
   );
@@ -195,10 +192,6 @@ export default function App() {
     } catch (error) {
       setLastError(String(error));
     }
-  }, []);
-
-  useEffect(() => {
-    getLocalIdentity().then(setIdentity).catch((error) => setLastError(String(error)));
   }, []);
 
   useEffect(() => {
@@ -555,12 +548,7 @@ export default function App() {
           <NetworkPage snapshot={snapshot} />
         ) : null}
 
-        {page === "settings" ? (
-          <SettingsPage
-            identity={identity}
-            onNetworkChanged={() => refreshSnapshot(selectedModel)}
-          />
-        ) : null}
+        {page === "settings" ? <SettingsPage /> : null}
       </main>
 
       {activityOpen ? (
@@ -2072,88 +2060,120 @@ function DownloadsPage({
   );
 }
 
-function SettingsPage({
-  identity,
-  onNetworkChanged,
-}: {
-  identity: LocalIdentity | null;
-  onNetworkChanged: () => void;
-}) {
-  const [manualPeer, setManualPeer] = useState("");
-  const [manualPeers, setManualPeers] = useState<string[]>([]);
-  const [manualPeerStatus, setManualPeerStatus] = useState<string | null>(null);
+function SettingsPage() {
+  const [settings, setSettings] = useState<VramContributionSettings | null>(null);
+  const [draftBytes, setDraftBytes] = useState(0);
+  const [status, setStatus] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
 
   useEffect(() => {
-    getManualPeers()
-      .then(setManualPeers)
-      .catch((error) => setManualPeerStatus(String(error)));
+    let disposed = false;
+    getVramContributionSettings()
+      .then((next) => {
+        if (disposed) return;
+        setSettings(next);
+        setDraftBytes(next.contributionBytes);
+      })
+      .catch((error) => {
+        if (!disposed) setStatus(String(error));
+      });
+    return () => {
+      disposed = true;
+    };
   }, []);
 
-  async function connectPeer() {
+  async function saveContribution() {
+    if (!settings || saving || draftBytes === settings.contributionBytes) return;
+    setSaving(true);
+    setStatus(null);
     try {
-      const peers = await addManualPeer(manualPeer);
-      setManualPeers(peers);
-      setManualPeer("");
-      setManualPeerStatus("Peer added. Refreshing network.");
-      onNetworkChanged();
+      const next = await setVramContribution(draftBytes);
+      setSettings(next);
+      setDraftBytes(next.contributionBytes);
+      setStatus(
+        next.contributionBytes === 0
+          ? "Network contribution is off."
+          : `Contribution limited to ${formatBytes(next.contributionBytes)}.`,
+      );
     } catch (error) {
-      setManualPeerStatus(String(error));
+      setStatus(String(error));
+    } finally {
+      setSaving(false);
     }
   }
 
-  async function clearPeers() {
-    try {
-      const peers = await clearManualPeers();
-      setManualPeers(peers);
-      setManualPeerStatus("Manual peers cleared.");
-      onNetworkChanged();
-    } catch (error) {
-      setManualPeerStatus(String(error));
-    }
-  }
+  const hasAccelerator = Boolean(settings?.totalBytes);
+  const contributionLabel = draftBytes === 0 ? "Off" : formatBytes(draftBytes);
 
   return (
     <section className="settings-screen">
       <div className="section-heading">
         <h2>Settings</h2>
-        <p>Connection details and controls for this node.</p>
+        <p>Control how much of this computer the network can use.</p>
       </div>
 
       <div className="settings-list">
-        <div className="settings-row">
-          <div>
-            <strong>Local node</strong>
-            <span>{identity?.peerId ?? "Starting"}</span>
-          </div>
-        </div>
-        <div className="settings-row">
-          <div>
-            <strong>LAN address</strong>
-            <span>{identity?.connectAddresses[0] ?? "Starting network"}</span>
-          </div>
-        </div>
-        <div className="settings-row manual-peer-settings">
-          <div>
-            <strong>Connect to another computer</strong>
-            <span>Paste the LAN address from the other Infernet app if automatic discovery shows 0 peers.</span>
-            {manualPeers.length > 0 ? (
-              <small>{manualPeers.length === 1 ? manualPeers[0] : `${manualPeers.length} manual peers`}</small>
+        <div className="settings-row vram-settings">
+          <div className="vram-settings-copy">
+            <strong>VRAM contribution</strong>
+            <span>
+              The most memory Infernet will offer to network work. Model data, KV cache,
+              and runtime headroom all count toward this limit.
+            </span>
+            {settings ? (
+              <small>
+                {settings.deviceName}
+                {settings.unifiedMemory ? " · shared GPU and system memory" : ""}
+              </small>
             ) : null}
-            {manualPeerStatus ? <small>{manualPeerStatus}</small> : null}
           </div>
-          <div className="manual-peer-controls">
-            <input
-              value={manualPeer}
-              onChange={(event) => setManualPeer(event.target.value)}
-              placeholder="/ip4/192.168.1.10/tcp/9777/p2p/12D3..."
-            />
-            <button className="secondary-button" onClick={connectPeer} disabled={!manualPeer.trim()}>
-              Connect
-            </button>
-            <button className="text-button" onClick={clearPeers} disabled={manualPeers.length === 0}>
-              Clear
-            </button>
-          </div>
+
+          {settings ? (
+            <div className="vram-controls">
+              <div className="vram-value-row">
+                <label htmlFor="vram-contribution">Contribution limit</label>
+                <output htmlFor="vram-contribution">{contributionLabel}</output>
+              </div>
+              <input
+                id="vram-contribution"
+                type="range"
+                min={0}
+                max={settings.totalBytes}
+                step={1024 * 1024 * 1024}
+                value={draftBytes}
+                disabled={!hasAccelerator || saving}
+                aria-describedby="vram-contribution-help"
+                onChange={(event) => {
+                  setDraftBytes(Number(event.target.value));
+                  setStatus(null);
+                }}
+              />
+              <div className="vram-range-labels" aria-hidden="true">
+                <span>Off</span>
+                <span>{formatBytes(settings.totalBytes)}</span>
+              </div>
+              <small id="vram-contribution-help">
+                {hasAccelerator
+                  ? `${formatBytes(settings.availableBytes)} currently available to Infernet.`
+                  : "No supported GPU or Apple unified memory was detected."}
+              </small>
+              <div className="vram-actions">
+                <button
+                  type="button"
+                  className="secondary-button"
+                  disabled={!hasAccelerator || saving || draftBytes === settings.contributionBytes}
+                  onClick={saveContribution}
+                >
+                  {saving ? "Saving…" : "Save limit"}
+                </button>
+                {status ? <span role="status">{status}</span> : null}
+              </div>
+            </div>
+          ) : (
+            <span className="settings-loading" role={status ? "alert" : "status"}>
+              {status ?? "Reading graphics memory…"}
+            </span>
+          )}
         </div>
       </div>
     </section>

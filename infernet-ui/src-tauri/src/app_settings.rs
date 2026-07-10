@@ -6,13 +6,14 @@ use std::{
 };
 
 use infernet_node::{
-    detect_node_capabilities, set_vram_contribution_limit_bytes,
+    clear_local_llama_rpc_endpoint, detect_node_capabilities, set_local_rpc_active,
+    set_vram_contribution_limit_bytes, stop_persistent_infernet_workers,
 };
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{AppHandle, State};
 use uuid::Uuid;
 
-use super::UiState;
+use super::{LlamaRpcServiceState, UiState, cache_config_for_app, ensure_llama_rpc_service};
 
 const APP_SETTINGS_VERSION: u32 = 1;
 
@@ -151,13 +152,32 @@ pub(crate) fn get_vram_contribution_settings(
 }
 
 #[tauri::command]
-pub(crate) fn set_vram_contribution(
+pub(crate) async fn set_vram_contribution(
+    app: AppHandle,
     state: State<'_, UiState>,
     contribution_bytes: u64,
 ) -> Result<VramContributionSettings, String> {
-    with_store(&state, |store| {
+    let settings = with_store(&state, |store| {
         store.set_vram_contribution(contribution_bytes)
-    })
+    })?;
+
+    stop_persistent_infernet_workers();
+    {
+        let mut service = state
+            .llama_rpc_service
+            .lock()
+            .map_err(|_| "failed to lock llama.cpp RPC service state".to_owned())?;
+        *service = LlamaRpcServiceState::Stopped;
+    }
+    clear_local_llama_rpc_endpoint();
+    set_local_rpc_active(false);
+
+    if contribution_bytes > 0 {
+        let cache_config = cache_config_for_app(&app);
+        ensure_llama_rpc_service(&state, &cache_config).await?;
+    }
+
+    Ok(settings)
 }
 
 fn with_store<T>(
@@ -253,10 +273,8 @@ mod tests {
 
     impl TestDirectory {
         fn new(label: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "infernet-app-settings-{label}-{}",
-                Uuid::new_v4()
-            ));
+            let path = std::env::temp_dir()
+                .join(format!("infernet-app-settings-{label}-{}", Uuid::new_v4()));
             fs::create_dir_all(&path).unwrap();
             Self(path)
         }
@@ -284,11 +302,12 @@ mod tests {
     fn contribution_limit_survives_reopen() {
         let directory = TestDirectory::new("roundtrip");
         let path = directory.settings_path();
-        let mut store = AppSettingsStore::open(path.clone()).unwrap();
-        let total_bytes = detect_node_capabilities().total_accelerator_memory_bytes;
-
-        store.set_vram_contribution(total_bytes.min(4 * 1024 * 1024 * 1024)).unwrap();
-        let expected = store.document.clone();
+        let store = AppSettingsStore::open(path.clone()).unwrap();
+        let expected = AppSettingsDocument {
+            version: APP_SETTINGS_VERSION,
+            vram_contribution_limit_bytes: Some(4 * 1024 * 1024 * 1024),
+        };
+        store.persist(&expected).unwrap();
         drop(store);
 
         let reopened = AppSettingsStore::open(path).unwrap();

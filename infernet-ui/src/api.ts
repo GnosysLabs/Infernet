@@ -8,6 +8,7 @@ import type {
   ModelImportProgress,
   ProgressEvent,
   RunDemoResponse,
+  VramContributionSettings,
 } from "./types";
 
 export const emptySnapshot: GridSnapshot = {
@@ -42,6 +43,16 @@ export async function getLocalIdentity(): Promise<LocalIdentity> {
 
 export async function getLocalNodeActivity(): Promise<LocalNodeActivitySnapshot> {
   return invoke<LocalNodeActivitySnapshot>("get_local_node_activity");
+}
+
+export async function getVramContributionSettings(): Promise<VramContributionSettings> {
+  return invoke<VramContributionSettings>("get_vram_contribution_settings");
+}
+
+export async function setVramContribution(
+  contributionBytes: number,
+): Promise<VramContributionSettings> {
+  return invoke<VramContributionSettings>("set_vram_contribution", { contributionBytes });
 }
 
 export async function getChatHistory(): Promise<ChatHistory> {

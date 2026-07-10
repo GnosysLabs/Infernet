@@ -1,3 +1,4 @@
+mod app_settings;
 mod chat_history;
 mod execution_plan;
 mod peer_presence;
@@ -13,6 +14,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use app_settings::{AppSettingsStore, get_vram_contribution_settings, set_vram_contribution};
 use chat_history::{
     ChatHistoryStore, append_chat_message, create_chat_thread, delete_chat_thread,
     get_chat_history, select_chat_thread,
@@ -33,10 +35,10 @@ use infernet_node::{
     import_seed_model_from_file_consuming_verified, infer_over_libp2p, is_executable_shard_record,
     load_or_generate_keypair, local_capability_advertisement, local_node_activity_snapshot,
     model_serving_telemetry, persistent_infernet_worker_is_resident,
-    run_model_distribution_node_with_readiness_and_registry,
-    seed_manifest_for_network, set_local_inference_active, set_local_llama_rpc_endpoint,
-    set_local_rpc_active, sha256_file, spawn_llama_rpc_server, stop_persistent_llama_server,
-    stop_persistent_rpc_tunnels,
+    run_model_distribution_node_with_readiness_and_registry, seed_manifest_for_network,
+    set_local_inference_active, set_local_llama_rpc_endpoint, set_local_rpc_active, sha256_file,
+    spawn_llama_rpc_server, stop_persistent_llama_server, stop_persistent_rpc_tunnels,
+    vram_contribution_limit_bytes,
 };
 use infernet_protocol::{
     LLAMA_RPC_TUNNEL_PROTOCOL, LlamaRpcEndpoint, ModelShardInfo, NodeAdvertisement,
@@ -93,6 +95,7 @@ impl Drop for AdvertisedLlamaRpcServer {
 
 struct UiState {
     keypair: Mutex<identity::Keypair>,
+    app_settings: Mutex<Option<AppSettingsStore>>,
     chat_history: Mutex<Option<ChatHistoryStore>>,
     chat_history_error: Mutex<Option<String>>,
     topic: String,
@@ -109,6 +112,7 @@ impl Default for UiState {
     fn default() -> Self {
         Self {
             keypair: Mutex::new(identity::Keypair::generate_ed25519()),
+            app_settings: Mutex::new(None),
             chat_history: Mutex::new(None),
             chat_history_error: Mutex::new(None),
             topic: DEFAULT_TOPIC.to_owned(),
@@ -713,8 +717,7 @@ async fn discover_registry(
         .lock()
         .map_err(|_| "failed to lock live peer registry".to_owned())?
         .clone();
-    let mut local_advertisement =
-        local_node_advertisement(cache_config, local_peer_id.clone());
+    let mut local_advertisement = local_node_advertisement(cache_config, local_peer_id.clone());
     local_advertisement.addresses = local_connect_addresses(&local_peer_id);
     registry.upsert(local_advertisement);
     let fresh_registry = trusted_launch_registry(registry, &local_peer_id);
@@ -2578,7 +2581,8 @@ async fn ensure_llama_rpc_service(
     state: &State<'_, UiState>,
     cache_config: &ShardCacheConfig,
 ) -> Result<(), String> {
-    if environment_flag("INFERNET_DISABLE_LLAMA_RPC") {
+    if environment_flag("INFERNET_DISABLE_LLAMA_RPC") || vram_contribution_limit_bytes() == Some(0)
+    {
         clear_local_llama_rpc_endpoint();
         return Ok(());
     }
@@ -3351,6 +3355,13 @@ pub fn run() {
         .setup(|app| {
             let app_handle = app.handle().clone();
             let app_data_dir = app.path().app_data_dir()?;
+            let app_settings = AppSettingsStore::open(app_data_dir.join("app-settings-v1.json"))?;
+            app_settings.apply_saved_limit();
+            *app_handle
+                .state::<UiState>()
+                .app_settings
+                .lock()
+                .expect("UI app settings lock poisoned during startup") = Some(app_settings);
             match ChatHistoryStore::open(app_data_dir.join("chat-history-v1.json")) {
                 Ok(chat_history) => {
                     *app_handle
@@ -3404,6 +3415,8 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            get_vram_contribution_settings,
+            set_vram_contribution,
             get_local_identity,
             get_local_node_activity,
             get_manual_peers,

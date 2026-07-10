@@ -1104,30 +1104,54 @@ button:disabled {
   max-width: 920px;
 }
 
-.manual-peer-settings {
-  max-width: 980px;
+.vram-settings {
+  max-width: 860px;
   align-items: flex-start;
 }
 
-.manual-peer-controls {
-  width: min(560px, 100%);
-  display: grid !important;
-  grid-template-columns: minmax(0, 1fr) auto auto;
-  align-items: center;
-  gap: 10px;
+.vram-settings-copy {
+  max-width: 420px;
 }
 
-.manual-peer-controls input {
-  width: 100%;
-  min-width: 0;
-  min-height: 42px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--surface-3);
-  color: var(--text);
-  outline: none;
-  padding: 0 12px;
+.vram-controls {
+  width: min(360px, 100%);
+  gap: 9px !important;
+}
+
+.vram-value-row,
+.vram-range-labels,
+.vram-actions {
+  display: flex !important;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.vram-value-row label,
+.vram-value-row output {
   font-size: 13px;
+  font-weight: 650;
+}
+
+.vram-value-row output {
+  color: var(--accent);
+}
+
+.vram-controls input[type="range"] {
+  width: 100%;
+  accent-color: var(--accent);
+}
+
+.vram-controls input[type="range"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 4px;
+}
+
+.vram-range-labels span,
+.vram-actions span,
+.settings-loading {
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .token-controls {
@@ -1280,8 +1304,17 @@ button:disabled {
 
   .network-summary-card,
   .activity-section-title,
-  .download-row {
+  .download-row,
+  .vram-settings {
     flex-direction: column;
+  }
+
+  .vram-settings-copy {
+    max-width: none;
+  }
+
+  .vram-controls {
+    width: 100%;
   }
 
   .shard-chip-row {
