@@ -44,6 +44,7 @@ type TransferStatus = "active" | "complete" | "error";
 type TransferActivity = ModelImportProgress & {
   id: string;
   status: TransferStatus;
+  startedAt: number;
   updatedAt: number;
 };
 
@@ -981,6 +982,7 @@ function TransferActivityRow({
   modelName: string;
   developerMode: boolean;
 }) {
+  const elapsedMs = useElapsedTime(activity.status === "active" ? activity.startedAt : null);
   const percent = activity.totalBytes && (activity.downloadedBytes > 0 || activity.status !== "active")
     ? Math.min(100, (activity.downloadedBytes / activity.totalBytes) * 100)
     : null;
@@ -993,7 +995,11 @@ function TransferActivityRow({
           <strong>{modelName}</strong>
           <span>{stage}</span>
         </div>
-        <small>{formatRelativeTime(activity.updatedAt)}</small>
+        <small>
+          {activity.status === "active"
+            ? formatDuration(elapsedMs)
+            : formatRelativeTime(activity.updatedAt)}
+        </small>
       </div>
       <p>{transferStageDescription(activity.stage, activity.status)}</p>
       {activity.status === "active" || percent !== null ? (
@@ -1459,13 +1465,15 @@ function upsertTransferActivity(
     }
   }
 
+  const id = transferActivityId(event);
+  const existing = current.find((item) => item.id === id);
   const activity: TransferActivity = {
     ...event,
-    id: transferActivityId(event),
+    id,
     status,
+    startedAt: existing?.startedAt ?? updatedAt,
     updatedAt,
   };
-  const existing = current.find((item) => item.id === activity.id);
   if (activity.status === "active" && existing && existing.status !== "active" && activity.id.endsWith(":model")) {
     return current;
   }
