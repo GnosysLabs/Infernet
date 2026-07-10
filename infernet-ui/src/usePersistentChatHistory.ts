@@ -13,6 +13,7 @@ import {
   createChatThread,
   createEmptyChatHistory,
   loadChatHistory as loadBrowserChatHistory,
+  loadChatHistoryResult as loadBrowserChatHistoryResult,
   removeChatThread,
   saveChatHistory as saveBrowserChatHistory,
 } from "./chatHistory";
@@ -47,11 +48,18 @@ export function usePersistentChatHistory() {
     let disposed = false;
 
     if (!nativeRuntime) {
-      const browserHistory = loadBrowserChatHistory();
+      const browserResult = loadBrowserChatHistoryResult();
       if (!disposed) {
-        commitHistory(browserHistory);
+        commitHistory(browserResult.history);
+        if (!browserResult.canPersist) {
+          commitBackend("unavailable");
+          setError(`Chat history couldn’t be opened: ${browserResult.error}`);
+          return () => {
+            disposed = true;
+          };
+        }
         commitBackend("browser");
-        if (!saveBrowserChatHistory(browserHistory)) {
+        if (!saveBrowserChatHistory(browserResult.history)) {
           setError("Chat history couldn’t be saved in this browser.");
         }
       }

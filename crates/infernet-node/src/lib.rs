@@ -26,8 +26,8 @@ use futures::{
     channel::{mpsc, oneshot},
 };
 use infernet_model::{
-    LayerRange, ModelManifest, OfficialModelRelease, RuntimeKind, SeedShardManifest,
-    ShardDescriptor,
+    INFERNET_CHAT_CONTEXT_TOKENS, LayerRange, ModelManifest, OfficialModelRelease, RuntimeKind,
+    SeedShardManifest, ShardDescriptor,
 };
 use infernet_protocol::{
     ACTIVATION_PROTOCOL, ActivationRequest, ActivationResponse, MODEL_BLOB_PROTOCOL,
@@ -68,7 +68,7 @@ pub use capabilities::{
     PINNED_GGML_RPC_PROTOCOL_VERSION, clear_local_llama_rpc_endpoint,
     configured_llama_rpc_endpoint, detect_node_capabilities, local_llama_rpc_target,
     set_local_inference_active, set_local_llama_rpc_endpoint, set_local_rpc_active,
-    validate_llama_rpc_endpoint,
+    set_vram_contribution_limit_bytes, validate_llama_rpc_endpoint, vram_contribution_limit_bytes,
 };
 pub use llama_server_runtime::{
     LlamaServerCompletion, LlamaServerConfig, complete_with_persistent_llama_server,
@@ -2769,7 +2769,7 @@ impl PersistentInfernetWorker {
             .arg("--threads")
             .arg(llama_bridge_thread_cap().to_string())
             .arg("--max-context")
-            .arg("8192")
+            .arg(INFERNET_CHAT_CONTEXT_TOKENS.to_string())
             .arg("--server")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -5037,15 +5037,29 @@ fn publish_local_advertisement(
     for shard in &mut advertisement.hosted_shards {
         shard.resident = persistent_infernet_worker_is_resident(&shard.model_id, shard.layers);
     }
-    if advertisement.hosted_shards.iter().any(|shard| shard.resident) {
-        if let Some(capabilities) = advertisement.capabilities.as_mut() {
-            capabilities.available_accelerator_memory_bytes =
-                capabilities.total_accelerator_memory_bytes;
-            advertisement.available_vram_bytes =
-                Some(capabilities.total_accelerator_memory_bytes);
-        }
-    }
+    promote_resident_accelerator_capacity(advertisement);
     publish_advertisement(swarm, topic, advertisement)
+}
+
+fn promote_resident_accelerator_capacity(advertisement: &mut NodeAdvertisement) {
+    if !advertisement
+        .hosted_shards
+        .iter()
+        .any(|shard| shard.resident)
+    {
+        return;
+    }
+
+    let Some(capabilities) = advertisement.capabilities.as_mut() else {
+        return;
+    };
+    let promoted_bytes = capabilities
+        .vram_contribution_limit_bytes
+        .map_or(capabilities.total_accelerator_memory_bytes, |limit| {
+            limit.min(capabilities.total_accelerator_memory_bytes)
+        });
+    capabilities.available_accelerator_memory_bytes = promoted_bytes;
+    advertisement.available_vram_bytes = (promoted_bytes > 0).then_some(promoted_bytes);
 }
 
 fn publish_known_advertisements(
@@ -5373,6 +5387,55 @@ mod tests {
             address: String::new(),
             layers: LayerRange::new(start, end).unwrap(),
         }
+    }
+
+    #[test]
+    fn resident_capacity_respects_vram_contribution_limit_and_zero_opt_out() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let mut advertisement = local_capability_advertisement("local".to_owned(), String::new());
+        let mut shard = ShardDescriptor::demo(
+            "grid-demo-12",
+            LayerRange::new(0, ModelManifest::demo().layer_count).unwrap(),
+        );
+        shard.resident = true;
+        advertisement.hosted_shards.push(shard);
+        advertisement.available_vram_bytes = Some(20 * GIB);
+        {
+            let capabilities = advertisement.capabilities.as_mut().unwrap();
+            capabilities.total_accelerator_memory_bytes = 24 * GIB;
+            capabilities.available_accelerator_memory_bytes = 20 * GIB;
+            capabilities.vram_contribution_limit_bytes = Some(8 * GIB);
+        }
+
+        promote_resident_accelerator_capacity(&mut advertisement);
+
+        assert_eq!(advertisement.available_vram_bytes, Some(8 * GIB));
+        assert_eq!(
+            advertisement
+                .capabilities
+                .as_ref()
+                .unwrap()
+                .available_accelerator_memory_bytes,
+            8 * GIB
+        );
+
+        advertisement.available_vram_bytes = Some(8 * GIB);
+        advertisement
+            .capabilities
+            .as_mut()
+            .unwrap()
+            .vram_contribution_limit_bytes = Some(0);
+        promote_resident_accelerator_capacity(&mut advertisement);
+
+        assert_eq!(advertisement.available_vram_bytes, None);
+        assert_eq!(
+            advertisement
+                .capabilities
+                .as_ref()
+                .unwrap()
+                .available_accelerator_memory_bytes,
+            0
+        );
     }
 
     #[test]

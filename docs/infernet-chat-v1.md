@@ -11,7 +11,7 @@ The selected upstream release is **Gemma 4 26B A4B Instruct QAT Q4_0**:
 - 25.2B total parameters and 3.8B active parameters per token
 - 30 transformer layers
 - 128 experts, with 8 routed experts plus 1 shared expert active per token
-- 256K architectural context; Infernet v1 caps requests at 8K–16K
+- 256K architectural context; Infernet v1 allocates 32,768 tokens per request
 - 14.4 GB official text-model Q4_0 payload
 - Apache 2.0 license
 

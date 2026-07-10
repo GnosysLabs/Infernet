@@ -44,7 +44,9 @@ import type {
   ModelView,
   ProgressEvent,
 } from "./types";
+import { createChatMessage } from "./chatHistory";
 import type { ChatMessage, ChatThread } from "./chatHistory";
+import { buildConversationPrompt } from "./conversationContext";
 import { usePersistentChatHistory } from "./usePersistentChatHistory";
 
 type Page = "chat" | "network" | "downloads" | "settings";
@@ -66,6 +68,7 @@ type NodeJournalEntry = {
 const DEFAULT_PROMPT = "";
 const COMPOSER_MAX_HEIGHT = 160;
 const INFERNET_CHAT_MODEL_ID = "infernet-chat-v1";
+const UNSAVED_RESPONSE_ERROR = "The response is visible, but Infernet couldn’t save it. Keep the app open if you need to copy it.";
 const MARKDOWN_COMPONENTS: Components = {
   a: ({ node: _node, ...props }) => (
     <a {...props} target="_blank" rel="noreferrer noopener" />
@@ -115,6 +118,9 @@ export default function App() {
   const [runningThreadId, setRunningThreadId] = useState<string | null>(null);
   const runningThreadIdRef = useRef<string | null>(null);
   const [threadErrors, setThreadErrors] = useState<Record<string, string>>({});
+  const [unsavedAssistantMessages, setUnsavedAssistantMessages] = useState<
+    Record<string, ChatMessage[]>
+  >({});
   const [composerFocusRequest, setComposerFocusRequest] = useState(0);
   const [lastError, setLastError] = useState<string | null>(null);
   const [transferActivities, setTransferActivities] = useState<TransferActivity[]>([]);
@@ -123,6 +129,9 @@ export default function App() {
   const activeThread = chatHistory.threads.find(
     (thread) => thread.id === chatHistory.activeThreadId,
   ) ?? chatHistory.threads[0];
+  const activeMessages = activeThread
+    ? [...activeThread.messages, ...(unsavedAssistantMessages[activeThread.id] ?? [])]
+    : [];
   const isRunning = runningThreadId !== null;
 
   const officialModels = useMemo(
@@ -386,10 +395,10 @@ export default function App() {
   async function createNewThread() {
     if (!chatHistoryReady) return;
     setPage("chat");
-    setPrompt("");
-    setLastError(null);
     const nextHistory = await createThread();
     if (nextHistory) {
+      setPrompt("");
+      setLastError(null);
       setComposerFocusRequest((request) => request + 1);
     }
   }
@@ -400,9 +409,11 @@ export default function App() {
       return;
     }
     setPage("chat");
-    setPrompt("");
-    setLastError(null);
-    await selectThread(threadId);
+    const nextHistory = await selectThread(threadId);
+    if (nextHistory) {
+      setPrompt("");
+      setLastError(null);
+    }
   }
 
   async function removeThread(threadId: string) {
@@ -411,6 +422,11 @@ export default function App() {
     const nextHistory = await deleteThread(threadId);
     if (!nextHistory) return;
     setThreadErrors((current) => {
+      const next = { ...current };
+      delete next[threadId];
+      return next;
+    });
+    setUnsavedAssistantMessages((current) => {
       const next = { ...current };
       delete next[threadId];
       return next;
@@ -424,7 +440,13 @@ export default function App() {
   async function runInference() {
     const userPrompt = prompt.trim();
     const threadId = activeThread?.id;
-    if (!userPrompt || !threadId || !chatHistoryReady || runningThreadIdRef.current) {
+    if (
+      !userPrompt
+      || !threadId
+      || !chatHistoryReady
+      || chatHistoryBusy
+      || runningThreadIdRef.current
+    ) {
       return;
     }
 
@@ -453,8 +475,20 @@ export default function App() {
     setLastError(null);
 
     try {
-      const output = (await runDistributedInference(userPrompt, selectedModel)).output;
-      await appendMessage(threadId, "assistant", output);
+      const conversationPrompt = buildConversationPrompt(activeMessages, userPrompt);
+      const output = (await runDistributedInference(conversationPrompt, selectedModel)).output;
+      const historyWithResponse = await appendMessage(threadId, "assistant", output);
+      if (!historyWithResponse) {
+        const unsavedMessage = createChatMessage("assistant", output);
+        setUnsavedAssistantMessages((current) => ({
+          ...current,
+          [threadId]: [...(current[threadId] ?? []), unsavedMessage],
+        }));
+        setThreadErrors((current) => ({
+          ...current,
+          [threadId]: UNSAVED_RESPONSE_ERROR,
+        }));
+      }
     } catch (error) {
       const message = String(error);
       setThreadErrors((current) => ({ ...current, [threadId]: message }));
@@ -497,12 +531,12 @@ export default function App() {
 
         {page === "chat" ? (
           <ChatPage
-            messages={activeThread?.messages ?? []}
+            messages={activeMessages}
             prompt={prompt}
             setPrompt={setPrompt}
             runInference={runInference}
             isRunning={runningThreadId === activeThread?.id}
-            sendBlocked={isRunning || !chatHistoryReady}
+            sendBlocked={isRunning || !chatHistoryReady || chatHistoryBusy}
             model={selectedModelView}
             isEstablishingConnection={isEstablishingConnection}
             lastError={activeThread ? threadErrors[activeThread.id] ?? lastError : lastError}
@@ -564,6 +598,21 @@ function Sidebar({
   onDeleteThread: (threadId: string) => Promise<void>;
 }) {
   const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
+  const [deletingThreadId, setDeletingThreadId] = useState<string | null>(null);
+  const deleteButtonRefs = useRef(new Map<string, HTMLButtonElement>());
+  const threadButtonRefs = useRef(new Map<string, HTMLButtonElement>());
+
+  const restoreDeleteButtonFocus = (threadId: string) => {
+    window.requestAnimationFrame(() => deleteButtonRefs.current.get(threadId)?.focus());
+  };
+
+  const restoreThreadFocus = () => {
+    window.requestAnimationFrame(() => {
+      const activeButton = threadButtonRefs.current.get(activeThreadId);
+      const fallbackButton = threadButtonRefs.current.values().next().value;
+      (activeButton ?? fallbackButton)?.focus();
+    });
+  };
 
   useEffect(() => {
     if (confirmingDeleteId && !threads.some((thread) => thread.id === confirmingDeleteId)) {
@@ -616,6 +665,7 @@ function Sidebar({
             const active = thread.id === activeThreadId;
             const isRunning = thread.id === runningThreadId;
             const confirmingDelete = thread.id === confirmingDeleteId;
+            const deleting = thread.id === deletingThreadId;
 
             return (
               <li
@@ -629,17 +679,26 @@ function Sidebar({
                       <button
                         type="button"
                         className="thread-confirm-cancel"
-                        onClick={() => setConfirmingDeleteId(null)}
+                        autoFocus
+                        disabled={disabled || deleting}
+                        onClick={() => {
+                          setConfirmingDeleteId(null);
+                          restoreDeleteButtonFocus(thread.id);
+                        }}
                       >
                         Cancel
                       </button>
                       <button
                         type="button"
                         className="thread-confirm-delete"
-                        autoFocus
+                        disabled={disabled || deleting}
                         onClick={async () => {
+                          if (deleting) return;
+                          setDeletingThreadId(thread.id);
                           await onDeleteThread(thread.id);
+                          setDeletingThreadId(null);
                           setConfirmingDeleteId(null);
+                          restoreThreadFocus();
                         }}
                       >
                         Delete
@@ -649,6 +708,10 @@ function Sidebar({
                 ) : (
                   <>
                     <button
+                      ref={(element) => {
+                        if (element) threadButtonRefs.current.set(thread.id, element);
+                        else threadButtonRefs.current.delete(thread.id);
+                      }}
                       type="button"
                       className="thread-select-button"
                       disabled={disabled}
@@ -661,6 +724,10 @@ function Sidebar({
                       ) : null}
                     </button>
                     <button
+                      ref={(element) => {
+                        if (element) deleteButtonRefs.current.set(thread.id, element);
+                        else deleteButtonRefs.current.delete(thread.id);
+                      }}
                       type="button"
                       className="thread-delete-button"
                       disabled={disabled || isRunning}
@@ -802,6 +869,7 @@ function ChatPage({
   const composerInputRef = useRef<HTMLTextAreaElement>(null);
   const canSend = Boolean(model?.runnable);
   const isEmpty = messages.length === 0;
+  const responseIsUnsaved = lastError === UNSAVED_RESPONSE_ERROR;
 
   useEffect(() => {
     const conversation = conversationRef.current;
@@ -878,8 +946,10 @@ function ChatPage({
 
           {lastError && messages.length > 0 && !isRunning ? (
             <div className="chat-error" role="alert">
-              <strong>Infernet couldn’t finish that response.</strong>
-              <span>{friendlyActivityError(lastError)}</span>
+              <strong>{responseIsUnsaved
+                ? "This response isn’t saved."
+                : "Infernet couldn’t finish that response."}</strong>
+              <span>{responseIsUnsaved ? lastError : friendlyActivityError(lastError)}</span>
             </div>
           ) : null}
         </div>

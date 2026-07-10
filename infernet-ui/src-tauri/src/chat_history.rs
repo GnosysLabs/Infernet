@@ -1,11 +1,12 @@
 use std::{
     collections::HashSet,
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::State;
@@ -53,6 +54,7 @@ pub(crate) enum ChatRole {
 pub(crate) struct ChatHistoryStore {
     path: PathBuf,
     document: ChatHistory,
+    _instance_lock: File,
 }
 
 enum DocumentParseError {
@@ -85,9 +87,14 @@ impl ChatThread {
 
 impl ChatHistoryStore {
     pub(crate) fn open(path: PathBuf) -> Result<Self, String> {
+        let instance_lock = lock_history_for_instance(&path)?;
         match fs::read(&path) {
             Ok(bytes) => match parse_document(&bytes) {
-                Ok(document) => Ok(Self { path, document }),
+                Ok(document) => Ok(Self {
+                    path,
+                    document,
+                    _instance_lock: instance_lock,
+                }),
                 Err(DocumentParseError::UnsupportedVersion(version)) => Err(format!(
                     "unsupported chat history version {version}; expected {CHAT_HISTORY_VERSION}"
                 )),
@@ -101,6 +108,7 @@ impl ChatHistoryStore {
                     let store = Self {
                         path,
                         document: ChatHistory::empty(now_unix_ms()),
+                        _instance_lock: instance_lock,
                     };
                     store.persist(&store.document).map_err(|error| {
                         format!(
@@ -116,6 +124,7 @@ impl ChatHistoryStore {
                 let store = Self {
                     path,
                     document: ChatHistory::empty(now_unix_ms()),
+                    _instance_lock: instance_lock,
                 };
                 store.persist(&store.document)?;
                 Ok(store)
@@ -273,10 +282,46 @@ fn with_store<T>(
         .chat_history
         .lock()
         .map_err(|_| "failed to lock chat history".to_owned())?;
-    let store = history
-        .as_mut()
-        .ok_or_else(|| "chat history is not initialized".to_owned())?;
+    let store = history.as_mut().ok_or_else(|| {
+        state
+            .chat_history_error
+            .lock()
+            .ok()
+            .and_then(|error| error.clone())
+            .unwrap_or_else(|| "chat history is not initialized".to_owned())
+    })?;
     operation(store)
+}
+
+fn lock_history_for_instance(path: &Path) -> Result<File, String> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "failed to create chat history directory {}: {error}",
+            parent.display()
+        )
+    })?;
+    let lock_path = path.with_extension("lock");
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let lock_file = options.open(&lock_path).map_err(|error| {
+        format!(
+            "failed to open chat history lock at {}: {error}",
+            lock_path.display()
+        )
+    })?;
+    FileExt::try_lock_exclusive(&lock_file).map_err(|error| {
+        format!(
+            "chat history is already open in another Infernet instance ({}): {error}",
+            lock_path.display()
+        )
+    })?;
+    Ok(lock_file)
 }
 
 fn parse_document(bytes: &[u8]) -> Result<ChatHistory, DocumentParseError> {
@@ -375,8 +420,12 @@ fn persist_document(path: &Path, document: &ChatHistory) -> io::Result<()> {
 
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+            // The rename is already published at this point. Sync the directory
+            // when the filesystem supports it, without reporting the committed
+            // document as failed if directory syncing is unavailable.
+            if let Ok(directory) = File::open(parent) {
+                let _ = directory.sync_all();
+            }
         }
 
         Ok(())
@@ -395,13 +444,32 @@ fn replace_with_rename(source: &Path, destination: &Path) -> io::Result<()> {
 
 #[cfg(windows)]
 fn replace_with_rename(source: &Path, destination: &Path) -> io::Result<()> {
-    match fs::rename(source, destination) {
-        Ok(()) => Ok(()),
-        Err(_) if destination.exists() => {
-            fs::remove_file(destination)?;
-            fs::rename(source, destination)
-        }
-        Err(error) => Err(error),
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let moved = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }
 
@@ -562,6 +630,21 @@ mod tests {
     }
 
     #[test]
+    fn a_second_instance_cannot_overwrite_an_open_history() {
+        let directory = TestDirectory::new("instance-lock");
+        let path = directory.history_path();
+        let first = ChatHistoryStore::open(path.clone()).expect("open first history instance");
+
+        let error = ChatHistoryStore::open(path.clone())
+            .err()
+            .expect("reject second history instance");
+        assert!(error.contains("already open in another Infernet instance"));
+
+        drop(first);
+        ChatHistoryStore::open(path).expect("reopen history after first instance closes");
+    }
+
+    #[test]
     fn malformed_json_is_quarantined_and_recovered() {
         let directory = TestDirectory::new("corrupt");
         let path = directory.history_path();
@@ -601,11 +684,11 @@ mod tests {
 
         assert!(error.contains("unsupported chat history version 2"));
         assert_eq!(fs::read(&path).expect("reread future history"), future);
-        assert_eq!(
+        assert!(
             fs::read_dir(&directory.0)
                 .expect("list test directory")
-                .count(),
-            1
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().contains(".corrupt-"))
         );
     }
 }

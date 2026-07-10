@@ -1,4 +1,6 @@
-use infernet_model::{LayerRange, ModelManifest, OfficialModelRelease};
+use infernet_model::{
+    INFERNET_CHAT_KV_CACHE_BYTES_PER_LAYER, LayerRange, ModelManifest, OfficialModelRelease,
+};
 use infernet_protocol::{NodeAdvertisement, NodeCapabilities, RouteHop};
 use infernet_router::ShardRegistry;
 use serde::Serialize;
@@ -6,7 +8,6 @@ use std::collections::BTreeSet;
 
 const SAFETY_RESERVE_BYTES: u64 = 1024 * 1024 * 1024;
 const RUNTIME_SCRATCH_BYTES: u64 = 768 * 1024 * 1024;
-const KV_CACHE_BYTES_PER_LAYER: u64 = 32 * 1024 * 1024;
 const MAX_PIPELINE_WORKERS: usize = 8;
 
 #[derive(Debug, Clone, Serialize)]
@@ -52,7 +53,7 @@ pub fn plan_worker_execution(
     let bytes_per_layer = release
         .expected_total_bytes
         .div_ceil(u64::from(model.layer_count))
-        .saturating_add(KV_CACHE_BYTES_PER_LAYER);
+        .saturating_add(INFERNET_CHAT_KV_CACHE_BYTES_PER_LAYER);
 
     let advertisements = registry.advertisements();
     let mut candidates = advertisements
@@ -357,6 +358,7 @@ mod tests {
                 available_ram_bytes: memory,
                 total_accelerator_memory_bytes: memory,
                 available_accelerator_memory_bytes: memory,
+                vram_contribution_limit_bytes: None,
                 unified_memory: false,
                 max_sessions: 1,
                 active_sessions: 0,

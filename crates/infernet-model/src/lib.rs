@@ -3,6 +3,12 @@ use thiserror::Error;
 
 pub mod gguf;
 
+/// Total prompt plus generation context allocated by Infernet Chat workers.
+pub const INFERNET_CHAT_CONTEXT_TOKENS: u32 = 32_768;
+/// Conservative per-layer KV allowance, scaled from 32 MiB at the former 8K window.
+pub const INFERNET_CHAT_KV_CACHE_BYTES_PER_LAYER: u64 =
+    32 * 1024 * 1024 * (INFERNET_CHAT_CONTEXT_TOKENS as u64) / 8_192;
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ModelError {
     #[error("layer range {start}..{end} is empty")]
@@ -363,7 +369,7 @@ impl OfficialModelRelease {
                 source_sha256: SOURCE_SHA256.to_owned(),
             },
             expected_total_bytes: SOURCE_BYTES,
-            launch_context_cap_tokens: 8_192,
+            launch_context_cap_tokens: INFERNET_CHAT_CONTEXT_TOKENS,
             components: vec![OfficialModelComponent {
                 component_id: "compatibility-full-model".to_owned(),
                 model_id: "infernet-chat-v1".to_owned(),
@@ -665,6 +671,11 @@ mod tests {
             Ok(())
         );
         assert_eq!(release.expected_total_bytes, 14_439_361_440);
+        assert_eq!(
+            release.launch_context_cap_tokens,
+            INFERNET_CHAT_CONTEXT_TOKENS
+        );
+        assert_eq!(INFERNET_CHAT_KV_CACHE_BYTES_PER_LAYER, 128 * 1024 * 1024);
         assert_eq!(
             release.components[0].sha256,
             "4c856523d61d77922dbc0b26753a6bf6208e5d69d80db0c04dcd776832d054c5"

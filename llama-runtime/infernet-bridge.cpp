@@ -206,7 +206,7 @@ public:
 
         llama_context_params params = llama_context_default_params();
         params.n_ctx = max_context_tokens_;
-        params.n_batch = std::min<uint32_t>(2048, max_context_tokens_);
+        params.n_batch = max_context_tokens_;
         params.n_ubatch = std::min<uint32_t>(2048, max_context_tokens_);
         params.n_seq_max = 1;
         params.infernet_layer_start = layer_start_;
@@ -240,8 +240,16 @@ public:
         const std::string formatted = format_chat_prompt(model_, prompt);
         std::vector<llama_token> tokens = tokenize_prompt(vocab_, formatted);
         if (tokens.empty()) throw std::runtime_error("prompt produced no tokens");
-        if (tokens.size() > 2048 || tokens.size() + MAX_GENERATED_TOKENS > max_context_tokens_) {
-            throw std::runtime_error("prompt exceeds the Infernet context safety limit");
+        const size_t prompt_token_limit = max_context_tokens_ > MAX_GENERATED_TOKENS
+            ? static_cast<size_t>(max_context_tokens_ - MAX_GENERATED_TOKENS)
+            : 0;
+        if (tokens.size() > prompt_token_limit) {
+            std::ostringstream error;
+            error << "prompt uses " << tokens.size() << " tokens, but Infernet's "
+                  << max_context_tokens_ << "-token context reserves "
+                  << MAX_GENERATED_TOKENS << " tokens for the response (maximum prompt: "
+                  << prompt_token_limit << " tokens)";
+            throw std::runtime_error(error.str());
         }
         const std::vector<float> activation = read_f32_file(input_path);
         decode(trace_id, tokens, activation, 0, output_path);
@@ -360,7 +368,7 @@ static void print_usage(const char * argv0) {
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
     std::string model_path;
-    uint32_t layer_start = 0, layer_end = 0, hidden_size = 0, threads = 4, max_context = 8192;
+    uint32_t layer_start = 0, layer_end = 0, hidden_size = 0, threads = 4, max_context = 32768;
     int32_t gpu_layers = -1;
     bool server = false;
 

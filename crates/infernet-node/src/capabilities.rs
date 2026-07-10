@@ -97,6 +97,7 @@ impl AvailableMemoryCache {
 
 static DETECTED_HARDWARE: OnceLock<NodeCapabilities> = OnceLock::new();
 static AVAILABLE_MEMORY: OnceLock<Mutex<AvailableMemoryCache>> = OnceLock::new();
+static VRAM_CONTRIBUTION_LIMIT_BYTES: OnceLock<Mutex<Option<u64>>> = OnceLock::new();
 static LOCAL_LLAMA_RPC: OnceLock<Mutex<LocalLlamaRpcState>> = OnceLock::new();
 static LOCAL_INFERENCE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static LOCAL_RPC_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -109,9 +110,13 @@ pub fn detect_node_capabilities() -> NodeCapabilities {
         .clone();
     let available_memory = detect_available_memory(&capabilities);
     capabilities.available_ram_bytes = available_memory.ram_bytes.min(capabilities.total_ram_bytes);
-    capabilities.available_accelerator_memory_bytes = available_memory
-        .accelerator_bytes
-        .min(capabilities.total_accelerator_memory_bytes);
+    let contribution_limit = vram_contribution_limit_bytes();
+    capabilities.available_accelerator_memory_bytes = clamp_available_accelerator_memory(
+        capabilities.total_accelerator_memory_bytes,
+        available_memory.accelerator_bytes,
+        contribution_limit,
+    );
+    capabilities.vram_contribution_limit_bytes = contribution_limit;
     capabilities.max_sessions = configured_u32("INFERNET_MAX_SESSIONS")
         .unwrap_or(capabilities.max_sessions)
         .max(1);
@@ -126,6 +131,34 @@ pub fn detect_node_capabilities() -> NodeCapabilities {
     capabilities.queue_depth = configured_u32("INFERNET_QUEUE_DEPTH").unwrap_or(0);
     capabilities.llama_rpc = local_llama_rpc_endpoint();
     capabilities
+}
+
+/// Sets the process-wide accelerator-memory limit offered to network work.
+/// `None` preserves automatic contribution of all currently available memory.
+pub fn set_vram_contribution_limit_bytes(limit: Option<u64>) {
+    *VRAM_CONTRIBUTION_LIMIT_BYTES
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = limit;
+}
+
+/// Returns the process-wide accelerator-memory limit offered to network work.
+pub fn vram_contribution_limit_bytes() -> Option<u64> {
+    *VRAM_CONTRIBUTION_LIMIT_BYTES
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn clamp_available_accelerator_memory(
+    total_bytes: u64,
+    available_bytes: u64,
+    contribution_limit_bytes: Option<u64>,
+) -> u64 {
+    let physically_available = available_bytes.min(total_bytes);
+    contribution_limit_bytes.map_or(physically_available, |limit| {
+        physically_available.min(limit)
+    })
 }
 
 pub fn set_local_inference_active(active: bool) {
@@ -241,6 +274,7 @@ fn detect_static_hardware() -> NodeCapabilities {
         available_ram_bytes: memory.available_bytes,
         total_accelerator_memory_bytes: 0,
         available_accelerator_memory_bytes: 0,
+        vram_contribution_limit_bytes: None,
         unified_memory: false,
         max_sessions: 1,
         active_sessions: 0,
@@ -767,6 +801,26 @@ mod tests {
         );
         assert_eq!(throttled_again, refreshed);
         assert_eq!(probes.get(), 1);
+    }
+
+    #[test]
+    fn contribution_limit_clamps_only_available_accelerator_memory() {
+        assert_eq!(
+            clamp_available_accelerator_memory(24_000, 20_000, None),
+            20_000
+        );
+        assert_eq!(
+            clamp_available_accelerator_memory(24_000, 20_000, Some(12_000)),
+            12_000
+        );
+        assert_eq!(
+            clamp_available_accelerator_memory(24_000, 20_000, Some(0)),
+            0
+        );
+        assert_eq!(
+            clamp_available_accelerator_memory(24_000, 30_000, Some(28_000)),
+            24_000
+        );
     }
 
     #[test]

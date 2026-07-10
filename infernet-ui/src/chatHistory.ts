@@ -18,6 +18,12 @@ export type ChatHistory = {
   threads: ChatThread[];
 };
 
+export type ChatHistoryLoadResult = {
+  history: ChatHistory;
+  canPersist: boolean;
+  error: string | null;
+};
+
 const CHAT_HISTORY_STORAGE_KEY = "infernet-chat-history-v1";
 const NEW_CHAT_TITLE = "New chat";
 const MAX_THREAD_TITLE_LENGTH = 48;
@@ -42,15 +48,39 @@ export function createEmptyChatHistory(now = Date.now()): ChatHistory {
 }
 
 export function loadChatHistory(): ChatHistory {
+  return loadChatHistoryResult().history;
+}
+
+export function loadChatHistoryResult(): ChatHistoryLoadResult {
   const storage = getLocalStorage();
-  if (!storage) return createEmptyChatHistory();
+  if (!storage) {
+    return {
+      history: createEmptyChatHistory(),
+      canPersist: false,
+      error: "local storage is unavailable",
+    };
+  }
 
   try {
     const stored = storage.getItem(CHAT_HISTORY_STORAGE_KEY);
-    if (!stored) return createEmptyChatHistory();
-    return parseChatHistory(JSON.parse(stored));
+    if (!stored) {
+      return { history: createEmptyChatHistory(), canPersist: true, error: null };
+    }
+    const parsed: unknown = JSON.parse(stored);
+    if (
+      isRecord(parsed)
+      && typeof parsed.version === "number"
+      && parsed.version !== 1
+    ) {
+      return {
+        history: createEmptyChatHistory(),
+        canPersist: false,
+        error: `unsupported chat history version ${parsed.version}; expected 1`,
+      };
+    }
+    return { history: parseChatHistory(parsed), canPersist: true, error: null };
   } catch {
-    return createEmptyChatHistory();
+    return { history: createEmptyChatHistory(), canPersist: true, error: null };
   }
 }
 

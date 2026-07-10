@@ -172,6 +172,10 @@ pub struct NodeCapabilities {
     pub available_ram_bytes: u64,
     pub total_accelerator_memory_bytes: u64,
     pub available_accelerator_memory_bytes: u64,
+    /// User-selected ceiling for accelerator or unified memory offered to
+    /// network work. `None` keeps the automatic all-available behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vram_contribution_limit_bytes: Option<u64>,
     pub unified_memory: bool,
     pub max_sessions: u32,
     pub active_sessions: u32,
@@ -531,6 +535,7 @@ mod tests {
             available_ram_bytes: 48 * 1024 * 1024 * 1024,
             total_accelerator_memory_bytes: 24 * 1024 * 1024 * 1024,
             available_accelerator_memory_bytes: 20 * 1024 * 1024 * 1024,
+            vram_contribution_limit_bytes: Some(16 * 1024 * 1024 * 1024),
             unified_memory: false,
             max_sessions: 1,
             active_sessions: 0,
@@ -564,6 +569,10 @@ mod tests {
         let advertised_rpc = &encoded["capabilities"]["llama_rpc"];
         assert!(advertised_rpc.get("host").is_none());
         assert!(advertised_rpc.get("port").is_none());
+        assert_eq!(
+            encoded["capabilities"]["vram_contribution_limit_bytes"],
+            16_u64 * 1024 * 1024 * 1024
+        );
         let decoded: NodeAdvertisement = serde_json::from_slice(&bytes).unwrap();
         let mut expected = advertisement.clone();
         let expected_rpc = expected
@@ -608,8 +617,14 @@ mod tests {
         }"#;
         let capabilities: NodeCapabilities = serde_json::from_str(capabilities_json).unwrap();
         assert!(capabilities.llama_rpc.is_none());
+        assert!(capabilities.vram_contribution_limit_bytes.is_none());
         let capabilities_value = serde_json::to_value(capabilities).unwrap();
         assert!(capabilities_value.get("llama_rpc").is_none());
+        assert!(
+            capabilities_value
+                .get("vram_contribution_limit_bytes")
+                .is_none()
+        );
 
         let prompt_json = r#"{"prompt":"hello","demo_mode":false}"#;
         let prompt: PromptMetadata = serde_json::from_str(prompt_json).unwrap();

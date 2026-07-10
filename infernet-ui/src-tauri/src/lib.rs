@@ -20,8 +20,8 @@ use chat_history::{
 use execution_plan::{ExecutionParticipantView, plan_worker_execution, worker_is_usable};
 use futures::{StreamExt, channel::oneshot};
 use infernet_model::{
-    LayerRange, ModelManifest, OfficialComponentKind, OfficialModelRelease, RuntimeKind,
-    SeedShardManifest, ShardDescriptor,
+    INFERNET_CHAT_KV_CACHE_BYTES_PER_LAYER, LayerRange, ModelManifest, OfficialComponentKind,
+    OfficialModelRelease, RuntimeKind, SeedShardManifest, ShardDescriptor,
 };
 use infernet_node::{
     DiscoveryConfig, INFERNET_LLAMA_RPC_RUNTIME_ABI, LLAMA_RPC_DEFAULT_PORT,
@@ -58,7 +58,6 @@ const DEFAULT_INFERENCE_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_MODEL_FETCH_TIMEOUT_MS: u64 = 60 * 60 * 1_000;
 const UI_LISTEN_PORT: u16 = 9777;
 const OFFICIAL_CHAT_MODEL_ID: &str = "infernet-chat-v1";
-const LAUNCH_KV_CACHE_BYTES_PER_LAYER: u64 = 32 * 1024 * 1024;
 const RUNTIME_SCRATCH_BYTES_PER_PEER: u64 = 768 * 1024 * 1024;
 const CAPACITY_SAFETY_BYTES: u64 = 1024 * 1024 * 1024;
 // The transport delivers 4 MiB chunks. Forward every completed chunk so the
@@ -95,6 +94,7 @@ impl Drop for AdvertisedLlamaRpcServer {
 struct UiState {
     keypair: Mutex<identity::Keypair>,
     chat_history: Mutex<Option<ChatHistoryStore>>,
+    chat_history_error: Mutex<Option<String>>,
     topic: String,
     model_distribution_service: Arc<Mutex<ModelDistributionServiceState>>,
     live_registry: Arc<Mutex<ShardRegistry>>,
@@ -110,6 +110,7 @@ impl Default for UiState {
         Self {
             keypair: Mutex::new(identity::Keypair::generate_ed25519()),
             chat_history: Mutex::new(None),
+            chat_history_error: Mutex::new(None),
             topic: DEFAULT_TOPIC.to_owned(),
             model_distribution_service: Arc::new(Mutex::new(
                 ModelDistributionServiceState::Stopped,
@@ -1450,7 +1451,7 @@ fn model_records_to_download_for_local_contribution(
     }
 
     let config = |minimum_peer_count| CapacityPlanningConfig {
-        kv_cache_bytes_per_layer: LAUNCH_KV_CACHE_BYTES_PER_LAYER,
+        kv_cache_bytes_per_layer: INFERNET_CHAT_KV_CACHE_BYTES_PER_LAYER,
         scratch_bytes_per_peer: RUNTIME_SCRATCH_BYTES_PER_PEER,
         safety_margin_bytes: CAPACITY_SAFETY_BYTES,
         safety_margin_basis_points: 1_000,
@@ -3361,6 +3362,11 @@ pub fn run() {
                 }
                 Err(error) => {
                     eprintln!("failed to open chat history: {error}");
+                    *app_handle
+                        .state::<UiState>()
+                        .chat_history_error
+                        .lock()
+                        .expect("UI chat history error lock poisoned during startup") = Some(error);
                 }
             }
             let identity_path = app_data_dir.join("identity.key");

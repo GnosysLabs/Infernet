@@ -20,6 +20,7 @@ anyhow = "1.0.98"
 async-trait = "0.1.88"
 clap = { version = "4.5.41", features = ["derive"] }
 futures = "0.3.31"
+fs2 = "0.4.3"
 if-addrs = "0.15.0"
 infernet-model = { path = "crates/infernet-model" }
 infernet-node = { path = "crates/infernet-node" }
