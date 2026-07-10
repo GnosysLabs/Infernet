@@ -743,6 +743,12 @@ async fn acquire_advertised_model_records(
         );
         let (mut config, _) = discovery_config_from_state(state)?;
         config.static_peers = static_peers.clone();
+        // The persistent desktop node already owns the machine's stable
+        // relay reservation. A one-shot download using the same PeerId creates
+        // a competing reservation and can wait forever for readiness. Give
+        // each transfer swarm its own short-lived authenticated identity.
+        config.keypair = identity::Keypair::generate_ed25519();
+        config.advertisement = None;
         let progress_app = app.clone();
         let progress_model_id = manifest.model_id.clone();
         let progress_detail = format!(
@@ -856,6 +862,8 @@ fn spawn_background_model_record_acquisition(
     merge_static_peer_advertisements(&mut static_peers, registry.advertisements());
     let (mut config, _) = discovery_config_from_state(state)?;
     config.static_peers = static_peers;
+    config.keypair = identity::Keypair::generate_ed25519();
+    config.advertisement = None;
 
     let app = app.clone();
     let cache_config = cache_config.clone();
