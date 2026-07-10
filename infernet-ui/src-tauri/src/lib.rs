@@ -652,7 +652,7 @@ async fn discover_registry(
         cache_config,
         local_peer_id.clone(),
     ));
-    let fresh_registry = trusted_launch_registry(registry);
+    let fresh_registry = trusted_launch_registry(registry, &local_peer_id);
     // Static bootstrap/manual descriptors are inserted before discovery, so
     // their mere presence is not proof that a machine is online. Only a
     // current capability or executable model report refreshes last-seen.
@@ -672,9 +672,20 @@ async fn discover_registry(
     Ok((routable_registry, local_peer_id, topic, presence))
 }
 
-fn trusted_launch_registry(registry: ShardRegistry) -> ShardRegistry {
+fn trusted_launch_registry(registry: ShardRegistry, local_peer_id: &str) -> ShardRegistry {
     let mut trusted = ShardRegistry::new();
     for mut advertisement in registry.advertisements() {
+        if advertisement.peer_id != local_peer_id {
+            advertisement
+                .addresses
+                .retain(|address| remote_route_address_is_usable(address));
+            advertisement.addresses.sort_by_key(|address| {
+                let is_tcp_circuit = address.contains("/tcp/") && address.contains("/p2p-circuit/");
+                let is_circuit = address.contains("/p2p-circuit/");
+                (!is_tcp_circuit, !is_circuit, address.clone())
+            });
+            advertisement.addresses.dedup();
+        }
         let trusted_records = advertisement
             .model_shards
             .iter()
@@ -709,6 +720,17 @@ fn trusted_launch_registry(registry: ShardRegistry) -> ShardRegistry {
         trusted.upsert(advertisement);
     }
     trusted
+}
+
+fn remote_route_address_is_usable(address: &str) -> bool {
+    let Ok(address) = address.parse::<Multiaddr>() else {
+        return false;
+    };
+    !address.iter().any(|protocol| match protocol {
+        Protocol::Ip4(host) => host.is_loopback() || host.is_unspecified(),
+        Protocol::Ip6(host) => host.is_loopback() || host.is_unspecified(),
+        _ => false,
+    })
 }
 
 fn official_release_download_url(release: &OfficialModelRelease) -> String {
@@ -3557,7 +3579,7 @@ mod tests {
         registry.upsert(valid);
         registry.upsert(forged);
         registry.upsert(too_small);
-        let trusted = trusted_launch_registry(registry);
+        let trusted = trusted_launch_registry(registry, "local-peer");
         let advertisements = trusted.advertisements();
         let route = trusted.route_for_model(&model).unwrap();
 
@@ -3991,5 +4013,20 @@ mod tests {
             Some(4_194_304)
         );
         assert_eq!(content_range_start("invalid"), None);
+    }
+
+    #[test]
+    fn remote_routes_reject_loopback_but_keep_public_circuits() {
+        let relay = identity::Keypair::generate_ed25519().public().to_peer_id();
+        let target = identity::Keypair::generate_ed25519().public().to_peer_id();
+        assert!(!remote_route_address_is_usable(&format!(
+            "/ip4/127.0.0.1/tcp/9777/p2p/{target}"
+        )));
+        assert!(!remote_route_address_is_usable(&format!(
+            "/ip4/0.0.0.0/tcp/9777/p2p/{target}"
+        )));
+        assert!(remote_route_address_is_usable(&format!(
+            "/ip4/217.77.11.197/tcp/9777/p2p/{relay}/p2p-circuit/p2p/{target}"
+        )));
     }
 }

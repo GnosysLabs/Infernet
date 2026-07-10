@@ -4381,6 +4381,17 @@ fn update_listen_address(
         return false;
     };
 
+    // Loopback and wildcard listeners are process-local implementation
+    // details. Advertising them makes remote nodes dial themselves while
+    // expecting this PeerId, producing an `Unexpected peer ID` failure.
+    if address.iter().any(|protocol| match protocol {
+        Protocol::Ip4(host) => host.is_loopback() || host.is_unspecified(),
+        Protocol::Ip6(host) => host.is_loopback() || host.is_unspecified(),
+        _ => false,
+    }) {
+        return false;
+    }
+
     let address = match address.with_p2p(peer_id) {
         Ok(address) | Err(address) => address.to_string(),
     };
