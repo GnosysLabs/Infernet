@@ -644,6 +644,12 @@ button:disabled {
   color: oklch(0.54 0 0);
 }
 
+.composer textarea:focus,
+.composer textarea:focus-visible {
+  outline: none;
+  outline-offset: 0;
+}
+
 .composer textarea:disabled {
   cursor: not-allowed;
   color: var(--muted);

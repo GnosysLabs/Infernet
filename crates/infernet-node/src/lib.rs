@@ -2172,7 +2172,7 @@ pub async fn infer_over_libp2p(
         return Ok(InferenceResult { route, response });
     }
 
-    const MAX_GENERATED_TOKENS: usize = 64;
+    const MAX_GENERATED_TOKENS: usize = 512;
     let trace_id = response.trace_id;
     let mut output_text = String::new();
     let mut complete_trace = Vec::new();
@@ -2236,8 +2236,53 @@ pub async fn infer_over_libp2p(
         .await?;
     }
     response.trace = complete_trace;
-    response.output_text = Some(output_text);
+    response.output_text = Some(sanitize_assistant_output(&output_text));
     Ok(InferenceResult { route, response })
+}
+
+fn sanitize_assistant_output(raw: &str) -> String {
+    let mut visible = raw.trim();
+
+    // Prefer an explicit final/content channel when a reasoning-capable chat
+    // template emitted both private analysis and a user-facing answer.
+    for marker in [
+        "<|channel|>final<|message|>",
+        "<|channel>final<channel|>",
+        "<|channel>final <channel|>",
+        "<|channel|>commentary<|message|>",
+    ] {
+        if let Some(index) = visible.rfind(marker) {
+            visible = &visible[index + marker.len()..];
+            break;
+        }
+    }
+
+    // Gemma 4's current template prefixes ordinary assistant text with this
+    // channel header. It is model control syntax, not response content.
+    for marker in [
+        "<|channel>thought<channel|>",
+        "<|channel>thought <channel|>",
+        "<|channel|>thought<|channel|>",
+        "<|channel|>thought <|channel|>",
+    ] {
+        if let Some(rest) = visible.strip_prefix(marker) {
+            visible = rest;
+            break;
+        }
+    }
+
+    let mut cleaned = visible.to_owned();
+    for control in [
+        "<|channel>",
+        "<channel|>",
+        "<|channel|>",
+        "<|message|>",
+        "<|start|>",
+        "<|end|>",
+    ] {
+        cleaned = cleaned.replace(control, "");
+    }
+    cleaned.trim().to_owned()
 }
 
 fn normalize_trusted_rpc_endpoints(endpoints: &[String]) -> Result<Vec<String>> {

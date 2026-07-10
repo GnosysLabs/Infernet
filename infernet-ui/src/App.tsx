@@ -13,7 +13,6 @@ import {
   MemoryStick,
   MessageSquare,
   PanelRightClose,
-  RefreshCw,
   Send,
   Server,
   Settings,
@@ -263,10 +262,10 @@ export default function App() {
   }, [connectionPending, page, refreshSnapshot, selectedModel]);
 
   useEffect(() => {
-    if (!activityOpen && page !== "downloads" && page !== "network") return;
+    if (page === "chat" && connectionPending) return;
     let disposed = false;
     let inFlight = false;
-    const refreshActivity = async () => {
+    const refreshStatus = async () => {
       if (inFlight) return;
       inFlight = true;
       try {
@@ -280,13 +279,13 @@ export default function App() {
         inFlight = false;
       }
     };
-    void refreshActivity();
-    const interval = window.setInterval(refreshActivity, 6000);
+    void refreshStatus();
+    const interval = window.setInterval(refreshStatus, 6000);
     return () => {
       disposed = true;
       window.clearInterval(interval);
     };
-  }, [activityOpen, page, selectedModel]);
+  }, [connectionPending, page, selectedModel]);
 
   useEffect(() => {
     let disposed = false;
@@ -389,10 +388,8 @@ export default function App() {
       <main className="app-main">
         <AppHeader
           page={page}
-          model={selectedModelView}
           networkNodeCount={snapshot.machines.filter((machine) => machine.connectionStatus !== "unreachable").length}
           networkReadyCount={snapshot.machines.filter((machine) => machine.rpcReady && machine.connectionStatus !== "unreachable").length}
-          onRefresh={() => refreshSnapshot(selectedModel)}
           activityOpen={activityOpen}
           hasActiveWork={
             localNodeActivity.computeActive
@@ -508,19 +505,15 @@ function NavButton({
 
 function AppHeader({
   page,
-  model,
   networkNodeCount,
   networkReadyCount,
-  onRefresh,
   activityOpen,
   hasActiveWork,
   onToggleActivity,
 }: {
   page: Page;
-  model?: ModelView;
   networkNodeCount: number;
   networkReadyCount: number;
-  onRefresh: () => void;
   activityOpen: boolean;
   hasActiveWork: boolean;
   onToggleActivity: () => void;
@@ -529,15 +522,15 @@ function AppHeader({
     <header className="app-header">
       <div>
         <h1>{pageTitle(page)}</h1>
-        <div className="header-meta">
-          <span>
-            {page === "network"
-              ? networkNodeCount > 0
+        {page === "network" ? (
+          <div className="header-meta">
+            <span>
+              {networkNodeCount > 0
                 ? `${networkNodeCount} node${networkNodeCount === 1 ? "" : "s"} visible · ${networkReadyCount} compute-ready`
-                : "Discovering network compute"
-              : model ? curatedModelName(model) : "No model selected"}
-          </span>
-        </div>
+                : "Discovering network compute"}
+            </span>
+          </div>
+        ) : null}
       </div>
 
       <div className="header-actions">
@@ -551,9 +544,6 @@ function AppHeader({
           <Activity size={16} />
           <span>Activity</span>
           {hasActiveWork ? <i aria-label="Active work" /> : null}
-        </button>
-        <button className="icon-button" aria-label="Refresh app status" onClick={onRefresh}>
-          <RefreshCw size={16} />
         </button>
       </div>
     </header>

@@ -162,6 +162,8 @@ static std::string format_chat_prompt(const llama_model * model, const std::stri
 
 class InfernetWorker {
 public:
+    static constexpr uint32_t MAX_GENERATED_TOKENS = 512;
+
     InfernetWorker(const std::string & model_path, uint32_t layer_start, uint32_t layer_end,
                    uint32_t hidden_size, uint32_t threads, uint32_t max_context_tokens,
                    int32_t gpu_layers)
@@ -221,7 +223,7 @@ public:
         const std::string formatted = format_chat_prompt(model_, prompt);
         std::vector<llama_token> tokens = tokenize_prompt(vocab_, formatted);
         if (tokens.empty()) throw std::runtime_error("prompt produced no tokens");
-        if (tokens.size() > 2048 || tokens.size() + 64 > max_context_tokens_) {
+        if (tokens.size() > 2048 || tokens.size() + MAX_GENERATED_TOKENS > max_context_tokens_) {
             throw std::runtime_error("prompt exceeds the Infernet context safety limit");
         }
         const std::vector<float> activation = read_f32_file(input_path);
