@@ -69,10 +69,6 @@ export async function runDistributedInference(prompt: string, modelId: string): 
   return invoke<RunDemoResponse>("run_demo_inference", { prompt, modelId });
 }
 
-export async function installOfficialModel(modelId: string): Promise<GridSnapshot> {
-  return invoke<GridSnapshot>("install_official_model", { modelId });
-}
-
 export async function listenForProgress(
   handler: (event: ProgressEvent) => void,
 ): Promise<() => void> {

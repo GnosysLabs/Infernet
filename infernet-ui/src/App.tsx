@@ -1,11 +1,9 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import createGlobe from "cobe";
 import type { Marker } from "cobe";
 import {
   Activity,
   Box,
-  CheckCircle2,
-  ChevronDown,
   Cpu,
   Download,
   Globe,
@@ -29,7 +27,6 @@ import {
   getLocalIdentity,
   getLocalNodeActivity,
   getManualPeers,
-  installOfficialModel,
   listenForProgress,
   listenForModelImportProgress,
   runDistributedInference,
@@ -44,7 +41,7 @@ import type {
   ProgressEvent,
 } from "./types";
 
-type Page = "chat" | "network" | "models" | "downloads" | "settings";
+type Page = "chat" | "network" | "downloads" | "settings";
 type Message = { id: string; role: "user" | "assistant"; text: string };
 type TransferStatus = "active" | "complete" | "error";
 type TransferActivity = ModelImportProgress & {
@@ -62,6 +59,7 @@ type NodeJournalEntry = {
 };
 
 const DEFAULT_PROMPT = "";
+const COMPOSER_MAX_HEIGHT = 160;
 const INFERNET_CHAT_MODEL_ID = "infernet-chat-v1";
 const EMPTY_LOCAL_NODE_ACTIVITY: LocalNodeActivitySnapshot = {
   computeActive: false,
@@ -93,7 +91,7 @@ export default function App() {
   const [isRunning, setIsRunning] = useState(false);
   const [lastError, setLastError] = useState<string | null>(null);
   const [transferActivities, setTransferActivities] = useState<TransferActivity[]>([]);
-  const [installingModelId, setInstallingModelId] = useState<string | null>(null);
+  const [connectionGraceExpired, setConnectionGraceExpired] = useState(false);
 
   const officialModels = useMemo(
     () => snapshot.availableModels.filter(isOfficialInfernetModel),
@@ -104,6 +102,9 @@ export default function App() {
     [officialModels, selectedModel],
   );
   const activeTransfers = transferActivities.filter((activity) => activity.status === "active").length;
+  const connectionPending = !snapshot.localPeerId
+    || Boolean(selectedModelView?.installed && !selectedModelView.runnable);
+  const isEstablishingConnection = connectionPending && !connectionGraceExpired;
 
   const appendJournalEntry = useCallback((entry: NodeJournalEntry) => {
     setLocalJournal((current) => {
@@ -235,6 +236,33 @@ export default function App() {
   }, [refreshSnapshot, selectedModel]);
 
   useEffect(() => {
+    if (!connectionPending) {
+      setConnectionGraceExpired(false);
+      return;
+    }
+    setConnectionGraceExpired(false);
+    const timeout = window.setTimeout(() => setConnectionGraceExpired(true), 12_000);
+    return () => window.clearTimeout(timeout);
+  }, [connectionPending]);
+
+  useEffect(() => {
+    if (page !== "chat" || !connectionPending) return;
+    let disposed = false;
+    let timeout: number | undefined;
+    const pollConnection = async () => {
+      await refreshSnapshot(selectedModel);
+      if (!disposed) {
+        timeout = window.setTimeout(pollConnection, 1000);
+      }
+    };
+    timeout = window.setTimeout(pollConnection, 1000);
+    return () => {
+      disposed = true;
+      if (timeout !== undefined) window.clearTimeout(timeout);
+    };
+  }, [connectionPending, page, refreshSnapshot, selectedModel]);
+
+  useEffect(() => {
     if (!activityOpen && page !== "downloads" && page !== "network") return;
     let disposed = false;
     let inFlight = false;
@@ -317,35 +345,6 @@ export default function App() {
     };
   }, [appendJournalEntry]);
 
-  function handleModelChange(modelId: string) {
-    setSelectedModel(modelId);
-    setPage("chat");
-    setLastError(null);
-  }
-
-  async function handleInstallModel(modelId: string) {
-    if (installingModelId) return;
-    setInstallingModelId(modelId);
-    setActivityOpen(true);
-    setLastError(null);
-    try {
-      const nextSnapshot = await installOfficialModel(modelId);
-      setSnapshot(nextSnapshot);
-    } catch (error) {
-      const message = String(error);
-      setTransferActivities((current) => upsertTransferActivity(current, {
-        modelId,
-        stage: "Download failed",
-        detail: message,
-        downloadedBytes: 0,
-        totalBytes: null,
-      }));
-      setLastError(message);
-    } finally {
-      setInstallingModelId(null);
-    }
-  }
-
   async function runInference() {
     const userPrompt = prompt.trim();
     if (!userPrompt || isRunning) {
@@ -411,18 +410,8 @@ export default function App() {
             runInference={runInference}
             isRunning={isRunning}
             model={selectedModelView}
+            isEstablishingConnection={isEstablishingConnection}
             lastError={lastError}
-            onOpenModels={() => setPage("models")}
-          />
-        ) : null}
-
-        {page === "models" ? (
-          <ModelsPage
-            snapshot={snapshot}
-            selectedModel={selectedModel}
-            onModelChange={handleModelChange}
-            onInstallModel={handleInstallModel}
-            installingModelId={installingModelId}
           />
         ) : null}
 
@@ -578,8 +567,8 @@ function ChatPage({
   runInference,
   isRunning,
   model,
+  isEstablishingConnection,
   lastError,
-  onOpenModels,
 }: {
   messages: Message[];
   prompt: string;
@@ -587,10 +576,11 @@ function ChatPage({
   runInference: () => void;
   isRunning: boolean;
   model?: ModelView;
+  isEstablishingConnection: boolean;
   lastError: string | null;
-  onOpenModels: () => void;
 }) {
   const conversationRef = useRef<HTMLDivElement>(null);
+  const composerInputRef = useRef<HTMLTextAreaElement>(null);
   const canSend = Boolean(model?.runnable);
   const isEmpty = messages.length === 0;
 
@@ -600,6 +590,26 @@ function ChatPage({
       conversation.scrollTop = conversation.scrollHeight;
     }
   }, [messages, isRunning, lastError]);
+
+  useLayoutEffect(() => {
+    const input = composerInputRef.current;
+    if (!input) return;
+    resizeComposerInput(input);
+  }, [prompt]);
+
+  useLayoutEffect(() => {
+    const input = composerInputRef.current;
+    if (!input || typeof ResizeObserver === "undefined") return;
+    let previousWidth = input.clientWidth;
+    const observer = new ResizeObserver(([entry]) => {
+      const nextWidth = entry.contentRect.width;
+      if (nextWidth === previousWidth) return;
+      previousWidth = nextWidth;
+      resizeComposerInput(input);
+    });
+    observer.observe(input);
+    return () => observer.disconnect();
+  }, []);
 
   return (
     <section className="chat-screen">
@@ -618,23 +628,20 @@ function ChatPage({
             </div>
           ))}
 
-          {!model ? (
+          {isEstablishingConnection ? (
+            <div className="connection-establishing" role="status" aria-live="polite">
+              <i className="connection-throbber" aria-hidden="true" />
+              <strong>Establishing Connection</strong>
+            </div>
+          ) : !model ? (
             <div className="empty-chat-card">
               <strong>Get Infernet Chat to start</strong>
               <span>The official Infernet model is not available on the network yet.</span>
-              <button className="secondary-button" onClick={onOpenModels}>
-                <Download size={16} />
-                <span>View Infernet Chat</span>
-              </button>
             </div>
           ) : !model.runnable ? (
             <div className="empty-chat-card warning">
               <strong>{curatedModelName(model)} is not ready yet</strong>
               <span>{model.status}</span>
-              <button className="secondary-button" onClick={onOpenModels}>
-                <Box size={16} />
-                <span>Manage Model</span>
-              </button>
             </div>
           ) : null}
 
@@ -651,12 +658,9 @@ function ChatPage({
 
       <div className="composer-dock">
         <div className="composer">
-          <div className="composer-model">
-            <Box size={15} />
-            <span>{model ? curatedModelName(model) : "No model selected"}</span>
-            <ChevronDown size={15} />
-          </div>
           <textarea
+            ref={composerInputRef}
+            rows={1}
             value={prompt}
             onChange={(event) => setPrompt(event.target.value)}
             onKeyDown={(event) => {
@@ -665,7 +669,13 @@ function ChatPage({
                 runInference();
               }
             }}
-            placeholder={canSend ? "Message Infernet" : model ? "Model is not ready" : "Install Infernet Chat first"}
+            placeholder={canSend
+              ? "Message Infernet"
+              : isEstablishingConnection
+                ? "Establishing connection"
+                : model
+                  ? "Model is not ready"
+                  : "Install Infernet Chat first"}
             disabled={!canSend}
             aria-label="Message Infernet"
           />
@@ -677,6 +687,13 @@ function ChatPage({
       </div>
     </section>
   );
+}
+
+function resizeComposerInput(input: HTMLTextAreaElement) {
+  input.style.height = "0px";
+  const nextHeight = Math.min(input.scrollHeight, COMPOSER_MAX_HEIGHT);
+  input.style.height = `${nextHeight}px`;
+  input.style.overflowY = input.scrollHeight > COMPOSER_MAX_HEIGHT ? "auto" : "hidden";
 }
 
 function ThinkingIndicator() {
@@ -1570,95 +1587,6 @@ function hashText(value: string): number {
   return hash >>> 0;
 }
 
-function ModelsPage({
-  snapshot,
-  selectedModel,
-  onModelChange,
-  onInstallModel,
-  installingModelId,
-}: {
-  snapshot: GridSnapshot;
-  selectedModel: string;
-  onModelChange: (modelId: string) => void;
-  onInstallModel: (modelId: string) => void;
-  installingModelId: string | null;
-}) {
-  const officialModels = snapshot.availableModels.filter(isOfficialInfernetModel);
-
-  return (
-    <section className="library-screen">
-      <div className="models-topbar">
-        <div className="section-heading">
-          <span className="section-eyebrow">Official catalog</span>
-          <h2>Infernet models</h2>
-          <p>A small collection built, tested, and distributed specifically for Infernet.</p>
-        </div>
-      </div>
-
-      <div className="official-model-note">
-        <CheckCircle2 size={18} />
-        <div>
-          <strong>Curated from end to end</strong>
-          <span>Infernet chooses the model, package layout, and runtime so every release works across the network.</span>
-        </div>
-      </div>
-
-      <div className="model-library">
-        {officialModels.length === 0 ? (
-          <div className="library-card flagship-card" aria-label="Infernet Chat flagship model">
-            <div>
-              <span className="model-edition">Flagship · Infernet edition</span>
-              <strong>Infernet Chat</strong>
-              <span>Powered by Gemma 4 26B A4B</span>
-            </div>
-            <div className="library-status">
-              <span>Official package</span>
-              <ProgressBar progress={0} />
-              <small>Preparing the first network release</small>
-            </div>
-          </div>
-        ) : (
-          officialModels.map((model) => {
-            const installed = model.installed || snapshot.distribution.installedModels.includes(model.modelId);
-            const installing = installingModelId === model.modelId;
-            return (
-              <div
-                className={selectedModel === model.modelId ? "library-card active" : "library-card"}
-                key={model.modelId}
-              >
-                <div>
-                  <span className="model-edition">Infernet edition</span>
-                  <strong>{curatedModelName(model)}</strong>
-                  <span>{curatedModelBasis(model)}</span>
-                </div>
-                <div className="library-status">
-                  <span>{installed ? "Stored on this computer" : "Available"}</span>
-                  <ProgressBar progress={installed ? 100 : 0} />
-                  <small>{model.runnable ? "Ready to chat" : "Preparing for this network"}</small>
-                </div>
-                <div className="library-actions">
-                  <button className="secondary-button" onClick={() => onModelChange(model.modelId)}>
-                    Use in chat
-                  </button>
-                  {!installed ? (
-                    <button
-                      className="primary-button"
-                      disabled={installing}
-                      onClick={() => onInstallModel(model.modelId)}
-                    >
-                      <Download size={15} />
-                      <span>{installing ? "Preparing…" : "Store 14.4 GB here"}</span>
-                    </button>
-                  ) : null}
-                </div>
-              </div>
-            );
-          })
-        )}
-      </div>
-    </section>
-  );
-}
 function DownloadsPage({
   snapshot,
   transferActivities,
@@ -2014,7 +1942,6 @@ function transferStatus(stage: string): TransferStatus {
 function pageTitle(page: Page): string {
   if (page === "chat") return "Chat";
   if (page === "network") return "Network";
-  if (page === "models") return "Models";
   if (page === "downloads") return "Downloads";
   return "Settings";
 }
@@ -2153,10 +2080,6 @@ function isOfficialInfernetModel(model: ModelView): boolean {
 
 function curatedModelName(_model: ModelView): string {
   return "Infernet Chat";
-}
-
-function curatedModelBasis(model: ModelView): string {
-  return isOfficialInfernetModel(model) ? "Powered by Gemma 4 26B A4B" : "Unofficial package";
 }
 
 type LocalModelSummary = {
