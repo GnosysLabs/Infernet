@@ -581,6 +581,7 @@ mod tests {
                 measured_decode_tokens_per_second: None,
                 queue_depth: 0,
                 llama_rpc: None,
+                image_rpc: None,
             }),
             hosted_shards: vec![ShardDescriptor {
                 model_id: model.model_id.clone(),

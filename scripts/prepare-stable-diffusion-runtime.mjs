@@ -21,7 +21,7 @@ const STABLE_DIFFUSION_CPP_REF =
   || "cc734292286f85f9c48305d94d7fd22f42838522";
 const EXPECTED_STABLE_DIFFUSION_CPP_REF =
   "cc734292286f85f9c48305d94d7fd22f42838522";
-const RUNTIME_FORMAT_VERSION = "infernet-sd-cli-v1";
+const RUNTIME_FORMAT_VERSION = "infernet-sd-cli-v2";
 const SOURCE_REPOSITORY = "https://github.com/leejet/stable-diffusion.cpp.git";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
@@ -36,6 +36,8 @@ const isMacosTarget = targetTriple.includes("apple-darwin");
 const executableSuffix = isWindowsTarget ? ".exe" : "";
 const backend = isMacosTarget ? "metal" : "cpu";
 const buildJobs = readBuildJobs();
+const imageRpcSourceDir = resolve(repoRoot, "stable-diffusion-runtime");
+const imageRpcOverlay = join(imageRpcSourceDir, "infernet-overlay.cmake");
 
 const runtimeRoot = resolve(repoRoot, "target", "stable-diffusion.cpp-runtime");
 const sourceDir = join(runtimeRoot, "source");
@@ -45,6 +47,10 @@ const sidecarDir = resolve(repoRoot, "infernet-ui", "src-tauri", "binaries");
 const sidecarPath = join(
   sidecarDir,
   `sd-cli-${targetTriple}${executableSuffix}`,
+);
+const imageRpcSidecarPath = join(
+  sidecarDir,
+  `infernet-image-rpc-server-${targetTriple}${executableSuffix}`,
 );
 const stampPath = join(
   sidecarDir,
@@ -57,6 +63,7 @@ const runtimeStamp = [
   targetTriple,
   backend,
   "rpc-on",
+  "image-rpc-worker",
   "webp-off",
   "webm-off",
   "static",
@@ -73,6 +80,9 @@ const cmakeConfigureArgs = [
   "-DSD_WEBP=OFF",
   "-DSD_WEBM=OFF",
   "-DSD_RPC=ON",
+  `-DINFERNET_IMAGE_RPC_SOURCE_DIR=${imageRpcSourceDir}`,
+  "-DCMAKE_PROJECT_TOP_LEVEL_INCLUDES=",
+  `-DCMAKE_PROJECT_INCLUDE=${imageRpcOverlay}`,
   "-DSD_CUDA=OFF",
   `-DSD_METAL=${isMacosTarget ? "ON" : "OFF"}`,
   "-DSD_VULKAN=OFF",
@@ -97,7 +107,9 @@ if (dryRun) {
   printBuildPlan();
 } else if (verifyOnly) {
   validatePreparedRuntime(sidecarPath);
+  validatePreparedImageRpcRuntime(imageRpcSidecarPath);
   log(`verified bundled stable-diffusion.cpp runtime: ${relative(sidecarPath)}`);
+  log(`verified bundled Infernet Image RPC worker: ${relative(imageRpcSidecarPath)}`);
 } else {
   withRuntimeLock(main);
 }
@@ -105,17 +117,20 @@ if (dryRun) {
 function main() {
   mkdirSync(sidecarDir, { recursive: true });
 
-  if (fileExists(sidecarPath) && readStamp() === runtimeStamp) {
+  if (fileExists(sidecarPath) && fileExists(imageRpcSidecarPath) && readStamp() === runtimeStamp) {
     const validation = validateRuntime(sidecarPath);
-    if (validation.ok) {
+    const rpcValidation = validateImageRpcRuntime(imageRpcSidecarPath);
+    if (validation.ok && rpcValidation.ok) {
       log(`bundled stable-diffusion.cpp runtime already exists: ${relative(sidecarPath)}`);
+      log(`bundled Infernet Image RPC worker already exists: ${relative(imageRpcSidecarPath)}`);
       return;
     }
-    log(`rebuilding bundled stable-diffusion.cpp runtime: ${validation.reason}`);
+    log(`rebuilding bundled stable-diffusion.cpp runtime: ${(validation.ok ? rpcValidation : validation).reason}`);
   }
 
   const allowExternal = environmentFlag("INFERNET_ALLOW_EXTERNAL_SD_RUNTIME");
   const configuredCli = process.env.INFERNET_SD_CLI?.trim();
+  const configuredImageRpcServer = process.env.INFERNET_IMAGE_RPC_SERVER?.trim();
   if (configuredCli) {
     if (!allowExternal) {
       fail(
@@ -126,7 +141,16 @@ function main() {
     if (targetTriple !== hostTriple) {
       fail("cross-target stable-diffusion.cpp sidecars cannot be executed and verified on this host");
     }
-    installSidecar(configuredCli, "INFERNET_SD_CLI");
+    if (!configuredImageRpcServer) {
+      fail("INFERNET_SD_CLI also requires an exact INFERNET_IMAGE_RPC_SERVER build");
+    }
+    installSidecar(configuredCli, sidecarPath, "INFERNET_SD_CLI", validatePreparedRuntime);
+    installSidecar(
+      configuredImageRpcServer,
+      imageRpcSidecarPath,
+      "INFERNET_IMAGE_RPC_SERVER",
+      validatePreparedImageRpcRuntime,
+    );
     writeStamp();
     return;
   }
@@ -142,7 +166,18 @@ function main() {
   requireCommand("cmake");
   prepareSource();
   configureAndBuild();
-  installSidecar(findBuiltCli(), "pinned stable-diffusion.cpp source build");
+  installSidecar(
+    findBuiltCli(),
+    sidecarPath,
+    "pinned stable-diffusion.cpp source build",
+    validatePreparedRuntime,
+  );
+  installSidecar(
+    findBuiltImageRpcServer(),
+    imageRpcSidecarPath,
+    "pinned stable-diffusion.cpp GGML source build",
+    validatePreparedImageRpcRuntime,
+  );
   writeStamp();
 }
 
@@ -190,7 +225,7 @@ function configureAndBuild() {
   run("cmake", [
     "--build", buildDir,
     "--config", "Release",
-    "--target", "sd-cli",
+    "--target", "sd-cli", "infernet-image-rpc-server",
     "--parallel", String(buildJobs),
   ]);
 }
@@ -209,27 +244,48 @@ function findBuiltCli() {
   return built;
 }
 
-function installSidecar(source, label) {
+function findBuiltImageRpcServer() {
+  const executableName = `infernet-image-rpc-server${executableSuffix}`;
+  const candidates = [
+    join(buildDir, "bin", executableName),
+    join(buildDir, "bin", "Release", executableName),
+    ...findFilesRecursive(buildDir, (path) => basename(path) === executableName),
+  ];
+  const built = candidates.find(fileExists);
+  if (!built) {
+    fail(`stable-diffusion.cpp build did not produce ${executableName}`);
+  }
+  return built;
+}
+
+function installSidecar(source, destination, label, validate) {
   const absoluteSource = resolve(source);
   if (!fileExists(absoluteSource)) {
     fail(`${label} did not point to an executable file: ${source}`);
   }
-  const temporary = `${sidecarPath}.tmp-${process.pid}`;
+  const temporary = `${destination}.tmp-${process.pid}`;
   rmSync(temporary, { force: true });
   copyFileSync(absoluteSource, temporary);
   if (!isWindowsTarget) {
     chmodSync(temporary, 0o755);
   }
-  validatePreparedRuntime(temporary);
-  rmSync(sidecarPath, { force: true });
-  renameSync(temporary, sidecarPath);
-  log(`prepared ${relative(sidecarPath)} from ${label}`);
+  validate(temporary);
+  rmSync(destination, { force: true });
+  renameSync(temporary, destination);
+  log(`prepared ${relative(destination)} from ${label}`);
 }
 
 function validatePreparedRuntime(path) {
   const validation = validateRuntime(path);
   if (!validation.ok) {
     fail(`stable-diffusion.cpp runtime validation failed: ${validation.reason}`);
+  }
+}
+
+function validatePreparedImageRpcRuntime(path) {
+  const validation = validateImageRpcRuntime(path);
+  if (!validation.ok) {
+    fail(`Infernet Image RPC runtime validation failed: ${validation.reason}`);
   }
 }
 
@@ -251,10 +307,33 @@ function validateRuntime(path) {
     return { ok: false, reason: "sd-cli does not report the pinned cc73429 revision" };
   }
 
+  return validatePortableBinary(path, "sd-cli");
+}
+
+function validateImageRpcRuntime(path) {
+  if (!fileExists(path)) {
+    return { ok: false, reason: `missing executable ${relative(path)}` };
+  }
+  const version = spawnSync(path, ["--version"], {
+    encoding: "utf8",
+    timeout: 15_000,
+    maxBuffer: 8 * 1024 * 1024,
+  });
+  const versionText = `${version.stdout || ""}\n${version.stderr || ""}`;
+  if (version.error || version.status !== 0
+      || !versionText.includes("Infernet Image RPC stable-diffusion.cpp")
+      || !versionText.includes(STABLE_DIFFUSION_CPP_REF)) {
+    return { ok: false, reason: "image RPC worker does not report the pinned runtime revision" };
+  }
+  return validatePortableBinary(path, "Infernet Image RPC worker");
+}
+
+function validatePortableBinary(path, label) {
+
   if (process.platform === "darwin") {
     const inspection = spawnSync("otool", ["-L", path], { encoding: "utf8" });
     if (inspection.status !== 0) {
-      return { ok: false, reason: "otool could not inspect sd-cli dependencies" };
+      return { ok: false, reason: `otool could not inspect ${label} dependencies` };
     }
     const badDependency = inspection.stdout
       .split(/\r?\n/)
@@ -262,12 +341,12 @@ function validateRuntime(path) {
       .find((dependency) => dependency?.startsWith("/opt/homebrew/")
         || dependency?.startsWith("/usr/local/"));
     if (badDependency) {
-      return { ok: false, reason: `sd-cli depends on non-system library ${badDependency}` };
+      return { ok: false, reason: `${label} depends on non-system library ${badDependency}` };
     }
     if (targetTriple === "aarch64-apple-darwin") {
       const architecture = spawnSync("file", [path], { encoding: "utf8" });
       if (architecture.status !== 0 || !architecture.stdout.includes("arm64")) {
-        return { ok: false, reason: "sd-cli is not an arm64 Mach-O executable" };
+        return { ok: false, reason: `${label} is not an arm64 Mach-O executable` };
       }
     }
   }
@@ -280,7 +359,7 @@ function validateRuntime(path) {
         .find((line) => line.includes("libggml") || line.includes("libstable-diffusion"))
       : null;
     if (badDependency) {
-      return { ok: false, reason: `sd-cli depends on non-bundled library ${badDependency.trim()}` };
+      return { ok: false, reason: `${label} depends on non-bundled library ${badDependency.trim()}` };
     }
   }
 
@@ -333,6 +412,7 @@ function printBuildPlan() {
     sourceDir,
     buildDir,
     sidecarPath,
+    imageRpcSidecarPath,
     stampPath,
     cmakeConfigureArgs,
     buildJobs,

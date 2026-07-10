@@ -54,12 +54,12 @@ struct AvailableMemoryCache {
 }
 
 #[derive(Debug, Default)]
-struct LocalLlamaRpcState {
+struct LocalRpcState {
     override_configured: bool,
     endpoint: Option<LlamaRpcEndpoint>,
 }
 
-impl LocalLlamaRpcState {
+impl LocalRpcState {
     fn set(&mut self, endpoint: Option<LlamaRpcEndpoint>) {
         self.override_configured = true;
         self.endpoint = endpoint;
@@ -100,7 +100,8 @@ impl AvailableMemoryCache {
 static DETECTED_HARDWARE: OnceLock<NodeCapabilities> = OnceLock::new();
 static AVAILABLE_MEMORY: OnceLock<Mutex<AvailableMemoryCache>> = OnceLock::new();
 static VRAM_CONTRIBUTION_LIMIT_BYTES: OnceLock<Mutex<Option<u64>>> = OnceLock::new();
-static LOCAL_LLAMA_RPC: OnceLock<Mutex<LocalLlamaRpcState>> = OnceLock::new();
+static LOCAL_LLAMA_RPC: OnceLock<Mutex<LocalRpcState>> = OnceLock::new();
+static LOCAL_IMAGE_RPC: OnceLock<Mutex<LocalRpcState>> = OnceLock::new();
 static LOCAL_MODEL_COMPONENTS: OnceLock<Mutex<Vec<ModelComponentInfo>>> = OnceLock::new();
 static LOCAL_INFERENCE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static LOCAL_RPC_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -133,6 +134,7 @@ pub fn detect_node_capabilities() -> NodeCapabilities {
         .min(capabilities.max_sessions);
     capabilities.queue_depth = configured_u32("INFERNET_QUEUE_DEPTH").unwrap_or(0);
     capabilities.llama_rpc = local_llama_rpc_endpoint();
+    capabilities.image_rpc = local_image_rpc_endpoint();
     capabilities
 }
 
@@ -181,7 +183,7 @@ pub fn set_local_llama_rpc_endpoint(endpoint: Option<LlamaRpcEndpoint>) -> Resul
         validate_llama_rpc_endpoint(endpoint)?;
     }
 
-    let state = LOCAL_LLAMA_RPC.get_or_init(|| Mutex::new(LocalLlamaRpcState::default()));
+    let state = LOCAL_LLAMA_RPC.get_or_init(|| Mutex::new(LocalRpcState::default()));
     state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -192,6 +194,22 @@ pub fn set_local_llama_rpc_endpoint(endpoint: Option<LlamaRpcEndpoint>) -> Resul
 pub fn clear_local_llama_rpc_endpoint() {
     // Clearing cannot fail validation.
     let _ = set_local_llama_rpc_endpoint(None);
+}
+
+pub fn set_local_image_rpc_endpoint(endpoint: Option<LlamaRpcEndpoint>) -> Result<(), String> {
+    if let Some(endpoint) = &endpoint {
+        validate_llama_rpc_endpoint(endpoint)?;
+    }
+    LOCAL_IMAGE_RPC
+        .get_or_init(|| Mutex::new(LocalRpcState::default()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .set(endpoint);
+    Ok(())
+}
+
+pub fn clear_local_image_rpc_endpoint() {
+    let _ = set_local_image_rpc_endpoint(None);
 }
 
 /// Replaces the verified model components advertised by this process. Runtime
@@ -213,7 +231,7 @@ pub(crate) fn local_model_components() -> Vec<ModelComponentInfo> {
 
 fn local_llama_rpc_endpoint() -> Option<LlamaRpcEndpoint> {
     let configured = configured_llama_rpc_endpoint();
-    let state = LOCAL_LLAMA_RPC.get_or_init(|| Mutex::new(LocalLlamaRpcState::default()));
+    let state = LOCAL_LLAMA_RPC.get_or_init(|| Mutex::new(LocalRpcState::default()));
     state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -224,6 +242,19 @@ fn local_llama_rpc_endpoint() -> Option<LlamaRpcEndpoint> {
 /// The host/port are never serialized in node advertisements.
 pub fn local_llama_rpc_target() -> Option<LlamaRpcEndpoint> {
     local_llama_rpc_endpoint()
+}
+
+fn local_image_rpc_endpoint() -> Option<LlamaRpcEndpoint> {
+    LOCAL_IMAGE_RPC
+        .get_or_init(|| Mutex::new(LocalRpcState::default()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .endpoint
+        .clone()
+}
+
+pub fn local_image_rpc_target() -> Option<LlamaRpcEndpoint> {
+    local_image_rpc_endpoint()
 }
 
 /// Returns an advertised llama.cpp RPC endpoint only when its network address,
@@ -302,6 +333,7 @@ fn detect_static_hardware() -> NodeCapabilities {
         measured_decode_tokens_per_second: None,
         queue_depth: 0,
         llama_rpc: None,
+        image_rpc: None,
     };
 
     if let Some(device) = detect_nvidia_device() {
@@ -915,7 +947,7 @@ mod tests {
     #[test]
     fn runtime_rpc_state_overrides_and_can_clear_startup_configuration() {
         let configured = rpc_endpoint(false);
-        let mut state = LocalLlamaRpcState::default();
+        let mut state = LocalRpcState::default();
         assert_eq!(state.resolve(Some(configured.clone())), Some(configured));
 
         let running = rpc_endpoint(true);

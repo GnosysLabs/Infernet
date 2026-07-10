@@ -166,6 +166,7 @@ export interface GenerateImageResponse {
   durationMs: number;
   releaseId: string;
   placement: string;
+  detailsAvailable: boolean;
 }
 
 export interface ModelImportProgress {

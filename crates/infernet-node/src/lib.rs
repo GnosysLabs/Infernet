@@ -31,10 +31,10 @@ use infernet_model::{
     SeedShardManifest, ShardDescriptor,
 };
 use infernet_protocol::{
-    ACTIVATION_PROTOCOL, ActivationRequest, ActivationResponse, MIN_DISTRIBUTED_MACHINE_COUNT,
-    MODEL_BLOB_PROTOCOL, MODEL_PROTOCOL, ModelBlobRequest, ModelBlobResponse, ModelShardInfo,
-    ModelShardRequest, ModelShardResponse, NodeAdvertisement, PROTOCOL_VERSION, PromptMetadata,
-    RouteHop, TraceEvent,
+    ACTIVATION_PROTOCOL, ActivationRequest, ActivationResponse, IMAGE_RPC_TUNNEL_PROTOCOL,
+    MIN_DISTRIBUTED_MACHINE_COUNT, MODEL_BLOB_PROTOCOL, MODEL_PROTOCOL, ModelBlobRequest,
+    ModelBlobResponse, ModelShardInfo, ModelShardRequest, ModelShardResponse, NodeAdvertisement,
+    PROTOCOL_VERSION, PromptMetadata, RouteHop, TraceEvent,
 };
 use infernet_router::{RouterError, ShardRegistry, validate_execution_route};
 use infernet_runtime::{DemoRuntime, LayerRuntime, activation_checksum};
@@ -67,8 +67,9 @@ use serde::Deserialize;
 use tokio::time::{Instant, interval, sleep};
 
 pub use capabilities::{
-    PINNED_GGML_RPC_PROTOCOL_VERSION, clear_local_llama_rpc_endpoint,
-    configured_llama_rpc_endpoint, detect_node_capabilities, local_llama_rpc_target,
+    PINNED_GGML_RPC_PROTOCOL_VERSION, clear_local_image_rpc_endpoint,
+    clear_local_llama_rpc_endpoint, configured_llama_rpc_endpoint, detect_node_capabilities,
+    local_image_rpc_target, local_llama_rpc_target, set_local_image_rpc_endpoint,
     set_local_inference_active, set_local_llama_rpc_endpoint, set_local_model_components,
     set_local_rpc_active, set_vram_contribution_limit_bytes, validate_llama_rpc_endpoint,
     vram_contribution_limit_bytes,
@@ -86,7 +87,9 @@ pub use rpc_tunnel::{
     RpcTunnelProxyConfig, RpcTunnelTicket, RpcTunnelWorker, RpcTunnelWorkerConfig,
 };
 pub use stable_diffusion_runtime::{
-    ImageGenerationOutput, ImageGenerationRequest, StableDiffusionConfig, StableDiffusionPlacement,
+    IMAGE_RPC_DEFAULT_PORT, INFERNET_IMAGE_RPC_RUNTIME_ABI, ImageGenerationOutput,
+    ImageGenerationRequest, StableDiffusionConfig, StableDiffusionPlacement,
+    distributed_diffusion_backend, distributed_diffusion_max_vram, find_image_rpc_server_binary,
     find_sd_cli_binary, generate_with_sd_cli,
 };
 
@@ -1263,7 +1266,7 @@ async fn run_model_distribution_node_inner(
     let listener_id = start_grid_listeners(&mut swarm, &discovery)?;
     add_static_peer_addresses(&mut swarm, &discovery.static_peers, &discovery.relay_peers);
     let rpc_tunnel_control = swarm.behaviour().rpc_tunnel.new_control();
-    let _rpc_tunnel_worker = start_local_rpc_tunnel_worker(&swarm)?;
+    let _rpc_tunnel_workers = start_local_rpc_tunnel_workers(&swarm)?;
 
     let mut publish_interval = interval(discovery.publish_interval);
     let mut static_peer_dial_interval = interval(Duration::from_secs(10));
@@ -1375,31 +1378,43 @@ async fn run_model_distribution_node_inner(
     }
 }
 
-fn start_local_rpc_tunnel_worker(swarm: &Swarm<GridBehaviour>) -> Result<Option<RpcTunnelWorker>> {
-    let Some(endpoint) = local_llama_rpc_target().filter(|endpoint| endpoint.ready) else {
-        return Ok(None);
-    };
-    let host = endpoint
-        .host
-        .parse::<IpAddr>()
-        .with_context(|| format!("invalid process-local RPC host {}", endpoint.host))?;
-    let target = SocketAddr::new(host, endpoint.port);
-    if !target.ip().is_loopback() {
-        bail!("refusing non-loopback RPC tunnel target {target}");
-    }
-    // llama.cpp may overlap device discovery, allocation, and tensor transfer
-    // connections to one RPC worker during model load. The authenticated
-    // default keeps a strict bound without rejecting valid parallel sessions.
-    let admission =
-        RpcTunnelAdmission::allow_authenticated_peers(RpcTunnelAdmissionLimits::default())?;
+fn start_local_rpc_tunnel_workers(swarm: &Swarm<GridBehaviour>) -> Result<Vec<RpcTunnelWorker>> {
     let mut control = swarm.behaviour().rpc_tunnel.new_control();
-    let incoming = control
-        .accept(RPC_TUNNEL_PROTOCOL)
-        .map_err(|_| anyhow!("RPC tunnel protocol was already registered"))?;
-    Ok(Some(RpcTunnelWorker::spawn(
-        incoming,
-        RpcTunnelWorkerConfig::new(target, admission),
-    )?))
+    let mut workers = Vec::new();
+    for (endpoint, protocol, label) in [
+        (
+            local_llama_rpc_target(),
+            RPC_TUNNEL_PROTOCOL,
+            "llama RPC tunnel",
+        ),
+        (
+            local_image_rpc_target(),
+            StreamProtocol::new(IMAGE_RPC_TUNNEL_PROTOCOL),
+            "image RPC tunnel",
+        ),
+    ] {
+        let Some(endpoint) = endpoint.filter(|endpoint| endpoint.ready) else {
+            continue;
+        };
+        let host = endpoint
+            .host
+            .parse::<IpAddr>()
+            .with_context(|| format!("invalid process-local RPC host {}", endpoint.host))?;
+        let target = SocketAddr::new(host, endpoint.port);
+        if !target.ip().is_loopback() {
+            bail!("refusing non-loopback RPC tunnel target {target}");
+        }
+        let admission =
+            RpcTunnelAdmission::allow_authenticated_peers(RpcTunnelAdmissionLimits::default())?;
+        let incoming = control
+            .accept(protocol)
+            .map_err(|_| anyhow!("{label} was already registered"))?;
+        workers.push(RpcTunnelWorker::spawn(
+            incoming,
+            RpcTunnelWorkerConfig::new(target, admission),
+        )?);
+    }
+    Ok(workers)
 }
 
 fn notify_registry_observer(
@@ -2134,6 +2149,181 @@ fn append_source_chunk(path: &Path, payload: &[u8]) -> Result<()> {
         .with_context(|| format!("failed to open {}", path.display()))?;
     file.write_all(payload)
         .with_context(|| format!("failed to write {}", path.display()))
+}
+
+const MIN_IMAGE_WORKER_TENSOR_UPLOAD_BYTES: u64 = 1024 * 1024;
+
+/// Runs one pinned image generation while the diffusion transformer is split
+/// across the requester's accelerator and every selected remote physical
+/// machine. Remote GGML sockets remain loopback-only and cross the network
+/// exclusively through authenticated Infernet streams.
+pub async fn generate_image_over_libp2p(
+    mut discovery: DiscoveryConfig,
+    mut image_config: StableDiffusionConfig,
+    request: ImageGenerationRequest,
+    connection_timeout: Duration,
+) -> Result<ImageGenerationOutput> {
+    if !discovery.rpc_endpoints.is_empty() || !image_config.rpc_servers.is_empty() {
+        bail!("raw image RPC endpoints cannot cross the network; select authenticated workers");
+    }
+    let machine_count = match image_config.placement {
+        StableDiffusionPlacement::Distributed { machine_count } => machine_count,
+        StableDiffusionPlacement::RequesterLocal => {
+            bail!("distributed image transport cannot run a requester-local placement")
+        }
+    };
+    if discovery.rpc_worker_peer_ids.is_empty()
+        || discovery.rpc_worker_peer_ids.len() + 1 != machine_count
+    {
+        bail!(
+            "distributed image placement selected {machine_count} machines but named {} remote workers",
+            discovery.rpc_worker_peer_ids.len()
+        );
+    }
+
+    let requester_machine_id = local_machine_id()?;
+    let mut selected_machines = HashSet::new();
+    let mut worker_hops = Vec::with_capacity(discovery.rpc_worker_peer_ids.len());
+    for worker_peer_id in &discovery.rpc_worker_peer_ids {
+        let advertisement = discovery
+            .static_peers
+            .iter()
+            .find(|advertisement| advertisement.peer_id == *worker_peer_id)
+            .ok_or_else(|| anyhow!("selected image worker {worker_peer_id} was not discovered"))?;
+        let capabilities = advertisement.capabilities.as_ref().ok_or_else(|| {
+            anyhow!("selected image worker {worker_peer_id} has no verified capabilities")
+        })?;
+        let machine_id = capabilities
+            .machine_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|machine_id| !machine_id.is_empty())
+            .ok_or_else(|| anyhow!("selected image worker {worker_peer_id} has no machine id"))?;
+        if machine_id == requester_machine_id {
+            bail!(
+                "selected image worker {worker_peer_id} is another peer on the requester's physical machine"
+            );
+        }
+        if !selected_machines.insert(machine_id.to_owned()) {
+            bail!("distributed image placement selected two peers on machine {machine_id}");
+        }
+        let endpoint = capabilities.image_rpc.as_ref().ok_or_else(|| {
+            anyhow!("selected image worker {worker_peer_id} has no ready GGML service")
+        })?;
+        if !endpoint.ready
+            || endpoint.rpc_protocol_version != PINNED_GGML_RPC_PROTOCOL_VERSION
+            || endpoint.runtime_abi != INFERNET_IMAGE_RPC_RUNTIME_ABI
+            || endpoint.tunnel_protocol.as_deref() != Some(IMAGE_RPC_TUNNEL_PROTOCOL)
+            || !matches!(endpoint.backend.as_str(), "cuda" | "metal")
+        {
+            bail!("selected image worker {worker_peer_id} has an incompatible GGML service");
+        }
+        let address = advertisement
+            .addresses
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow!("selected image worker {worker_peer_id} has no route"))?;
+        worker_hops.push(RouteHop {
+            peer_id: worker_peer_id.clone(),
+            machine_id: machine_id.to_owned(),
+            address,
+            // This range is only a transport label. DiT block ownership is
+            // enforced by stable-diffusion.cpp's layer partition below.
+            layers: LayerRange { start: 0, end: 1 },
+        });
+    }
+
+    let topic = gossipsub::IdentTopic::new(discovery.topic.clone());
+    let mut registry = ShardRegistry::new();
+    registry.extend(discovery.static_peers.clone());
+    let mut swarm = build_grid_swarm(
+        discovery.keypair.clone(),
+        &topic,
+        discovery.relay_server,
+        discovery.enable_mdns,
+    )?;
+    start_grid_listeners(&mut swarm, &discovery)?;
+    add_static_peer_addresses(&mut swarm, &discovery.static_peers, &discovery.relay_peers);
+    for hop in &worker_hops {
+        connect_to_activation_hop(
+            &mut swarm,
+            &mut registry,
+            &mut discovery,
+            &topic,
+            hop,
+            connection_timeout,
+        )
+        .await
+        .with_context(|| format!("failed to connect image worker {}", hop.peer_id))?;
+    }
+
+    let control = swarm.behaviour().rpc_tunnel.new_control();
+    let mut proxies = Vec::with_capacity(worker_hops.len());
+    for hop in &worker_hops {
+        let worker_peer_id = hop
+            .peer_id
+            .parse::<PeerId>()
+            .with_context(|| format!("invalid selected image worker {}", hop.peer_id))?;
+        proxies.push(
+            RpcTunnelProxy::bind(
+                control.clone(),
+                RpcTunnelProxyConfig::new(worker_peer_id, RpcTunnelTicket::default())
+                    .with_protocol(StreamProtocol::new(IMAGE_RPC_TUNNEL_PROTOCOL)),
+            )
+            .await
+            .with_context(|| format!("failed to open image tunnel for {}", hop.peer_id))?,
+        );
+    }
+    image_config.rpc_servers = proxies
+        .iter()
+        .map(RpcTunnelProxy::llama_cpp_endpoint)
+        .collect();
+    let output_path = image_config
+        .output_dir
+        .join(format!("{}.png", request.job_id));
+    let mut generation = tokio::task::spawn_blocking(move || {
+        stable_diffusion_runtime::generate_with_sd_cli(&image_config, &request)
+    });
+
+    let generation_result = loop {
+        tokio::select! {
+            result = &mut generation => break result,
+            event = swarm.select_next_some() => {
+                // Keep the swarm progressing while sd-cli opens GGML sockets
+                // through the proxy. An unrelated discovery event must not
+                // abandon the child process; runtime/tunnel failure makes the
+                // pinned CLI fail without a local or remote-only fallback.
+                if let Err(error) = handle_grid_event(
+                    &mut swarm,
+                    event,
+                    &mut registry,
+                    &mut discovery.advertisement,
+                    &topic,
+                    discovery.advertise_listen_addresses,
+                    discovery.dial_discovered_peers,
+                ) {
+                    eprintln!("distributed image network event failed: {error:#}");
+                }
+            }
+        }
+    };
+    let output = generation_result.context("Infernet Image runtime task failed")??;
+
+    for (hop, proxy) in worker_hops.iter().zip(&proxies) {
+        let telemetry = proxy.telemetry();
+        if telemetry.accepted_sessions == 0
+            || telemetry.bytes_local_to_p2p < MIN_IMAGE_WORKER_TENSOR_UPLOAD_BYTES
+            || telemetry.bytes_p2p_to_local == 0
+        {
+            let _ = fs::remove_file(&output_path);
+            bail!(
+                "image worker {} did not execute a DiT block; Infernet discarded the single-machine result",
+                hop.peer_id
+            );
+        }
+    }
+
+    Ok(output)
 }
 
 pub async fn infer_over_libp2p(

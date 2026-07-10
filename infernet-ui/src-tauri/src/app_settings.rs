@@ -6,14 +6,17 @@ use std::{
 };
 
 use infernet_node::{
-    clear_local_llama_rpc_endpoint, detect_node_capabilities, set_local_rpc_active,
-    set_vram_contribution_limit_bytes, stop_persistent_infernet_workers,
+    clear_local_image_rpc_endpoint, clear_local_llama_rpc_endpoint, detect_node_capabilities,
+    set_local_rpc_active, set_vram_contribution_limit_bytes, stop_persistent_infernet_workers,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
 use uuid::Uuid;
 
-use super::{LlamaRpcServiceState, UiState, cache_config_for_app, ensure_llama_rpc_service};
+use super::{
+    ImageRpcServiceState, LlamaRpcServiceState, UiState, cache_config_for_app,
+    ensure_image_rpc_service, ensure_llama_rpc_service,
+};
 
 const APP_SETTINGS_VERSION: u32 = 1;
 
@@ -169,11 +172,20 @@ pub(crate) async fn set_vram_contribution(
             .map_err(|_| "failed to lock llama.cpp RPC service state".to_owned())?;
         *service = LlamaRpcServiceState::Stopped;
     }
+    {
+        let mut service = state
+            .image_rpc_service
+            .lock()
+            .map_err(|_| "failed to lock Infernet Image RPC service state".to_owned())?;
+        *service = ImageRpcServiceState::Stopped;
+    }
     clear_local_llama_rpc_endpoint();
+    clear_local_image_rpc_endpoint();
     set_local_rpc_active(false);
 
     if contribution_bytes > 0 {
         let cache_config = cache_config_for_app(&app);
+        ensure_image_rpc_service(&state, &cache_config).await?;
         ensure_llama_rpc_service(&state, &cache_config).await?;
     }
 

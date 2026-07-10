@@ -631,6 +631,7 @@ fn static_peer_capabilities(machine_id: String) -> NodeCapabilities {
         measured_decode_tokens_per_second: None,
         queue_depth: 0,
         llama_rpc: None,
+        image_rpc: None,
     }
 }
 

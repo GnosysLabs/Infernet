@@ -10,6 +10,7 @@ pub const ACTIVATION_PROTOCOL: &str = "/infernet/activation/2";
 pub const MODEL_PROTOCOL: &str = "/infernet/model/1";
 pub const MODEL_BLOB_PROTOCOL: &str = "/infernet/model-blob/1";
 pub const LLAMA_RPC_TUNNEL_PROTOCOL: &str = "/infernet/llama-rpc-tunnel/1";
+pub const IMAGE_RPC_TUNNEL_PROTOCOL: &str = "/infernet/image-rpc-tunnel/1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelShardInfo {
@@ -209,6 +210,11 @@ pub struct NodeCapabilities {
     pub queue_depth: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llama_rpc: Option<LlamaRpcEndpoint>,
+    /// Exact stable-diffusion.cpp GGML worker used only for image DiT blocks.
+    /// It is separate from llama.cpp because equal wire versions do not imply
+    /// an equal in-memory tensor ABI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_rpc: Option<LlamaRpcEndpoint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -587,6 +593,7 @@ mod tests {
                 ready: true,
                 tunnel_protocol: Some(LLAMA_RPC_TUNNEL_PROTOCOL.to_owned()),
             }),
+            image_rpc: None,
         };
         let advertisement = NodeAdvertisement {
             protocol_version: PROTOCOL_VERSION,

@@ -306,6 +306,7 @@ pub struct RpcTunnelProxyConfig {
     pub bind_addr: SocketAddr,
     /// Exact worker identity selected by the coordinator.
     pub worker_peer_id: PeerId,
+    pub tunnel_protocol: StreamProtocol,
     pub ticket: RpcTunnelTicket,
     pub handshake_timeout: Duration,
     pub max_session_duration: Duration,
@@ -317,6 +318,7 @@ impl RpcTunnelProxyConfig {
         Self {
             bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             worker_peer_id,
+            tunnel_protocol: RPC_TUNNEL_PROTOCOL,
             ticket,
             handshake_timeout: Duration::from_secs(10),
             max_session_duration: Duration::from_secs(30 * 60),
@@ -326,6 +328,11 @@ impl RpcTunnelProxyConfig {
             // which llama.cpp reports as a crashed or malformed RPC server.
             max_connections: LLAMA_RPC_TUNNEL_MAX_CONNECTIONS,
         }
+    }
+
+    pub fn with_protocol(mut self, protocol: StreamProtocol) -> Self {
+        self.tunnel_protocol = protocol;
+        self
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -552,9 +559,28 @@ pub async fn open_rpc_tunnel_stream(
     ticket: RpcTunnelTicket,
     handshake_timeout: Duration,
 ) -> std::result::Result<Stream, RpcTunnelOpenError> {
+    open_rpc_tunnel_stream_for_protocol(
+        control,
+        worker_peer_id,
+        RPC_TUNNEL_PROTOCOL,
+        session_id,
+        ticket,
+        handshake_timeout,
+    )
+    .await
+}
+
+pub async fn open_rpc_tunnel_stream_for_protocol(
+    control: &mut Control,
+    worker_peer_id: PeerId,
+    tunnel_protocol: StreamProtocol,
+    session_id: Uuid,
+    ticket: RpcTunnelTicket,
+    handshake_timeout: Duration,
+) -> std::result::Result<Stream, RpcTunnelOpenError> {
     let open = async {
         let mut stream = control
-            .open_stream(worker_peer_id, RPC_TUNNEL_PROTOCOL)
+            .open_stream(worker_peer_id, tunnel_protocol)
             .await
             .map_err(RpcTunnelOpenError::Stream)?;
         write_open_frame(&mut stream, session_id, ticket)
@@ -824,9 +850,10 @@ async fn run_proxy_accept_loop(
                 let session_telemetry = Arc::clone(&telemetry);
                 sessions.spawn(async move {
                     let session_id = Uuid::new_v4();
-                    match open_rpc_tunnel_stream(
+                    match open_rpc_tunnel_stream_for_protocol(
                         &mut session_control,
                         session_config.worker_peer_id,
+                        session_config.tunnel_protocol,
                         session_id,
                         session_config.ticket,
                         session_config.handshake_timeout,

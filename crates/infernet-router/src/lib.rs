@@ -1332,6 +1332,7 @@ mod tests {
                 measured_decode_tokens_per_second: decode_tokens_per_second,
                 queue_depth,
                 llama_rpc: None,
+                image_rpc: None,
             }),
             hosted_shards: Vec::new(),
             model_shards: Vec::new(),

@@ -5,6 +5,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use libp2p::swarm::Swarm;
+use libp2p::StreamProtocol;
 use libp2p_stream as stream;
 use libp2p_swarm_test::SwarmExt as _;
 use rpc_tunnel::{
@@ -38,6 +39,15 @@ async fn tunnel_harness(
     ticket: RpcTunnelTicket,
     limits: RpcTunnelAdmissionLimits,
 ) -> TunnelHarness {
+    tunnel_harness_for_protocol(target_addr, ticket, limits, RPC_TUNNEL_PROTOCOL).await
+}
+
+async fn tunnel_harness_for_protocol(
+    target_addr: SocketAddr,
+    ticket: RpcTunnelTicket,
+    limits: RpcTunnelAdmissionLimits,
+    protocol: StreamProtocol,
+) -> TunnelHarness {
     let mut coordinator: Swarm<stream::Behaviour> =
         Swarm::new_ephemeral_tokio(|_| stream::Behaviour::new());
     let mut worker: Swarm<stream::Behaviour> =
@@ -47,7 +57,7 @@ async fn tunnel_harness(
 
     let coordinator_control = coordinator.behaviour().new_control();
     let mut worker_control = worker.behaviour().new_control();
-    let incoming = worker_control.accept(RPC_TUNNEL_PROTOCOL).unwrap();
+    let incoming = worker_control.accept(protocol).unwrap();
     let admission = RpcTunnelAdmission::reserved(limits).unwrap();
     admission.grant_ticket(coordinator_peer_id, ticket);
     let tunnel_worker =
@@ -66,6 +76,36 @@ async fn tunnel_harness(
         coordinator_swarm,
         worker_swarm,
     }
+}
+
+#[tokio::test]
+async fn proxy_can_select_an_image_only_tunnel_protocol() {
+    const IMAGE_PROTOCOL: StreamProtocol = StreamProtocol::new("/infernet/image-rpc-tunnel/1");
+    let (sidecar_addr, sidecar_task) = spawn_echo_sidecar().await;
+    let ticket = RpcTunnelTicket::random();
+    let harness = tunnel_harness_for_protocol(
+        sidecar_addr,
+        ticket,
+        RpcTunnelAdmissionLimits::default(),
+        IMAGE_PROTOCOL,
+    )
+    .await;
+    let proxy = RpcTunnelProxy::bind(
+        harness.coordinator_control.clone(),
+        RpcTunnelProxyConfig::new(harness.worker_peer_id, ticket).with_protocol(IMAGE_PROTOCOL),
+    )
+    .await
+    .unwrap();
+
+    let payload = b"image rpc bytes";
+    let mut client = TcpStream::connect(proxy.local_addr()).await.unwrap();
+    client.write_all(payload).await.unwrap();
+    let mut echoed = vec![0_u8; payload.len()];
+    client.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(echoed, payload);
+
+    proxy.shutdown().await;
+    sidecar_task.abort();
 }
 
 async fn spawn_echo_sidecar() -> (SocketAddr, JoinHandle<()>) {

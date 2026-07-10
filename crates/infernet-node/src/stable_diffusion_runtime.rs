@@ -16,6 +16,15 @@ use anyhow::{Context, Result, anyhow, bail};
 const MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DECODED_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 const PINNED_STABLE_DIFFUSION_CPP_REVISION: &str = "cc73429";
+pub const IMAGE_RPC_DEFAULT_PORT: u16 = 50_053;
+pub const INFERNET_IMAGE_RPC_RUNTIME_ABI: &str = "infernet-sdcpp-ggml-rpc-v1";
+const MAX_DISTRIBUTED_IMAGE_MACHINES: usize = 9;
+// Z-Image's transformer-block weights occupy comfortably more than 4 GiB of
+// the pinned 5,017,613,376-byte GGUF. Capping every device except the final
+// one to an equal share of this conservative floor forces the layer allocator
+// to cross every selected device boundary instead of leaving a capable remote
+// unused when the requester can hold the complete model.
+const DISTRIBUTED_DIT_BLOCK_BUDGET_GIB: f64 = 4.0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ValidatedRuntime {
@@ -42,6 +51,8 @@ pub struct StableDiffusionConfig {
     pub log_dir: PathBuf,
     pub backend: String,
     pub params_backend: Option<String>,
+    pub split_mode: Option<String>,
+    pub max_vram: Option<String>,
     pub rpc_servers: Vec<String>,
     pub placement: StableDiffusionPlacement,
     pub timeout: Duration,
@@ -209,6 +220,75 @@ pub fn find_sd_cli_binary() -> Option<PathBuf> {
         .find(|candidate| validate_sd_cli_binary(candidate).is_ok())
 }
 
+pub fn find_image_rpc_server_binary() -> Option<PathBuf> {
+    if environment_flag("INFERNET_ALLOW_EXTERNAL_SD_RUNTIME")
+        && let Some(path) = env::var_os("INFERNET_IMAGE_RPC_SERVER").map(PathBuf::from)
+        && validate_image_rpc_server_binary(&path).is_ok()
+    {
+        return Some(path);
+    }
+    let executable_name = platform_executable_name("infernet-image-rpc-server");
+    let sidecar_name = target_triple().map(|triple| {
+        if cfg!(windows) {
+            format!("infernet-image-rpc-server-{triple}.exe")
+        } else {
+            format!("infernet-image-rpc-server-{triple}")
+        }
+    });
+    let mut candidates = Vec::new();
+    if let Ok(current_exe) = env::current_exe()
+        && let Some(directory) = current_exe.parent()
+    {
+        push_candidates(
+            &mut candidates,
+            directory,
+            &executable_name,
+            sidecar_name.as_deref(),
+        );
+        push_candidates(
+            &mut candidates,
+            &directory.join("resources"),
+            &executable_name,
+            sidecar_name.as_deref(),
+        );
+    }
+    let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    if let Some(repo_root) = crate_dir.parent().and_then(Path::parent) {
+        push_candidates(
+            &mut candidates,
+            &repo_root
+                .join("infernet-ui")
+                .join("src-tauri")
+                .join("binaries"),
+            &executable_name,
+            sidecar_name.as_deref(),
+        );
+    }
+    candidates
+        .into_iter()
+        .find(|candidate| validate_image_rpc_server_binary(candidate).is_ok())
+}
+
+fn validate_image_rpc_server_binary(path: &Path) -> Result<()> {
+    let output = Command::new(path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("failed to inspect image RPC worker {}", path.display()))?;
+    let version = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if !output.status.success()
+        || !version.contains("Infernet Image RPC stable-diffusion.cpp")
+        || !version.contains(PINNED_STABLE_DIFFUSION_CPP_REVISION)
+    {
+        bail!("Infernet Image RPC worker is not built from the pinned image runtime");
+    }
+    Ok(())
+}
+
 fn validate_config(config: &StableDiffusionConfig, request: &ImageGenerationRequest) -> Result<()> {
     for (label, path) in [
         ("sd-cli", &config.binary),
@@ -254,12 +334,90 @@ fn validate_placement(config: &StableDiffusionConfig) -> Result<()> {
         StableDiffusionPlacement::RequesterLocal if !config.rpc_servers.is_empty() => {
             bail!("requester-local image execution cannot use remote RPC workers");
         }
-        StableDiffusionPlacement::Distributed { .. } => bail!(
-            "distributed image execution requires Infernet's role-scoped stage runtime; sd-cli RPC is not a valid placement plan"
-        ),
+        StableDiffusionPlacement::Distributed { machine_count } => {
+            if !(2..=MAX_DISTRIBUTED_IMAGE_MACHINES).contains(&machine_count) {
+                bail!(
+                    "distributed image execution requires 2..={MAX_DISTRIBUTED_IMAGE_MACHINES} physical machines"
+                );
+            }
+            if config.rpc_servers.len() + 1 != machine_count {
+                bail!(
+                    "distributed image execution selected {machine_count} machines but opened {} remote workers",
+                    config.rpc_servers.len()
+                );
+            }
+            let expected_backend = distributed_diffusion_backend(
+                local_backend_from_assignment(&config.backend),
+                machine_count,
+            )?;
+            if config.backend != expected_backend {
+                bail!(
+                    "distributed image backend must split DiT blocks across requester and every remote worker"
+                );
+            }
+            let expected_budget = distributed_diffusion_max_vram(
+                local_backend_from_assignment(&config.backend),
+                machine_count,
+            )?;
+            if config.max_vram.as_deref() != Some(expected_budget.as_str())
+                || config.split_mode.as_deref() != Some("layer")
+            {
+                bail!(
+                    "distributed image execution requires a forced non-empty layer split on every machine"
+                );
+            }
+        }
         StableDiffusionPlacement::RequesterLocal => {}
     }
     Ok(())
+}
+
+pub fn distributed_diffusion_backend(local_backend: &str, machine_count: usize) -> Result<String> {
+    let local_backend = validate_local_accelerator_backend(local_backend)?;
+    if !(2..=MAX_DISTRIBUTED_IMAGE_MACHINES).contains(&machine_count) {
+        bail!(
+            "distributed image execution requires 2..={MAX_DISTRIBUTED_IMAGE_MACHINES} physical machines"
+        );
+    }
+    let mut diffusion_devices = Vec::with_capacity(machine_count);
+    diffusion_devices.push(local_backend.to_owned());
+    diffusion_devices.extend((0..machine_count - 1).map(|index| format!("RPC{index}")));
+    Ok(format!(
+        "te={0},vae={0},diffusion={1}",
+        local_backend,
+        diffusion_devices.join("&")
+    ))
+}
+
+pub fn distributed_diffusion_max_vram(local_backend: &str, machine_count: usize) -> Result<String> {
+    let local_backend = validate_local_accelerator_backend(local_backend)?;
+    if !(2..=MAX_DISTRIBUTED_IMAGE_MACHINES).contains(&machine_count) {
+        bail!(
+            "distributed image execution requires 2..={MAX_DISTRIBUTED_IMAGE_MACHINES} physical machines"
+        );
+    }
+    let per_machine_gib = DISTRIBUTED_DIT_BLOCK_BUDGET_GIB / machine_count as f64;
+    let mut capped_devices = Vec::with_capacity(machine_count - 1);
+    capped_devices.push(format!("{local_backend}={per_machine_gib:.3}"));
+    capped_devices
+        .extend((0..machine_count - 2).map(|index| format!("RPC{index}={per_machine_gib:.3}")));
+    Ok(capped_devices.join(","))
+}
+
+fn validate_local_accelerator_backend(backend: &str) -> Result<&str> {
+    let backend = backend.trim();
+    if !matches!(backend, "metal" | "cuda0") {
+        bail!("distributed image requester backend must be metal or cuda0");
+    }
+    Ok(backend)
+}
+
+fn local_backend_from_assignment(backend: &str) -> &str {
+    backend
+        .strip_prefix("te=")
+        .and_then(|assignment| assignment.split_once(','))
+        .map(|(backend, _)| backend)
+        .unwrap_or(backend)
 }
 
 fn validate_sd_cli_binary(path: &Path) -> Result<()> {
@@ -364,6 +522,14 @@ fn sd_cli_arguments(
     if let Some(params_backend) = config.params_backend.as_deref() {
         arguments.push(OsString::from("--params-backend"));
         arguments.push(OsString::from(params_backend));
+    }
+    if let Some(split_mode) = config.split_mode.as_deref() {
+        arguments.push(OsString::from("--split-mode"));
+        arguments.push(OsString::from(split_mode));
+    }
+    if let Some(max_vram) = config.max_vram.as_deref() {
+        arguments.push(OsString::from("--max-vram"));
+        arguments.push(OsString::from(max_vram));
     }
     if !config.rpc_servers.is_empty() {
         arguments.push(OsString::from("--rpc-servers"));
@@ -491,6 +657,49 @@ mod tests {
         assert!(validate_placement(&config).is_err());
     }
 
+    #[test]
+    fn distributed_plan_splits_dit_across_requester_and_every_remote() {
+        let mut config = test_config();
+        config.placement = StableDiffusionPlacement::Distributed { machine_count: 3 };
+        config.rpc_servers = vec!["127.0.0.1:50052".to_owned(), "127.0.0.1:50053".to_owned()];
+        config.backend = distributed_diffusion_backend("metal", 3).unwrap();
+        config.params_backend = Some("te=cpu,vae=cpu".to_owned());
+        config.split_mode = Some("layer".to_owned());
+        config.max_vram = Some(distributed_diffusion_max_vram("metal", 3).unwrap());
+
+        validate_placement(&config).unwrap();
+        let arguments = sd_cli_arguments(
+            &config,
+            &ImageGenerationRequest {
+                job_id: "distributed-image".to_owned(),
+                prompt: "two red kites".to_owned(),
+                seed: 7,
+                width: 1024,
+                height: 1024,
+                steps: 8,
+            },
+            Path::new("output.png"),
+        );
+
+        assert!(arguments.contains(&OsString::from(
+            "te=metal,vae=metal,diffusion=metal&RPC0&RPC1"
+        )));
+        assert!(arguments.contains(&OsString::from("metal=1.333,RPC0=1.333")));
+        assert!(arguments.contains(&OsString::from("layer")));
+    }
+
+    #[test]
+    fn distributed_plan_rejects_a_remote_only_dit_assignment() {
+        let mut config = test_config();
+        config.placement = StableDiffusionPlacement::Distributed { machine_count: 2 };
+        config.rpc_servers = vec!["127.0.0.1:50052".to_owned()];
+        config.backend = "te=metal,vae=metal,diffusion=RPC0".to_owned();
+        config.split_mode = Some("layer".to_owned());
+        config.max_vram = Some("metal=2.000".to_owned());
+
+        assert!(validate_placement(&config).is_err());
+    }
+
     #[cfg(unix)]
     #[test]
     fn pinned_runtime_wrapper_commits_a_validated_png() {
@@ -540,6 +749,8 @@ cp "$(dirname "$0")/fixture.png" "$output"
             log_dir: root.join("logs"),
             backend: "metal".to_owned(),
             params_backend: Some("*=cpu".to_owned()),
+            split_mode: None,
+            max_vram: None,
             rpc_servers: Vec::new(),
             placement: StableDiffusionPlacement::RequesterLocal,
             timeout: Duration::from_secs(5),
@@ -590,6 +801,8 @@ cp "$(dirname "$0")/fixture.png" "$output"
             log_dir: PathBuf::from("logs"),
             backend: "metal".to_owned(),
             params_backend: None,
+            split_mode: None,
+            max_vram: None,
             rpc_servers: Vec::new(),
             placement: StableDiffusionPlacement::RequesterLocal,
             timeout: Duration::from_secs(60),

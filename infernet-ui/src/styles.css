@@ -3361,7 +3361,7 @@ select:focus-visible {
   flex-direction: column;
 }
 
-.sidebar-mode-empty > div:last-child {
+.creation-empty-state {
   display: flex;
   align-items: flex-start;
   gap: 9px;
@@ -3375,6 +3375,49 @@ select:focus-visible {
   flex: none;
   margin-top: 1px;
   color: var(--soft);
+}
+
+.creation-list {
+  min-height: 0;
+  overflow-y: auto;
+  display: grid;
+  align-content: start;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.creation-list button {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--soft);
+  display: block;
+  padding: 3px;
+}
+
+.creation-list button:hover {
+  border-color: var(--border-soft);
+  background: var(--surface);
+  color: var(--text);
+}
+
+.creation-list button.active {
+  border-color: var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.creation-list img {
+  width: 100%;
+  aspect-ratio: 1;
+  border-radius: 6px;
+  object-fit: cover;
+  display: block;
 }
 
 .thread-list {

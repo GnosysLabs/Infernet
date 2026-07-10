@@ -126,6 +126,10 @@ export async function generateImage(
   return invoke<GenerateImageResponse>("generate_image", { prompt, seed: seed ?? null });
 }
 
+export async function listGeneratedImages(): Promise<GenerateImageResponse[]> {
+  return invoke<GenerateImageResponse[]>("list_generated_images");
+}
+
 export async function listenForProgress(
   handler: (event: ProgressEvent) => void,
 ): Promise<() => void> {

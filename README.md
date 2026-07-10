@@ -456,11 +456,13 @@ npm --prefix infernet-ui run prepare-image-runtime
 
 The image preparation script checks out stable-diffusion.cpp commit
 `cc734292286f85f9c48305d94d7fd22f42838522`, reuses the incremental build under
-`target/stable-diffusion.cpp-runtime`, and installs the Tauri sidecar as
-`infernet-ui/src-tauri/binaries/sd-cli-<target-triple>`. On Apple Silicon it
-builds a static arm64 executable with Metal enabled. Native Linux and Windows
-hosts retain a CPU build path; cross-target preparation requires a separately
-verified native executable from the target platform.
+`target/stable-diffusion.cpp-runtime`, and installs two Tauri sidecars:
+`sd-cli-<target-triple>` and `infernet-image-rpc-server-<target-triple>`. Both
+link the exact same pinned GGML core; the separate llama.cpp RPC worker is not
+wire-ABI-safe for image tensor allocation. On Apple Silicon the image sidecars
+are static arm64 executables with Metal enabled. Native Linux and Windows hosts
+retain a CPU build path; cross-target preparation requires separately verified
+native executables from the target platform.
 
 The build plan can be inspected without changing files:
 
@@ -473,15 +475,16 @@ settings while it downloads and verifies both official model packages. The
 7,850,198,884-byte Z-Image package resumes partial downloads and must match all
 three pinned SHA-256 checksums before onboarding completes. Requester-local
 image generation is allowed only after a discovery window confirms this
-computer is the sole eligible physical machine. If another eligible machine is
-online, the current build refuses the request until the role-scoped
-multi-machine image runtime is connected.
+computer is the sole eligible physical machine. With multiple eligible
+physical machines, Infernet splits contiguous DiT blocks across the requester
+and one authenticated image worker on every other machine.
 
 An external development binary is accepted only with an explicit opt-in:
 
 ```sh
 INFERNET_ALLOW_EXTERNAL_SD_RUNTIME=1 \
 INFERNET_SD_CLI=/path/to/sd-cli \
+INFERNET_IMAGE_RPC_SERVER=/path/to/infernet-image-rpc-server \
 npm --prefix infernet-ui run prepare-image-runtime
 ```
 

@@ -67,7 +67,7 @@ impl Drop for LlamaRpcServer {
 pub fn spawn_llama_rpc_server(config: LlamaRpcServerConfig) -> Result<LlamaRpcServer> {
     if !config.binary.is_file() {
         bail!(
-            "llama.cpp RPC server binary is missing: {}",
+            "GGML RPC server binary is missing: {}",
             config.binary.display()
         );
     }
@@ -75,7 +75,7 @@ pub fn spawn_llama_rpc_server(config: LlamaRpcServerConfig) -> Result<LlamaRpcSe
         || config.bind_host.trim().is_empty()
         || config.advertised_host.trim().is_empty()
     {
-        bail!("llama.cpp RPC server requires a host and non-zero port");
+        bail!("GGML RPC server requires a host and non-zero port");
     }
 
     fs::create_dir_all(&config.cache_dir)
@@ -119,7 +119,7 @@ pub fn spawn_llama_rpc_server(config: LlamaRpcServerConfig) -> Result<LlamaRpcSe
     let probe_address = resolve_one(&probe)?;
     let mut child = command.spawn().with_context(|| {
         format!(
-            "failed to start llama.cpp RPC server {}",
+            "failed to start GGML RPC server {}",
             config.binary.display()
         )
     })?;
@@ -134,13 +134,13 @@ pub fn spawn_llama_rpc_server(config: LlamaRpcServerConfig) -> Result<LlamaRpcSe
             }
             if let Some(status) = child.try_wait()? {
                 bail!(
-                    "llama.cpp RPC server exited during startup with {status}; see {}",
+                    "GGML RPC server exited during startup with {status}; see {}",
                     log_path.display()
                 );
             }
             if Instant::now() >= deadline {
                 bail!(
-                    "timed out validating llama.cpp RPC {} backend at {probe}; see {}",
+                    "timed out validating GGML RPC {} backend at {probe}; see {}",
                     config.expected_backend,
                     log_path.display()
                 );

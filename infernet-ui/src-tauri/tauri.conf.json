@@ -31,7 +31,8 @@
       "binaries/infernet-llama-bridge",
       "binaries/ggml-rpc-server",
       "binaries/llama-server",
-      "binaries/sd-cli"
+      "binaries/sd-cli",
+      "binaries/infernet-image-rpc-server"
     ]
   }
 }

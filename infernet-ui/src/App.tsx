@@ -40,6 +40,7 @@ import {
   getLocalNodeActivity,
   getVramContributionSettings,
   installOfficialImage,
+  listGeneratedImages,
   installOfficialModel,
   listenForProgress,
   listenForModelImportProgress,
@@ -135,6 +136,7 @@ export default function App() {
   const imageGeneratingRef = useRef(false);
   const [imageGenerationStartedAt, setImageGenerationStartedAt] = useState<number | null>(null);
   const [imageResult, setImageResult] = useState<GenerateImageResponse | null>(null);
+  const [imageCreations, setImageCreations] = useState<GenerateImageResponse[]>([]);
   const [imageGenerationError, setImageGenerationError] = useState<string | null>(null);
   const [runningThreadId, setRunningThreadId] = useState<string | null>(null);
   const runningThreadIdRef = useRef<string | null>(null);
@@ -153,6 +155,18 @@ export default function App() {
   const [requiredSetupRunning, setRequiredSetupRunning] = useState(false);
   const [requiredSetupErrors, setRequiredSetupErrors] = useState<RequiredSetupErrors>({});
   const requiredSetupStartedRef = useRef(false);
+
+  useEffect(() => {
+    let disposed = false;
+    listGeneratedImages()
+      .then((creations) => {
+        if (!disposed) setImageCreations(creations);
+      })
+      .catch((error) => console.error("Failed to restore generated images", error));
+    return () => {
+      disposed = true;
+    };
+  }, []);
 
   const activeThread = chatHistory.threads.find(
     (thread) => thread.id === chatHistory.activeThreadId,
@@ -585,7 +599,12 @@ export default function App() {
     setImageGenerationError(null);
     setImageResult(null);
     try {
-      setImageResult(await generateImage(cleanPrompt));
+      const nextImage = await generateImage(cleanPrompt);
+      setImageResult(nextImage);
+      setImageCreations((current) => [
+        nextImage,
+        ...current.filter((creation) => creation.imageId !== nextImage.imageId),
+      ]);
     } catch (error) {
       setImageGenerationError(imageErrorMessage(error));
     } finally {
@@ -593,6 +612,13 @@ export default function App() {
       setImageGenerating(false);
       getImageRuntimeStatus().then(setImageRuntimeStatus).catch(() => undefined);
     }
+  }
+
+  function openImageCreation(creation: GenerateImageResponse) {
+    setPrimaryMode("image");
+    setPage("image");
+    setImageResult(creation);
+    setImageGenerationError(null);
   }
 
   async function removeThread(threadId: string) {
@@ -706,10 +732,13 @@ export default function App() {
         primaryMode={primaryMode}
         runningThreadId={runningThreadId}
         imageGenerationBusy={imageGenerating || Boolean(imageRuntimeStatus?.busy)}
+        imageCreations={imageCreations}
+        activeImageId={page === "image" ? imageResult?.imageId ?? null : null}
         disabled={!chatHistoryReady || chatHistoryBusy}
         persistenceError={chatHistoryError}
         onCreateThread={createNewThread}
         onStartImage={startNewImage}
+        onOpenImage={openImageCreation}
         onModeChange={selectPrimaryMode}
         onOpenThread={openThread}
         onDeleteThread={removeThread}
@@ -951,10 +980,13 @@ function Sidebar({
   primaryMode,
   runningThreadId,
   imageGenerationBusy,
+  imageCreations,
+  activeImageId,
   disabled,
   persistenceError,
   onCreateThread,
   onStartImage,
+  onOpenImage,
   onModeChange,
   onOpenThread,
   onDeleteThread,
@@ -965,10 +997,13 @@ function Sidebar({
   primaryMode: PrimaryMode;
   runningThreadId: string | null;
   imageGenerationBusy: boolean;
+  imageCreations: GenerateImageResponse[];
+  activeImageId: string | null;
   disabled: boolean;
   persistenceError: string | null;
   onCreateThread: () => Promise<void>;
   onStartImage: () => void;
+  onOpenImage: (creation: GenerateImageResponse) => void;
   onModeChange: (mode: PrimaryMode) => void;
   onOpenThread: (threadId: string) => Promise<void>;
   onDeleteThread: (threadId: string) => Promise<void>;
@@ -1167,10 +1202,29 @@ function Sidebar({
       ) : (
         <div className="sidebar-mode-empty">
           <div className="thread-list-heading">Creations</div>
-          <div>
-            <ImageIcon size={17} aria-hidden="true" />
-            <span>Your generated images will appear here.</span>
-          </div>
+          {imageCreations.length > 0 ? (
+            <ul className="creation-list" aria-label="Generated images">
+              {imageCreations.map((creation) => (
+                <li key={creation.imageId}>
+                  <button
+                    type="button"
+                    className={creation.imageId === activeImageId ? "active" : undefined}
+                    aria-current={creation.imageId === activeImageId ? "page" : undefined}
+                    aria-label={`Open creation: ${creation.prompt}`}
+                    title={creation.prompt}
+                    onClick={() => onOpenImage(creation)}
+                  >
+                    <img src={creation.imageDataUrl} alt="" />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <div className="creation-empty-state">
+              <ImageIcon size={17} aria-hidden="true" />
+              <span>Your generated images will appear here.</span>
+            </div>
+          )}
         </div>
       )}
 
@@ -1490,7 +1544,7 @@ function ImagePage({
               <dl className="image-result-meta">
                 <div>
                   <dt>Seed</dt>
-                  <dd>{result.seed}</dd>
+                  <dd>{result.detailsAvailable ? result.seed : "Unavailable"}</dd>
                 </div>
                 <div>
                   <dt>Size</dt>
@@ -1498,11 +1552,11 @@ function ImagePage({
                 </div>
                 <div>
                   <dt>Steps</dt>
-                  <dd>{result.steps}</dd>
+                  <dd>{result.detailsAvailable ? result.steps : "Unavailable"}</dd>
                 </div>
                 <div>
                   <dt>Time</dt>
-                  <dd>{formatDuration(result.durationMs)}</dd>
+                  <dd>{result.detailsAvailable ? formatDuration(result.durationMs) : "Unavailable"}</dd>
                 </div>
               </dl>
             </figcaption>
@@ -1536,7 +1590,7 @@ function ImagePage({
         ) : null}
       </div>
 
-      <div className="image-composer-dock">
+      {result ? null : <div className="image-composer-dock">
         <div className="composer image-composer">
           <textarea
             ref={inputRef}
@@ -1570,7 +1624,7 @@ function ImagePage({
         <p id="image-runtime-note" className="image-runtime-note" role="status" aria-live="polite">
           {runtimeNote}
         </p>
-      </div>
+      </div>}
     </section>
   );
 }

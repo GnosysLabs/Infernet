@@ -1,9 +1,9 @@
 # Infernet Image v1
 
-Status: requester-local first slice implemented. The pinned package installer,
-runtime status, generation command, and Image workspace are connected. The
-multi-machine stage runtime remains gated; requests refuse instead of falling
-back to one machine whenever two or more eligible physical machines are online.
+Status: requester-local and authenticated multi-machine generation are
+implemented. When two or more eligible physical machines are online, the
+diffusion transformer is divided into contiguous block ranges across the
+requester and every selected remote machine for every denoising step.
 
 ## Product decision
 
@@ -79,22 +79,22 @@ Image inference follows the product-wide physical-machine placement invariant:
   participate in the split pipeline. Separate peer identities on one physical
   machine do not satisfy this requirement.
 
-The first network topology is a stage split, not whole-pipeline remote
-execution:
+The first network topology is a sticky diffusion-transformer block split, not
+whole-pipeline remote execution:
 
 1. Package the text encoder, diffusion transformer, and VAE as independently
    verified, role-scoped components of one signed release.
-2. Add role-scoped runtime operations for prompt encoding, denoising, and VAE
-   decoding. Do not expose a remote end-to-end generation operation that can
-   bypass placement.
-3. For two eligible physical machines, place the text encoder and VAE on one
-   machine and the complete eight-step DiT denoising loop on the other. Transfer
-   prompt embeddings once to the DiT machine and the final latent once to the
-   VAE machine.
-4. For three or more eligible physical machines, place the three stages across
-   the eligible topology and split contiguous DiT block ranges when needed to
-   include additional capacity-safe participants. Keep one sticky plan for all
-   eight denoising steps.
+2. Keep prompt encoding, scheduling, and VAE decode on the requester. These
+   lighter stages do not count as the requester's distributed contribution.
+3. Assign the diffusion transformer to an ordered device list whose first
+   device is the requester's accelerator and whose remaining devices are one
+   authenticated worker on every other eligible physical machine. Split
+   contiguous transformer-block ranges across that complete list and reuse the
+   same sticky assignment for all eight denoising steps.
+4. Force a non-empty range on every selected machine even when one accelerator
+   could hold the complete transformer. After generation, require substantial
+   tensor traffic through every selected worker tunnel; discard the PNG if any
+   participant did not actually execute its assigned DiT range.
 5. Persist finished images and metadata separately from chat messages, and let
    Infernet distribute each signed component through the existing verified
    model-transfer layer.
@@ -102,11 +102,18 @@ execution:
    collapse the active request onto one remote machine. A new sole-machine plan
    is valid only if the requester is then the sole eligible machine.
 
-Stage placement is the initial production boundary. Inter-peer DiT block
-splitting remains gated on correctness and network benchmarks because its
-activation boundary repeats during all eight denoising steps.
+The initial implementation uses stable-diffusion.cpp's layer-split scheduler
+over an image-only authenticated GGML tunnel. The pinned image runtime and
+worker link the exact same stable-diffusion.cpp GGML core; the llama.cpp worker
+is kept separate even when it advertises the same RPC wire version. Raw worker
+TCP endpoints are never advertised or accepted: the server stays on loopback,
+each coordinator proxy is bound to an exact authenticated PeerId, and a failed
+distributed plan never falls back to local-only or remote-only execution.
 
-Do not reuse stable-diffusion.cpp RPC as the network design. Its client-driven tensor and graph transfer is different from Infernet's worker-cached, signed package model.
+This first implementation transfers assigned weights and repeated activation
+boundaries through the tunnel. A later worker-cached image protocol may reduce
+warm-generation transfer cost, but it must preserve the same requester-plus-
+remote DiT participation invariant.
 
 ## Release gate
 

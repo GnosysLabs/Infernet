@@ -43,8 +43,12 @@ fn prepare_llama_runtime() {
 
 fn prepare_stable_diffusion_runtime() {
     println!("cargo:rerun-if-changed=../../scripts/prepare-stable-diffusion-runtime.mjs");
+    println!("cargo:rerun-if-changed=../../stable-diffusion-runtime/CMakeLists.txt");
+    println!("cargo:rerun-if-changed=../../stable-diffusion-runtime/infernet-overlay.cmake");
+    println!("cargo:rerun-if-changed=../../stable-diffusion-runtime/rpc-server.cpp");
     println!("cargo:rerun-if-env-changed=INFERNET_SKIP_RUNTIME_PREPARE");
     println!("cargo:rerun-if-env-changed=INFERNET_SD_CLI");
+    println!("cargo:rerun-if-env-changed=INFERNET_IMAGE_RPC_SERVER");
     println!("cargo:rerun-if-env-changed=INFERNET_SD_BUILD_JOBS");
     println!("cargo:rerun-if-env-changed=STABLE_DIFFUSION_CPP_REF");
     println!("cargo:rerun-if-env-changed=INFERNET_ALLOW_EXTERNAL_SD_RUNTIME");

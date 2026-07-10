@@ -28,7 +28,9 @@ use infernet_model::{
     OfficialModelRelease, RuntimeKind, SeedShardManifest, ShardDescriptor,
 };
 use infernet_node::stable_diffusion_runtime::{
-    ImageGenerationRequest, StableDiffusionConfig, StableDiffusionPlacement, find_sd_cli_binary,
+    IMAGE_RPC_DEFAULT_PORT, INFERNET_IMAGE_RPC_RUNTIME_ABI, ImageGenerationRequest,
+    StableDiffusionConfig, StableDiffusionPlacement, distributed_diffusion_backend,
+    distributed_diffusion_max_vram, find_image_rpc_server_binary, find_sd_cli_binary,
     generate_with_sd_cli,
 };
 use infernet_node::{
@@ -36,26 +38,27 @@ use infernet_node::{
     LLAMA_RPC_PROTOCOL_VERSION, LlamaRpcServer, LlamaRpcServerConfig, LocalNodeActivityEntry,
     LocalNodeActivityKind, LocalNodeActivityOutcome, LocalNodeActivityTask,
     PAYLOAD_KIND_FULL_MODEL, PAYLOAD_KIND_GGUF_SHARD, PAYLOAD_KIND_INFERNET_SHARD, ShardCache,
-    ShardCacheConfig, begin_local_node_activity, clear_local_llama_rpc_endpoint,
-    detect_node_capabilities, empty_advertisement, enrich_local_advertisement,
-    fetch_model_shard_over_libp2p_with_progress, find_llama_rpc_server_binary,
+    ShardCacheConfig, begin_local_node_activity, clear_local_image_rpc_endpoint,
+    clear_local_llama_rpc_endpoint, detect_node_capabilities, empty_advertisement,
+    enrich_local_advertisement, fetch_model_shard_over_libp2p_with_progress,
+    find_llama_rpc_server_binary, generate_image_over_libp2p,
     import_seed_model_from_file_consuming_verified, infer_over_libp2p, is_executable_shard_record,
     load_or_generate_keypair, local_capability_advertisement, local_node_activity_snapshot,
     model_serving_telemetry, persistent_infernet_worker_is_resident,
     run_model_distribution_node_with_readiness_and_registry, seed_manifest_for_network,
-    set_local_inference_active, set_local_llama_rpc_endpoint, set_local_model_components,
-    set_local_rpc_active, sha256_file, spawn_llama_rpc_server, stop_persistent_llama_server,
-    stop_persistent_rpc_tunnels, vram_contribution_limit_bytes,
+    set_local_image_rpc_endpoint, set_local_inference_active, set_local_llama_rpc_endpoint,
+    set_local_model_components, set_local_rpc_active, sha256_file, spawn_llama_rpc_server,
+    stop_persistent_llama_server, stop_persistent_rpc_tunnels, vram_contribution_limit_bytes,
 };
 use infernet_protocol::{
-    LLAMA_RPC_TUNNEL_PROTOCOL, LlamaRpcEndpoint, ModelShardInfo, NodeAdvertisement,
-    PROTOCOL_VERSION, RouteHop, TraceEvent,
+    IMAGE_RPC_TUNNEL_PROTOCOL, LLAMA_RPC_TUNNEL_PROTOCOL, LlamaRpcEndpoint, ModelShardInfo,
+    NodeAdvertisement, PROTOCOL_VERSION, RouteHop, TraceEvent,
 };
 use infernet_router::{
     CapacityPlanningConfig, FixedModelComponent, ShardRegistry, plan_fixed_components,
 };
 use libp2p::{Multiaddr, PeerId, identity, multiaddr::Protocol};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::io::AsyncWriteExt;
 use tokio::time::{Instant, sleep};
@@ -70,6 +73,7 @@ const UI_LISTEN_PORT: u16 = 9777;
 const OFFICIAL_CHAT_MODEL_ID: &str = "infernet-chat-v1";
 const RUNTIME_SCRATCH_BYTES_PER_PEER: u64 = 768 * 1024 * 1024;
 const CAPACITY_SAFETY_BYTES: u64 = 1024 * 1024 * 1024;
+const IMAGE_SPLIT_MIN_AVAILABLE_ACCELERATOR_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 // The transport delivers 4 MiB chunks. Forward every completed chunk so the
 // desktop progress bar reflects the live transfer instead of appearing frozen
 // until another 64 MiB has accumulated.
@@ -91,6 +95,12 @@ enum LlamaRpcServiceState {
     Running(AdvertisedLlamaRpcServer),
 }
 
+enum ImageRpcServiceState {
+    Stopped,
+    Starting(Vec<oneshot::Sender<Result<(), String>>>),
+    Running(AdvertisedImageRpcServer),
+}
+
 struct AdvertisedLlamaRpcServer {
     server: LlamaRpcServer,
 }
@@ -98,6 +108,16 @@ struct AdvertisedLlamaRpcServer {
 impl Drop for AdvertisedLlamaRpcServer {
     fn drop(&mut self) {
         clear_local_llama_rpc_endpoint();
+    }
+}
+
+struct AdvertisedImageRpcServer {
+    server: LlamaRpcServer,
+}
+
+impl Drop for AdvertisedImageRpcServer {
+    fn drop(&mut self) {
+        clear_local_image_rpc_endpoint();
     }
 }
 
@@ -110,6 +130,7 @@ struct UiState {
     model_distribution_service: Arc<Mutex<ModelDistributionServiceState>>,
     live_registry: Arc<Mutex<ShardRegistry>>,
     llama_rpc_service: Arc<Mutex<LlamaRpcServiceState>>,
+    image_rpc_service: Arc<Mutex<ImageRpcServiceState>>,
     active_model_acquisitions: Arc<Mutex<BTreeSet<String>>>,
     manual_peers: Mutex<Vec<NodeAdvertisement>>,
     peer_presence: Mutex<PeerPresence>,
@@ -130,6 +151,7 @@ impl Default for UiState {
             )),
             live_registry: Arc::new(Mutex::new(ShardRegistry::new())),
             llama_rpc_service: Arc::new(Mutex::new(LlamaRpcServiceState::Stopped)),
+            image_rpc_service: Arc::new(Mutex::new(ImageRpcServiceState::Stopped)),
             active_model_acquisitions: Arc::new(Mutex::new(BTreeSet::new())),
             manual_peers: Mutex::new(Vec::new()),
             peer_presence: Mutex::new(PeerPresence::default()),
@@ -316,6 +338,28 @@ struct GenerateImageResponse {
     duration_ms: u64,
     release_id: String,
     placement: String,
+    details_available: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GeneratedImageMetadata {
+    version: u32,
+    image_id: String,
+    prompt: String,
+    seed: i64,
+    width: u32,
+    height: u32,
+    steps: u32,
+    duration_ms: u64,
+    release_id: String,
+    placement: String,
+}
+
+struct DiscoveredImagePlacement {
+    placement: StableDiffusionPlacement,
+    remote_worker_peer_ids: Vec<String>,
+    advertisements: Vec<NodeAdvertisement>,
 }
 
 struct ImageOperationGuard {
@@ -414,7 +458,11 @@ fn get_local_node_activity() -> LocalNodeActivityView {
     let compute_ready = capabilities
         .llama_rpc
         .as_ref()
-        .is_some_and(|endpoint| endpoint.ready);
+        .is_some_and(|endpoint| endpoint.ready)
+        || capabilities
+            .image_rpc
+            .as_ref()
+            .is_some_and(|endpoint| endpoint.ready);
     let serving = model_serving_telemetry();
     let sharing_active = serving
         .last_activity_unix_ms
@@ -538,6 +586,138 @@ async fn install_official_image(
 }
 
 #[tauri::command]
+async fn list_generated_images(app: AppHandle) -> Result<Vec<GenerateImageResponse>, String> {
+    let image_dir = app_data_dir(&app).join("generated-images");
+    let mut directory = match tokio::fs::read_dir(&image_dir).await {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "failed to read generated images at {}: {error}",
+                image_dir.display()
+            ));
+        }
+    };
+    let mut creations = Vec::new();
+
+    while let Some(entry) = directory
+        .next_entry()
+        .await
+        .map_err(|error| format!("failed to inspect generated images: {error}"))?
+    {
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("png") {
+            continue;
+        }
+        let Some(image_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if uuid::Uuid::parse_str(image_id).is_err() {
+            continue;
+        }
+
+        let image_bytes = match tokio::fs::read(&path).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                eprintln!(
+                    "failed to reload generated image {}: {error}",
+                    path.display()
+                );
+                continue;
+            }
+        };
+        let Some((png_width, png_height)) = png_dimensions(&image_bytes) else {
+            eprintln!("ignored invalid generated PNG at {}", path.display());
+            continue;
+        };
+        let metadata_path = image_dir.join(format!("{image_id}.json"));
+        let saved_metadata = match tokio::fs::read(&metadata_path).await {
+            Ok(bytes) => serde_json::from_slice::<GeneratedImageMetadata>(&bytes)
+                .ok()
+                .filter(|metadata| metadata.version == 1 && metadata.image_id == image_id),
+            Err(_) => None,
+        };
+        let modified_at = entry
+            .metadata()
+            .await
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0);
+
+        let response = if let Some(metadata) = saved_metadata {
+            GenerateImageResponse {
+                image_data_url: format!(
+                    "data:image/png;base64,{}",
+                    BASE64_STANDARD.encode(&image_bytes)
+                ),
+                image_id: metadata.image_id,
+                prompt: metadata.prompt,
+                seed: metadata.seed,
+                width: metadata.width,
+                height: metadata.height,
+                steps: metadata.steps,
+                duration_ms: metadata.duration_ms,
+                release_id: metadata.release_id,
+                placement: metadata.placement,
+                details_available: true,
+            }
+        } else {
+            GenerateImageResponse {
+                image_data_url: format!(
+                    "data:image/png;base64,{}",
+                    BASE64_STANDARD.encode(&image_bytes)
+                ),
+                image_id: image_id.to_owned(),
+                prompt: "Saved creation".to_owned(),
+                seed: 0,
+                width: png_width,
+                height: png_height,
+                steps: 0,
+                duration_ms: 0,
+                release_id: image_runtime::IMAGE_RELEASE_ID.to_owned(),
+                placement: "Saved on this computer".to_owned(),
+                details_available: false,
+            }
+        };
+        creations.push((modified_at, response));
+    }
+
+    creations.sort_by(|left, right| right.0.cmp(&left.0));
+    Ok(creations
+        .into_iter()
+        .map(|(_, creation)| creation)
+        .collect())
+}
+
+fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    if bytes.len() < 24 || &bytes[..8] != PNG_SIGNATURE || &bytes[12..16] != b"IHDR" {
+        return None;
+    }
+    let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
+    let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+    (width > 0 && height > 0).then_some((width, height))
+}
+
+async fn persist_generated_image_metadata(
+    image_dir: &std::path::Path,
+    metadata: &GeneratedImageMetadata,
+) -> Result<(), String> {
+    let metadata_path = image_dir.join(format!("{}.json", metadata.image_id));
+    let temporary_path = image_dir.join(format!(".{}.json.tmp", metadata.image_id));
+    let bytes = serde_json::to_vec_pretty(metadata)
+        .map_err(|error| format!("failed to serialize generated image metadata: {error}"))?;
+    tokio::fs::write(&temporary_path, bytes)
+        .await
+        .map_err(|error| format!("failed to save generated image metadata: {error}"))?;
+    tokio::fs::rename(&temporary_path, &metadata_path)
+        .await
+        .map_err(|error| format!("failed to commit generated image metadata: {error}"))
+}
+
+#[tauri::command]
 async fn generate_image(
     app: AppHandle,
     state: State<'_, UiState>,
@@ -553,6 +733,7 @@ async fn generate_image(
     }
     let _operation = begin_image_operation(&state)?;
     let cache_config = cache_config_for_app(&app);
+    ensure_image_rpc_service(&state, &cache_config).await?;
     ensure_model_distribution_service(&state, cache_config.clone()).await?;
     let package_paths = image_runtime::ensure_verified_package(&cache_config)
         .await
@@ -568,7 +749,7 @@ async fn generate_image(
         .map(str::trim)
         .filter(|machine_id| !machine_id.is_empty())
         .ok_or_else(|| "Infernet could not verify this computer's identity.".to_owned())?;
-    let placement = discover_image_placement(
+    let discovered_placement = discover_image_placement(
         &app,
         &state,
         &cache_config,
@@ -576,17 +757,9 @@ async fn generate_image(
         Duration::from_millis(DEFAULT_DISCOVERY_TIMEOUT_MS),
     )
     .await?;
-    let StableDiffusionPlacement::RequesterLocal = placement else {
-        let machine_count = match placement {
-            StableDiffusionPlacement::Distributed { machine_count } => machine_count,
-            StableDiffusionPlacement::RequesterLocal => unreachable!(),
-        };
-        return Err(format!(
-            "{machine_count} eligible physical machines are online, so Infernet requires this image request to be split. The distributed image stage runtime is not connected yet; no single machine received the request."
-        ));
-    };
+    let placement = discovered_placement.placement.clone();
 
-    let backend = match local_capabilities.compute_backend.as_str() {
+    let local_backend = match local_capabilities.compute_backend.as_str() {
         "metal" => "metal",
         "cuda" => "cuda0",
         _ => {
@@ -595,20 +768,45 @@ async fn generate_image(
             );
         }
     };
+    let (runtime_backend, params_backend, split_mode, max_vram, placement_label) = match placement {
+        StableDiffusionPlacement::RequesterLocal => (
+            local_backend.to_owned(),
+            Some("*=cpu".to_owned()),
+            None,
+            None,
+            "requester-local sole eligible machine".to_owned(),
+        ),
+        StableDiffusionPlacement::Distributed { machine_count } => (
+            distributed_diffusion_backend(local_backend, machine_count)
+                .map_err(|error| error.to_string())?,
+            Some("te=cpu,vae=cpu".to_owned()),
+            Some("layer".to_owned()),
+            Some(
+                distributed_diffusion_max_vram(local_backend, machine_count)
+                    .map_err(|error| error.to_string())?,
+            ),
+            format!(
+                "DiT blocks split across {machine_count} physical machines, including requester"
+            ),
+        ),
+    };
     let image_trace_id = uuid::Uuid::new_v4();
     let image_id = image_trace_id.to_string();
     let seed = seed.unwrap_or_else(|| (current_unix_ms_u64() & i64::MAX as u64) as i64);
+    let image_dir = app_data_dir(&app).join("generated-images");
     let config = StableDiffusionConfig {
         binary,
         diffusion_model_path: package_paths.diffusion_model,
         text_encoder_path: package_paths.text_encoder,
         vae_path: package_paths.vae,
-        output_dir: app_data_dir(&app).join("generated-images"),
+        output_dir: image_dir.clone(),
         log_dir: app_data_dir(&app).join("runtime-logs").join("image"),
-        backend: backend.to_owned(),
-        params_backend: Some("*=cpu".to_owned()),
+        backend: runtime_backend,
+        params_backend,
+        split_mode,
+        max_vram,
         rpc_servers: Vec::new(),
-        placement: StableDiffusionPlacement::RequesterLocal,
+        placement: placement.clone(),
         timeout: Duration::from_secs(10 * 60),
     };
     let request = ImageGenerationRequest {
@@ -623,14 +821,53 @@ async fn generate_image(
     let activity =
         begin_local_node_activity(image_trace_id, LocalNodeActivityKind::ImageGeneration);
     set_local_inference_active(true);
-    let generation = tokio::task::spawn_blocking(move || generate_with_sd_cli(&config, &request))
-        .await
-        .map_err(|error| format!("Infernet Image runtime task failed: {error}"));
+    let generation: Result<_, String> = async {
+        match placement {
+            StableDiffusionPlacement::RequesterLocal => {
+                tokio::task::spawn_blocking(move || generate_with_sd_cli(&config, &request))
+                    .await
+                    .map_err(|error| format!("Infernet Image runtime task failed: {error}"))?
+                    .map_err(|error| error.to_string())
+            }
+            StableDiffusionPlacement::Distributed { .. } => {
+                let (mut discovery, _) = discovery_config_from_state(&state)?;
+                discovery.keypair = identity::Keypair::generate_ed25519();
+                discovery.advertisement = None;
+                discovery.advertise_listen_addresses = false;
+                merge_static_peer_advertisements(
+                    &mut discovery.static_peers,
+                    discovered_placement.advertisements,
+                );
+                discovery
+                    .set_rpc_worker_peer_ids(discovered_placement.remote_worker_peer_ids)
+                    .map_err(|error| error.to_string())?;
+                generate_image_over_libp2p(discovery, config, request, Duration::from_secs(30))
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+        }
+    }
+    .await;
     set_local_inference_active(false);
-    let output = generation?.map_err(|error| error.to_string())?;
+    let output = generation?;
     let image_bytes = tokio::fs::read(&output.png_path)
         .await
         .map_err(|error| format!("failed to read generated image: {error}"))?;
+    let metadata = GeneratedImageMetadata {
+        version: 1,
+        image_id: image_id.clone(),
+        prompt: prompt.clone(),
+        seed: output.seed,
+        width: output.width,
+        height: output.height,
+        steps: output.steps,
+        duration_ms: output.duration_ms,
+        release_id: image_runtime::IMAGE_RELEASE_ID.to_owned(),
+        placement: placement_label.clone(),
+    };
+    if let Err(error) = persist_generated_image_metadata(&image_dir, &metadata).await {
+        eprintln!("{error}");
+    }
     activity.complete(LocalNodeActivityOutcome::Success);
 
     Ok(GenerateImageResponse {
@@ -646,7 +883,8 @@ async fn generate_image(
         steps: output.steps,
         duration_ms: output.duration_ms,
         release_id: image_runtime::IMAGE_RELEASE_ID.to_owned(),
-        placement: "requester-local sole eligible machine".to_owned(),
+        placement: placement_label,
+        details_available: true,
     })
 }
 
@@ -676,26 +914,10 @@ fn eligible_image_machine_ids(
     advertisements: &[NodeAdvertisement],
     local_peer_id: &str,
 ) -> BTreeSet<String> {
-    let expected_components = image_runtime::component_infos();
     advertisements
         .iter()
         .filter_map(|advertisement| {
-            let capabilities = advertisement.capabilities.as_ref()?;
-            if !matches!(capabilities.compute_backend.as_str(), "cuda" | "metal")
-                || capabilities.active_sessions >= capabilities.max_sessions
-                || capabilities.available_accelerator_memory_bytes == 0
-                || (advertisement.peer_id != local_peer_id
-                    && (advertisement.addresses.is_empty()
-                        || capabilities.vram_contribution_limit_bytes == Some(0)))
-                || !expected_components.iter().all(|expected| {
-                    advertisement
-                        .model_components
-                        .iter()
-                        .any(|actual| actual == expected)
-                })
-            {
-                return None;
-            }
+            let capabilities = image_advertisement_is_eligible(advertisement, local_peer_id)?;
             capabilities
                 .machine_id
                 .as_deref()
@@ -704,6 +926,78 @@ fn eligible_image_machine_ids(
                 .map(str::to_owned)
         })
         .collect()
+}
+
+fn image_advertisement_is_eligible<'a>(
+    advertisement: &'a NodeAdvertisement,
+    local_peer_id: &str,
+) -> Option<&'a infernet_protocol::NodeCapabilities> {
+    let capabilities = advertisement.capabilities.as_ref()?;
+    let expected_components = image_runtime::component_infos();
+    let remote_rpc_ready = advertisement.peer_id == local_peer_id
+        || capabilities.image_rpc.as_ref().is_some_and(|endpoint| {
+            endpoint.ready
+                && endpoint.rpc_protocol_version == LLAMA_RPC_PROTOCOL_VERSION
+                && endpoint.runtime_abi == INFERNET_IMAGE_RPC_RUNTIME_ABI
+                && endpoint.tunnel_protocol.as_deref() == Some(IMAGE_RPC_TUNNEL_PROTOCOL)
+                && matches!(endpoint.backend.as_str(), "cuda" | "metal")
+        });
+    (matches!(capabilities.compute_backend.as_str(), "cuda" | "metal")
+        && capabilities.active_sessions < capabilities.max_sessions
+        && capabilities.available_accelerator_memory_bytes
+            >= IMAGE_SPLIT_MIN_AVAILABLE_ACCELERATOR_BYTES
+        && (advertisement.peer_id == local_peer_id
+            || (!advertisement.addresses.is_empty()
+                && capabilities.vram_contribution_limit_bytes != Some(0)))
+        && remote_rpc_ready
+        && expected_components.iter().all(|expected| {
+            advertisement
+                .model_components
+                .iter()
+                .any(|actual| actual == expected)
+        }))
+    .then_some(capabilities)
+}
+
+fn select_image_rpc_workers(
+    advertisements: &[NodeAdvertisement],
+    local_peer_id: &str,
+    origin_machine_id: &str,
+) -> Vec<String> {
+    let mut best_by_machine = BTreeMap::<String, (u64, String)>::new();
+    for advertisement in advertisements {
+        let Some(capabilities) = image_advertisement_is_eligible(advertisement, local_peer_id)
+        else {
+            continue;
+        };
+        let Some(machine_id) = capabilities
+            .machine_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|machine_id| !machine_id.is_empty() && *machine_id != origin_machine_id)
+        else {
+            continue;
+        };
+        let candidate = (
+            capabilities.available_accelerator_memory_bytes,
+            advertisement.peer_id.clone(),
+        );
+        best_by_machine
+            .entry(machine_id.to_owned())
+            .and_modify(|current| {
+                if candidate.0 > current.0 || (candidate.0 == current.0 && candidate.1 < current.1)
+                {
+                    *current = candidate.clone();
+                }
+            })
+            .or_insert(candidate);
+    }
+    let mut workers = best_by_machine.into_values().collect::<Vec<_>>();
+    // The final device receives the uncapped remainder of the transformer, so
+    // put the largest remote last while every earlier machine gets a forced
+    // non-empty contiguous range.
+    workers.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    workers.into_iter().map(|(_, peer_id)| peer_id).collect()
 }
 
 fn plan_image_placement(
@@ -719,6 +1013,10 @@ fn plan_image_placement(
             "Infernet will not assign an entire image request to one remote computer; waiting for another eligible computer."
                 .to_owned(),
         ),
+        _ if !eligible_machine_ids.contains(origin_machine_id) => Err(
+            "This computer must participate in the image generation split, but it is not currently eligible."
+                .to_owned(),
+        ),
         machine_count => Ok(StableDiffusionPlacement::Distributed { machine_count }),
     }
 }
@@ -729,21 +1027,45 @@ async fn discover_image_placement(
     cache_config: &ShardCacheConfig,
     origin_machine_id: &str,
     timeout: Duration,
-) -> Result<StableDiffusionPlacement, String> {
+) -> Result<DiscoveredImagePlacement, String> {
     let deadline = Instant::now() + timeout;
     loop {
         let (registry, local_peer_id, _, _) =
             discover_registry(app, state, cache_config, 0).await?;
-        let eligible_machines =
-            eligible_image_machine_ids(&registry.advertisements(), &local_peer_id);
+        let advertisements = registry.advertisements();
+        let eligible_machines = eligible_image_machine_ids(&advertisements, &local_peer_id);
         let planned = plan_image_placement(&eligible_machines, origin_machine_id);
 
         match &planned {
-            Ok(StableDiffusionPlacement::Distributed { .. }) => return planned,
-            Ok(StableDiffusionPlacement::RequesterLocal) if Instant::now() >= deadline => {
-                return planned;
+            Ok(StableDiffusionPlacement::Distributed { machine_count }) => {
+                let remote_worker_peer_ids =
+                    select_image_rpc_workers(&advertisements, &local_peer_id, origin_machine_id);
+                if remote_worker_peer_ids.len() + 1 != *machine_count {
+                    return Err(
+                        "Infernet could not bind every eligible physical machine to one image worker."
+                            .to_owned(),
+                    );
+                }
+                return Ok(DiscoveredImagePlacement {
+                    placement: planned?,
+                    remote_worker_peer_ids,
+                    advertisements,
+                });
             }
-            Err(_) if Instant::now() >= deadline => return planned,
+            Ok(StableDiffusionPlacement::RequesterLocal) if Instant::now() >= deadline => {
+                return Ok(DiscoveredImagePlacement {
+                    placement: planned?,
+                    remote_worker_peer_ids: Vec::new(),
+                    advertisements,
+                });
+            }
+            Err(_) if Instant::now() >= deadline => {
+                return planned.map(|placement| DiscoveredImagePlacement {
+                    placement,
+                    remote_worker_peer_ids: Vec::new(),
+                    advertisements,
+                });
+            }
             _ => sleep(Duration::from_millis(100)).await,
         }
     }
@@ -828,8 +1150,8 @@ async fn run_demo_inference(
     model_id: Option<String>,
 ) -> Result<RunDemoResponse, String> {
     let cache_config = cache_config_for_app(&app);
-    ensure_model_distribution_service(&state, cache_config.clone()).await?;
     ensure_llama_rpc_service(&state, &cache_config).await?;
+    ensure_model_distribution_service(&state, cache_config.clone()).await?;
     let (registry, _, _, _) =
         discover_registry(&app, &state, &cache_config, DEFAULT_DISCOVERY_TIMEOUT_MS).await?;
     let manifest = manifest_for_model(model_id.as_deref(), &cache_config, Some(&registry))
@@ -3016,6 +3338,136 @@ async fn ensure_llama_rpc_service(
         .map_err(|_| "llama.cpp RPC startup coordinator stopped before readiness".to_owned())?
 }
 
+async fn ensure_image_rpc_service(
+    state: &State<'_, UiState>,
+    cache_config: &ShardCacheConfig,
+) -> Result<(), String> {
+    if environment_flag("INFERNET_DISABLE_IMAGE_RPC") || vram_contribution_limit_bytes() == Some(0)
+    {
+        clear_local_image_rpc_endpoint();
+        return Ok(());
+    }
+
+    let (waiter_sender, waiter_receiver) = oneshot::channel();
+    let should_start = {
+        let mut service = state
+            .image_rpc_service
+            .lock()
+            .map_err(|_| "failed to lock Infernet Image RPC service state".to_owned())?;
+        if let ImageRpcServiceState::Running(running) = &mut *service {
+            if running.server.is_running() {
+                return Ok(());
+            }
+            *service = ImageRpcServiceState::Stopped;
+            clear_local_image_rpc_endpoint();
+        }
+        match &mut *service {
+            ImageRpcServiceState::Running(_) => return Ok(()),
+            ImageRpcServiceState::Starting(waiters) => {
+                waiters.push(waiter_sender);
+                false
+            }
+            ImageRpcServiceState::Stopped => {
+                *service = ImageRpcServiceState::Starting(vec![waiter_sender]);
+                true
+            }
+        }
+    };
+
+    if should_start {
+        clear_local_image_rpc_endpoint();
+        let startup = match image_rpc_configuration(cache_config) {
+            Ok((server_config, endpoint)) => tauri::async_runtime::spawn_blocking(move || {
+                let server =
+                    spawn_llama_rpc_server(server_config).map_err(|error| format!("{error:#}"))?;
+                set_local_image_rpc_endpoint(Some(endpoint))?;
+                Ok::<_, String>(AdvertisedImageRpcServer { server })
+            })
+            .await
+            .map_err(|error| format!("Infernet Image RPC startup task failed: {error}"))
+            .and_then(|result| result),
+            Err(error) => Err(error),
+        };
+        let startup_result = startup.as_ref().map(|_| ()).map_err(Clone::clone);
+        let waiters = {
+            let mut service = state
+                .image_rpc_service
+                .lock()
+                .map_err(|_| "failed to lock Infernet Image RPC service state".to_owned())?;
+            let waiters = match std::mem::replace(&mut *service, ImageRpcServiceState::Stopped) {
+                ImageRpcServiceState::Starting(waiters) => waiters,
+                current => {
+                    *service = current;
+                    Vec::new()
+                }
+            };
+            if let Ok(server) = startup {
+                *service = ImageRpcServiceState::Running(server);
+            } else {
+                clear_local_image_rpc_endpoint();
+            }
+            waiters
+        };
+        for waiter in waiters {
+            let _ = waiter.send(startup_result.clone());
+        }
+    }
+
+    waiter_receiver
+        .await
+        .map_err(|_| "Infernet Image RPC startup coordinator stopped before readiness".to_owned())?
+}
+
+fn image_rpc_configuration(
+    cache_config: &ShardCacheConfig,
+) -> Result<(LlamaRpcServerConfig, LlamaRpcEndpoint), String> {
+    let binary = find_image_rpc_server_binary().ok_or_else(|| {
+        "Infernet Image RPC worker was not found; rebuild the pinned image runtime".to_owned()
+    })?;
+    let host = Ipv4Addr::LOCALHOST;
+    let requested_port = configured_image_rpc_port()?;
+    let port = available_rpc_port(
+        host,
+        requested_port,
+        IMAGE_RPC_DEFAULT_PORT,
+        "Infernet Image RPC",
+    )?;
+    let cache_dir = infernet_runtime_dir(cache_config).join("image-rpc");
+    let threads = configured_rpc_threads()?;
+    let device = env::var("INFERNET_IMAGE_RPC_DEVICE")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let backend = rpc_backend_for_device(
+        &detect_node_capabilities().compute_backend,
+        device.as_deref(),
+    )?;
+    let endpoint = LlamaRpcEndpoint {
+        host: host.to_string(),
+        port,
+        rpc_protocol_version: LLAMA_RPC_PROTOCOL_VERSION.to_owned(),
+        runtime_abi: INFERNET_IMAGE_RPC_RUNTIME_ABI.to_owned(),
+        backend: backend.clone(),
+        ready: true,
+        tunnel_protocol: Some(IMAGE_RPC_TUNNEL_PROTOCOL.to_owned()),
+    };
+    Ok((
+        LlamaRpcServerConfig {
+            binary,
+            bind_host: host.to_string(),
+            advertised_host: host.to_string(),
+            port,
+            cache_dir,
+            cache_tensors: false,
+            threads,
+            device,
+            expected_backend: backend,
+            startup_timeout: Duration::from_secs(30),
+        },
+        endpoint,
+    ))
+}
+
 fn llama_rpc_configuration(
     cache_config: &ShardCacheConfig,
 ) -> Result<(LlamaRpcServerConfig, LlamaRpcEndpoint), String> {
@@ -3027,7 +3479,12 @@ fn llama_rpc_configuration(
     // workers reach it through the authenticated libp2p tunnel.
     let host = Ipv4Addr::LOCALHOST;
     let requested_port = configured_rpc_port()?;
-    let port = available_rpc_port(host, requested_port)?;
+    let port = available_rpc_port(
+        host,
+        requested_port,
+        LLAMA_RPC_DEFAULT_PORT,
+        "llama.cpp RPC",
+    )?;
     let cache_dir = infernet_runtime_dir(cache_config).join("llama-rpc");
     let threads = configured_rpc_threads()?;
     let device = env::var("INFERNET_LLAMA_RPC_DEVICE")
@@ -3124,19 +3581,38 @@ fn configured_rpc_port() -> Result<Option<u16>, String> {
     Ok(Some(port))
 }
 
-fn available_rpc_port(host: Ipv4Addr, requested: Option<u16>) -> Result<u16, String> {
-    let preferred = requested.unwrap_or(LLAMA_RPC_DEFAULT_PORT);
+fn configured_image_rpc_port() -> Result<Option<u16>, String> {
+    let Ok(value) = env::var("INFERNET_IMAGE_RPC_PORT") else {
+        return Ok(None);
+    };
+    let port = value
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| "INFERNET_IMAGE_RPC_PORT must be between 1 and 65535".to_owned())?;
+    if port == 0 {
+        return Err("INFERNET_IMAGE_RPC_PORT must be between 1 and 65535".to_owned());
+    }
+    Ok(Some(port))
+}
+
+fn available_rpc_port(
+    host: Ipv4Addr,
+    requested: Option<u16>,
+    default_port: u16,
+    label: &str,
+) -> Result<u16, String> {
+    let preferred = requested.unwrap_or(default_port);
     match TcpListener::bind((host, preferred)) {
         Ok(listener) => {
             drop(listener);
             Ok(preferred)
         }
         Err(error) if requested.is_some() => Err(format!(
-            "configured llama.cpp RPC address {host}:{preferred} is unavailable: {error}"
+            "configured {label} address {host}:{preferred} is unavailable: {error}"
         )),
         Err(_) => {
             let listener = TcpListener::bind((host, 0)).map_err(|error| {
-                format!("could not allocate a private llama.cpp RPC port on {host}: {error}")
+                format!("could not allocate a private {label} port on {host}: {error}")
             })?;
             let port = listener
                 .local_addr()
@@ -3765,13 +4241,16 @@ pub fn run() {
             let cache_config = cache_config_for_app(app.handle());
             tauri::async_runtime::spawn(async move {
                 let state = app_handle.state::<UiState>();
+                if let Err(error) = ensure_image_rpc_service(&state, &cache_config).await {
+                    eprintln!("failed to start Infernet Image RPC service: {error}");
+                }
+                if let Err(error) = ensure_llama_rpc_service(&state, &cache_config).await {
+                    eprintln!("failed to start GGML RPC service: {error}");
+                }
                 if let Err(error) =
                     ensure_model_distribution_service(&state, cache_config.clone()).await
                 {
                     eprintln!("failed to start model distribution service: {error}");
-                }
-                if let Err(error) = ensure_llama_rpc_service(&state, &cache_config).await {
-                    eprintln!("failed to start llama.cpp RPC service: {error}");
                 }
             });
             Ok(())
@@ -3784,7 +4263,11 @@ pub fn run() {
                 if let Ok(mut service) = state.llama_rpc_service.lock() {
                     *service = LlamaRpcServiceState::Stopped;
                 }
+                if let Ok(mut service) = state.image_rpc_service.lock() {
+                    *service = ImageRpcServiceState::Stopped;
+                }
                 clear_local_llama_rpc_endpoint();
+                clear_local_image_rpc_endpoint();
                 set_local_inference_active(false);
                 set_local_rpc_active(false);
             }
@@ -3805,6 +4288,7 @@ pub fn run() {
             get_grid_snapshot,
             get_image_runtime_status,
             install_official_image,
+            list_generated_images,
             generate_image,
             install_official_model,
             run_demo_inference
@@ -3817,6 +4301,16 @@ pub fn run() {
 mod tests {
     use super::*;
     use infernet_protocol::{ImageComponentRole, ModelComponentInfo};
+
+    #[test]
+    fn reads_dimensions_from_a_png_header() {
+        let mut header = Vec::from(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".as_slice());
+        header.extend_from_slice(&1024_u32.to_be_bytes());
+        header.extend_from_slice(&768_u32.to_be_bytes());
+
+        assert_eq!(png_dimensions(&header), Some((1024, 768)));
+        assert_eq!(png_dimensions(b"not a png"), None);
+    }
 
     fn eligible_image_advertisement(peer_id: &str, machine_id: &str) -> NodeAdvertisement {
         const GIB: u64 = 1024 * 1024 * 1024;
@@ -3832,6 +4326,15 @@ mod tests {
         capabilities.max_sessions = 1;
         capabilities.active_sessions = 0;
         capabilities.vram_contribution_limit_bytes = None;
+        capabilities.image_rpc = Some(LlamaRpcEndpoint {
+            host: String::new(),
+            port: 0,
+            rpc_protocol_version: LLAMA_RPC_PROTOCOL_VERSION.to_owned(),
+            runtime_abi: INFERNET_IMAGE_RPC_RUNTIME_ABI.to_owned(),
+            backend: "metal".to_owned(),
+            ready: true,
+            tunnel_protocol: Some(IMAGE_RPC_TUNNEL_PROTOCOL.to_owned()),
+        });
         advertisement.available_vram_bytes = Some(12 * GIB);
         advertisement.model_components = image_runtime::component_infos();
         advertisement
@@ -3875,6 +4378,52 @@ mod tests {
         assert_eq!(
             plan_image_placement(&machines, "requester-machine").unwrap(),
             StableDiffusionPlacement::Distributed { machine_count: 2 }
+        );
+    }
+
+    #[test]
+    fn image_placement_rejects_two_remotes_without_the_requester() {
+        let advertisements = vec![
+            eligible_image_advertisement("remote-a", "remote-machine-a"),
+            eligible_image_advertisement("remote-b", "remote-machine-b"),
+        ];
+        let machines = eligible_image_machine_ids(&advertisements, "requester-peer");
+
+        let error = plan_image_placement(&machines, "requester-machine").unwrap_err();
+        assert!(error.contains("must participate"));
+    }
+
+    #[test]
+    fn image_worker_selection_uses_every_remote_machine_once() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let mut smaller = eligible_image_advertisement("remote-small", "remote-machine-a");
+        smaller
+            .capabilities
+            .as_mut()
+            .unwrap()
+            .available_accelerator_memory_bytes = 6 * GIB;
+        let mut duplicate = eligible_image_advertisement("remote-duplicate", "remote-machine-a");
+        duplicate
+            .capabilities
+            .as_mut()
+            .unwrap()
+            .available_accelerator_memory_bytes = 5 * GIB;
+        let mut larger = eligible_image_advertisement("remote-large", "remote-machine-b");
+        larger
+            .capabilities
+            .as_mut()
+            .unwrap()
+            .available_accelerator_memory_bytes = 10 * GIB;
+        let advertisements = vec![
+            eligible_image_advertisement("requester-peer", "requester-machine"),
+            larger,
+            duplicate,
+            smaller,
+        ];
+
+        assert_eq!(
+            select_image_rpc_workers(&advertisements, "requester-peer", "requester-machine"),
+            vec!["remote-small".to_owned(), "remote-large".to_owned()]
         );
     }
 
