@@ -162,7 +162,7 @@ static std::string format_chat_prompt(const llama_model * model, const std::stri
 
 class InfernetWorker {
 public:
-    static constexpr uint32_t MAX_GENERATED_TOKENS = 512;
+    static constexpr uint32_t MAX_GENERATED_TOKENS = 4096;
 
     InfernetWorker(const std::string & model_path, uint32_t layer_start, uint32_t layer_end,
                    uint32_t hidden_size, uint32_t threads, uint32_t max_context_tokens,

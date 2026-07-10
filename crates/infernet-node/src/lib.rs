@@ -2172,7 +2172,7 @@ pub async fn infer_over_libp2p(
         return Ok(InferenceResult { route, response });
     }
 
-    const MAX_GENERATED_TOKENS: usize = 512;
+    const MAX_GENERATED_TOKENS: usize = 4096;
     let trace_id = response.trace_id;
     let mut output_text = String::new();
     let mut complete_trace = Vec::new();
@@ -2185,7 +2185,7 @@ pub async fn infer_over_libp2p(
         if let Some(piece) = response.output_text.take() {
             output_text.push_str(&piece);
         }
-        if response.generation_complete || generated_tokens >= MAX_GENERATED_TOKENS {
+        if response.generation_complete {
             break;
         }
         let sampled_token_id = response.sampled_token_id.ok_or_else(|| {
@@ -2193,7 +2193,9 @@ pub async fn infer_over_libp2p(
         })?;
         generated_tokens += 1;
         if generated_tokens >= MAX_GENERATED_TOKENS {
-            break;
+            bail!(
+                "Infernet Chat reached the {MAX_GENERATED_TOKENS}-token response limit before completing its answer"
+            );
         }
 
         let mut next_request = ActivationRequest::new(
@@ -2243,35 +2245,22 @@ pub async fn infer_over_libp2p(
 fn sanitize_assistant_output(raw: &str) -> String {
     let mut visible = raw.trim();
 
-    // Prefer an explicit final/content channel when a reasoning-capable chat
-    // template emitted both private analysis and a user-facing answer.
-    for marker in [
+    // Prefer the last explicit user-facing channel when a reasoning-capable
+    // template emitted both private analysis and an answer.
+    if let Some((index, marker)) = [
         "<|channel|>final<|message|>",
         "<|channel>final<channel|>",
         "<|channel>final <channel|>",
         "<|channel|>commentary<|message|>",
-    ] {
-        if let Some(index) = visible.rfind(marker) {
-            visible = &visible[index + marker.len()..];
-            break;
-        }
+    ]
+    .into_iter()
+    .filter_map(|marker| visible.rfind(marker).map(|index| (index, marker)))
+    .max_by_key(|(index, _)| *index)
+    {
+        visible = &visible[index + marker.len()..];
     }
 
-    // Gemma 4's current template prefixes ordinary assistant text with this
-    // channel header. It is model control syntax, not response content.
-    for marker in [
-        "<|channel>thought<channel|>",
-        "<|channel>thought <channel|>",
-        "<|channel|>thought<|channel|>",
-        "<|channel|>thought <|channel|>",
-    ] {
-        if let Some(rest) = visible.strip_prefix(marker) {
-            visible = rest;
-            break;
-        }
-    }
-
-    let mut cleaned = visible.to_owned();
+    let mut cleaned = strip_private_channel_blocks(visible);
     for control in [
         "<|channel>",
         "<channel|>",
@@ -2283,6 +2272,53 @@ fn sanitize_assistant_output(raw: &str) -> String {
         cleaned = cleaned.replace(control, "");
     }
     cleaned.trim().to_owned()
+}
+
+fn strip_private_channel_blocks(raw: &str) -> String {
+    let mut cleaned = String::with_capacity(raw.len());
+    let mut remaining = raw;
+
+    loop {
+        let next_private_channel = ["<|channel>thought", "<|channel>analysis"]
+            .into_iter()
+            .filter_map(|marker| remaining.find(marker).map(|index| (index, marker)))
+            .min_by_key(|(index, _)| *index);
+        let Some((index, marker)) = next_private_channel else {
+            cleaned.push_str(remaining);
+            break;
+        };
+
+        cleaned.push_str(&remaining[..index]);
+        let private_content = &remaining[index + marker.len()..];
+        let Some(end) = private_content.find("<channel|>") else {
+            // A truncated private channel must never become user-visible.
+            break;
+        };
+        remaining = &private_content[end + "<channel|>".len()..];
+    }
+
+    for marker in [
+        "<|channel|>analysis<|message|>",
+        "<|channel|>thought<|message|>",
+    ] {
+        while let Some(start) = cleaned.find(marker) {
+            let private_content = &cleaned[start + marker.len()..];
+            let Some(end) = private_content.find("<|end|>") else {
+                cleaned.truncate(start);
+                break;
+            };
+            cleaned.replace_range(start..start + marker.len() + end + "<|end|>".len(), "");
+        }
+    }
+
+    for marker in [
+        "<|channel|>thought<|channel|>",
+        "<|channel|>thought <|channel|>",
+    ] {
+        cleaned = cleaned.replace(marker, "");
+    }
+
+    cleaned
 }
 
 fn normalize_trusted_rpc_endpoints(endpoints: &[String]) -> Result<Vec<String>> {
@@ -5289,6 +5325,47 @@ mod tests {
             address: String::new(),
             layers: LayerRange::new(start, end).unwrap(),
         }
+    }
+
+    #[test]
+    fn assistant_output_strips_gemma_thought_channels() {
+        assert_eq!(
+            sanitize_assistant_output("<|channel>thought\n<channel|>The visible answer."),
+            "The visible answer."
+        );
+        assert_eq!(
+            sanitize_assistant_output(
+                "<|channel>thought\nprivate reasoning\n<channel|>The visible answer."
+            ),
+            "The visible answer."
+        );
+    }
+
+    #[test]
+    fn assistant_output_drops_truncated_private_channels() {
+        assert_eq!(
+            sanitize_assistant_output("<|channel>thought\nprivate reasoning without a terminator"),
+            ""
+        );
+    }
+
+    #[test]
+    fn assistant_output_prefers_the_last_public_channel() {
+        let output = concat!(
+            "<|channel|>analysis<|message|>private reasoning<|end|>",
+            "<|channel|>commentary<|message|>intermediate text<|end|>",
+            "<|channel|>final<|message|>The complete answer.<|end|>"
+        );
+
+        assert_eq!(sanitize_assistant_output(output), "The complete answer.");
+    }
+
+    #[test]
+    fn assistant_output_preserves_plain_text() {
+        assert_eq!(
+            sanitize_assistant_output("  An ordinary answer.  "),
+            "An ordinary answer."
+        );
     }
 
     #[test]
