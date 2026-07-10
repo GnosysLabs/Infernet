@@ -2561,6 +2561,10 @@ fn refresh_advertisement_model_shards(
                         model_id: manifest.model_id.clone(),
                         layers: manifest.layers,
                         runtime_kind: manifest.runtime_kind.clone(),
+                        resident: persistent_infernet_worker_is_resident(
+                            &manifest.model_id,
+                            manifest.layers,
+                        ),
                         tokenizer: Some(manifest.tokenizer.clone()),
                         metadata: Some(manifest.metadata.clone()),
                         shard_hash: Some(manifest.shard_hash.clone()),
@@ -2720,6 +2724,8 @@ struct PersistentInfernetWorker {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    model_id: String,
+    layers: LayerRange,
 }
 
 static PERSISTENT_INFERNET_WORKERS: OnceLock<Mutex<HashMap<String, PersistentInfernetWorker>>> =
@@ -2729,6 +2735,7 @@ impl PersistentInfernetWorker {
     fn spawn(
         bridge: &Path,
         model_path: &Path,
+        model_id: &str,
         layers: LayerRange,
         hidden_size: usize,
     ) -> Result<Self> {
@@ -2786,6 +2793,8 @@ impl PersistentInfernetWorker {
             child,
             stdin,
             stdout: BufReader::new(stdout),
+            model_id: model_id.to_owned(),
+            layers,
         };
         let ready = worker.read_json_line()?;
         if !ready
@@ -2853,6 +2862,7 @@ fn encode_worker_field(value: &str) -> String {
 fn run_persistent_infernet_worker(
     bridge: &Path,
     model_path: &Path,
+    model_id: &str,
     layers: LayerRange,
     hidden_size: usize,
     command: &str,
@@ -2873,7 +2883,13 @@ fn run_persistent_infernet_worker(
         if !workers.contains_key(&key) {
             workers.insert(
                 key.clone(),
-                PersistentInfernetWorker::spawn(bridge, model_path, layers, hidden_size)?,
+                PersistentInfernetWorker::spawn(
+                    bridge,
+                    model_path,
+                    model_id,
+                    layers,
+                    hidden_size,
+                )?,
             );
         }
         let result = workers
@@ -2893,6 +2909,21 @@ fn run_persistent_infernet_worker(
         }
     }
     unreachable!()
+}
+
+pub fn persistent_infernet_worker_is_resident(model_id: &str, layers: LayerRange) -> bool {
+    let Some(workers) = PERSISTENT_INFERNET_WORKERS.get() else {
+        return false;
+    };
+    workers
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .values_mut()
+        .any(|worker| {
+            worker.model_id == model_id
+                && worker.layers == layers
+                && worker.child.try_wait().is_ok_and(|status| status.is_none())
+        })
 }
 
 fn execute_llama_cpp_shard(
@@ -2980,8 +3011,14 @@ fn execute_llama_cpp_shard(
             encode_worker_field(&output)
         ),
     };
-    let bridge_output =
-        run_persistent_infernet_worker(&bridge, &model_path, layers, config.hidden_size, &command)?;
+    let bridge_output = run_persistent_infernet_worker(
+        &bridge,
+        &model_path,
+        &config.model_id,
+        layers,
+        config.hidden_size,
+        &command,
+    )?;
 
     if !bridge_output.ok {
         bail!(
@@ -4997,6 +5034,17 @@ fn publish_local_advertisement(
     };
 
     refresh_local_advertisement_capabilities(advertisement, local_peer_id);
+    for shard in &mut advertisement.hosted_shards {
+        shard.resident = persistent_infernet_worker_is_resident(&shard.model_id, shard.layers);
+    }
+    if advertisement.hosted_shards.iter().any(|shard| shard.resident) {
+        if let Some(capabilities) = advertisement.capabilities.as_mut() {
+            capabilities.available_accelerator_memory_bytes =
+                capabilities.total_accelerator_memory_bytes;
+            advertisement.available_vram_bytes =
+                Some(capabilities.total_accelerator_memory_bytes);
+        }
+    }
     publish_advertisement(swarm, topic, advertisement)
 }
 
@@ -6138,6 +6186,7 @@ mod tests {
             model_id: manifest.model_id.clone(),
             layers,
             runtime_kind: manifest.runtime_kind.clone(),
+            resident: false,
             tokenizer: Some(manifest.tokenizer.clone()),
             metadata: Some(manifest.metadata.clone()),
             shard_hash: Some(manifest.shard_hash.clone()),

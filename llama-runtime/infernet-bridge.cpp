@@ -1,5 +1,6 @@
 #include "llama.h"
 #include "ggml-backend.h"
+#include "chat.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -12,6 +13,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 static std::string escape_json(const std::string & value) {
@@ -139,6 +141,21 @@ static std::string token_to_piece(const llama_vocab * vocab, llama_token token) 
 }
 
 static std::string format_chat_prompt(const llama_model * model, const std::string & prompt) {
+    try {
+        auto chat_templates = common_chat_templates_init(model, "");
+        common_chat_templates_inputs inputs;
+        common_chat_msg message;
+        message.role = "user";
+        message.content = prompt;
+        inputs.messages.push_back(std::move(message));
+        inputs.add_generation_prompt = true;
+        inputs.use_jinja = true;
+        inputs.enable_thinking = false;
+        return common_chat_templates_apply(chat_templates.get(), inputs).prompt;
+    } catch (const std::exception &) {
+        // Older llama.cpp templates still use the lightweight formatter below.
+    }
+
     const char * chat_template = llama_model_chat_template(model, nullptr);
     if (!chat_template) return prompt;
     const llama_chat_message message = { "user", prompt.c_str() };

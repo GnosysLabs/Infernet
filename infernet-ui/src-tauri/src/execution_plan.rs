@@ -58,7 +58,7 @@ pub fn plan_worker_execution(
     let mut candidates = advertisements
         .iter()
         .filter(|advertisement| hosts_verified_full_model(advertisement, model))
-        .filter_map(|advertisement| candidate(advertisement, bytes_per_layer))
+        .filter_map(|advertisement| candidate(advertisement, model, bytes_per_layer))
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
         right
@@ -87,9 +87,10 @@ pub fn plan_worker_execution(
         ));
     }
 
-    // Every available machine participates. One layer is assigned first, then
+    // Every selected machine participates. One layer is assigned first, then
     // remaining layers are placed on the machine with the most memory per
-    // assigned layer. This keeps boundaries few and respects current capacity.
+    // assigned layer. This intentionally keeps the model split even when one
+    // worker could hold all of it.
     for candidate in &mut candidates {
         candidate.assigned_layers = 1;
     }
@@ -189,7 +190,11 @@ impl WorkerExecutionPlan {
     }
 }
 
-fn candidate(advertisement: &NodeAdvertisement, bytes_per_layer: u64) -> Option<Candidate> {
+fn candidate(
+    advertisement: &NodeAdvertisement,
+    model: &ModelManifest,
+    bytes_per_layer: u64,
+) -> Option<Candidate> {
     let capabilities = advertisement.capabilities.as_ref()?;
     if !worker_is_available(capabilities) {
         return None;
@@ -197,7 +202,15 @@ fn candidate(advertisement: &NodeAdvertisement, bytes_per_layer: u64) -> Option<
     let address = preferred_address(advertisement)?;
     let available_memory_bytes = capabilities.available_accelerator_memory_bytes;
     let usable_memory_bytes = safe_model_memory(available_memory_bytes);
-    let layer_capacity = usable_memory_bytes.checked_div(bytes_per_layer)? as u32;
+    let resident_layer_capacity = advertisement
+        .hosted_shards
+        .iter()
+        .filter(|shard| shard.model_id == model.model_id && shard.resident)
+        .map(|shard| shard.layers.len())
+        .max()
+        .unwrap_or(0);
+    let layer_capacity = (usable_memory_bytes.checked_div(bytes_per_layer)? as u32)
+        .max(resident_layer_capacity);
     if layer_capacity == 0 {
         return None;
     }
@@ -280,7 +293,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn assigns_contiguous_ranges_to_every_ready_local_model_worker() {
+    fn splits_across_every_ready_worker_even_when_one_can_host_the_model() {
         let model = ModelManifest::infernet_chat_v1();
         let mut registry = ShardRegistry::new();
         registry.upsert(advertisement("worker-3090", 24, &model));
@@ -309,6 +322,19 @@ mod tests {
         peer.hosted_shards.clear();
         registry.upsert(peer);
         assert!(plan_worker_execution(&registry, &model).is_err());
+    }
+
+    #[test]
+    fn counts_resident_model_layers_when_physical_free_memory_is_low() {
+        let model = ModelManifest::infernet_chat_v1();
+        let mut registry = ShardRegistry::new();
+        let mut peer = advertisement("resident-worker", 1, &model);
+        peer.hosted_shards[0].resident = true;
+        registry.upsert(peer);
+
+        let plan = plan_worker_execution(&registry, &model).unwrap();
+        assert_eq!(plan.route.len(), 1);
+        assert_eq!(plan.route[0].layers, LayerRange::new(0, model.layer_count).unwrap());
     }
 
     fn advertisement(peer_id: &str, memory_gib: u64, model: &ModelManifest) -> NodeAdvertisement {
@@ -346,6 +372,7 @@ mod tests {
                     end: model.layer_count,
                 },
                 runtime_kind: RuntimeKind::LlamaCpp,
+                resident: false,
                 tokenizer: None,
                 metadata: None,
                 shard_hash: Some("verified".to_owned()),

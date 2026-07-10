@@ -32,7 +32,8 @@ use infernet_node::{
     fetch_model_shard_over_libp2p_with_progress, find_llama_rpc_server_binary,
     import_seed_model_from_file_consuming_verified, infer_over_libp2p, is_executable_shard_record,
     load_or_generate_keypair, local_capability_advertisement, local_node_activity_snapshot,
-    model_serving_telemetry, run_model_distribution_node_with_readiness_and_registry,
+    model_serving_telemetry, persistent_infernet_worker_is_resident,
+    run_model_distribution_node_with_readiness_and_registry,
     seed_manifest_for_network, set_local_inference_active, set_local_llama_rpc_endpoint,
     set_local_rpc_active, sha256_file, spawn_llama_rpc_server, stop_persistent_llama_server,
     stop_persistent_rpc_tunnels,
@@ -583,15 +584,16 @@ async fn run_demo_inference(
     merge_static_peer_advertisements(&mut config.static_peers, registry.advertisements());
     config.set_planned_route(worker_plan.route.clone());
     let hidden_size = manifest.hidden_size;
-    let result = match infer_over_libp2p(
+    let inference_result = infer_over_libp2p(
         config,
         manifest,
         prompt,
         hidden_size,
         Duration::from_millis(DEFAULT_INFERENCE_TIMEOUT_MS),
     )
-    .await
-    {
+    .await;
+    set_local_inference_active(false);
+    let result = match inference_result {
         Ok(result) => result,
         Err(error) => {
             let message = error.to_string();
@@ -710,10 +712,10 @@ async fn discover_registry(
         .lock()
         .map_err(|_| "failed to lock live peer registry".to_owned())?
         .clone();
-    registry.upsert(local_node_advertisement(
-        cache_config,
-        local_peer_id.clone(),
-    ));
+    let mut local_advertisement =
+        local_node_advertisement(cache_config, local_peer_id.clone());
+    local_advertisement.addresses = local_connect_addresses(&local_peer_id);
+    registry.upsert(local_advertisement);
     let fresh_registry = trusted_launch_registry(registry, &local_peer_id);
     // Static bootstrap/manual descriptors are inserted before discovery, so
     // their mere presence is not proof that a machine is online. Only a
@@ -2363,6 +2365,10 @@ fn local_cache_advertisement(
                 model_id: manifest.model_id.clone(),
                 layers: manifest.layers,
                 runtime_kind: manifest.runtime_kind.clone(),
+                resident: persistent_infernet_worker_is_resident(
+                    &manifest.model_id,
+                    manifest.layers,
+                ),
                 tokenizer: Some(manifest.tokenizer.clone()),
                 metadata: Some(manifest.metadata.clone()),
                 shard_hash: Some(manifest.shard_hash.clone()),
@@ -3502,6 +3508,7 @@ mod tests {
             model_id: "gemma".to_owned(),
             layers,
             runtime_kind: RuntimeKind::LlamaCpp,
+            resident: false,
             tokenizer: None,
             metadata: None,
             shard_hash: None,
@@ -3655,6 +3662,7 @@ mod tests {
             model_id: model.model_id.clone(),
             layers,
             runtime_kind: model.runtime_kind.clone(),
+            resident: false,
             tokenizer: Some(seed_manifest.tokenizer.clone()),
             metadata: Some(seed_manifest.metadata.clone()),
             shard_hash: Some(seed_manifest.shard_hash.clone()),

@@ -256,6 +256,8 @@ pub struct ShardDescriptor {
     pub model_id: String,
     pub layers: LayerRange,
     pub runtime_kind: RuntimeKind,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub resident: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokenizer: Option<TokenizerCompatibility>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -266,12 +268,17 @@ pub struct ShardDescriptor {
     pub seed_manifest: Option<Box<SeedShardManifest>>,
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 impl ShardDescriptor {
     pub fn demo(model_id: impl Into<String>, layers: LayerRange) -> Self {
         Self {
             model_id: model_id.into(),
             layers,
             runtime_kind: RuntimeKind::Demo,
+            resident: false,
             tokenizer: None,
             metadata: None,
             shard_hash: None,
@@ -284,6 +291,7 @@ impl ShardDescriptor {
             model_id: manifest.model_id.clone(),
             layers,
             runtime_kind: manifest.runtime_kind.clone(),
+            resident: false,
             tokenizer: None,
             metadata: Some(ShardMetadata {
                 architecture: manifest.architecture.clone(),

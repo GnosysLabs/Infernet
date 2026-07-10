@@ -875,6 +875,7 @@ mod tests {
                 model_id: model_id.to_owned(),
                 layers,
                 runtime_kind: RuntimeKind::Demo,
+                resident: false,
                 tokenizer: None,
                 metadata: None,
                 shard_hash: None,
