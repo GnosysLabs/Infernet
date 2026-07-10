@@ -31,6 +31,7 @@ import type {
   GridSnapshot,
   HopProgress,
   LocalIdentity,
+  MachineView,
   ModelImportProgress,
   ModelView,
   ProgressEvent,
@@ -174,7 +175,7 @@ export default function App() {
   }, [refreshSnapshot, selectedModel]);
 
   useEffect(() => {
-    if (!activityOpen) return;
+    if (!activityOpen && page !== "downloads") return;
     let disposed = false;
     let inFlight = false;
     const refreshActivity = async () => {
@@ -197,7 +198,7 @@ export default function App() {
       disposed = true;
       window.clearInterval(interval);
     };
-  }, [activityOpen, isRunning, selectedModel]);
+  }, [activityOpen, isRunning, page, selectedModel]);
 
   useEffect(() => {
     let disposed = false;
@@ -261,7 +262,15 @@ export default function App() {
       setRoute(nextSnapshot.route);
       setStatus("Ready");
     } catch (error) {
-      setLastError(String(error));
+      const message = String(error);
+      setTransferActivities((current) => upsertTransferActivity(current, {
+        modelId,
+        stage: "Download failed",
+        detail: message,
+        downloadedBytes: 0,
+        totalBytes: null,
+      }));
+      setLastError(message);
       setStatus("Needs attention");
     } finally {
       setInstallingModelId(null);
@@ -556,7 +565,7 @@ function ChatPage({
           {!model ? (
             <div className="empty-chat-card">
               <strong>Get Infernet Chat to start</strong>
-              <span>The official Infernet model is not on this Mac yet.</span>
+              <span>The official Infernet model is not available on the network yet.</span>
               <button className="secondary-button" onClick={onOpenModels}>
                 <Download size={16} />
                 <span>View Infernet Chat</span>
@@ -666,6 +675,9 @@ function ActivitySidebar({
   const computeMs = hops.reduce((total, hop) => total + (hop.timingMs ?? 0), 0);
   const activeTransfers = transferActivities.filter((activity) => activity.status === "active");
   const recentTransfer = transferActivities.find((activity) => activity.status !== "active");
+  const modelHosts = snapshot.machines.filter(
+    (machine) => machine.hostedComponentCount > 0 && machine.connectionStatus !== "unreachable",
+  );
   const location = executionPlan.length > 0
     ? executionConfirmed
       ? `${executionPlan.length} computers completed the last response`
@@ -673,7 +685,7 @@ function ActivitySidebar({
     : peerIds.length === 0
     ? isRunning ? "Choosing a computer" : "Not used yet"
     : ranLocally
-      ? "This Mac"
+      ? "This computer"
       : `${peerIds.length} network computer${peerIds.length === 1 ? "" : "s"}`;
   const currentStatus = lastError ? "Needs attention" : status;
 
@@ -715,6 +727,14 @@ function ActivitySidebar({
               label="Distributed workers ready"
               value={String(snapshot.machines.filter((machine) => machine.rpcReady).length)}
             />
+            <ActivityDataRow
+              label="Model availability"
+              value={modelHosts.length > 0
+                ? `Hosted by ${modelHosts.length} computer${modelHosts.length === 1 ? "" : "s"}`
+                : activeTransfers.length > 0
+                  ? "Downloading on this computer"
+                  : "Not hosted on the network"}
+            />
           </dl>
         </section>
 
@@ -738,35 +758,16 @@ function ActivitySidebar({
           ) : (
             <div className="machine-list">
               {snapshot.machines.map((machine) => (
-                <div className="machine-row" key={machine.peerId}>
-                  <div className="machine-row-main">
-                    <span className={`machine-backend ${machine.computeBackend}`}>
-                      {machineBackendLabel(machine.computeBackend)}
-                    </span>
-                    <div>
-                      <strong>{machine.isLocal ? "This Mac" : machine.deviceName}</strong>
-                      <span>{machine.isLocal ? machine.deviceName : `${machine.logicalCpuCores} CPU cores`}</span>
-                    </div>
-                  </div>
-                  <div className="machine-capacity">
-                    <strong>
-                      {formatBytes(machine.availableMemoryBytes)} free of {formatBytes(machine.totalMemoryBytes)}
-                    </strong>
-                    <span>{machineLoadLabel(machine.activeSessions, machine.maxSessions, machine.queueDepth)}</span>
-                  </div>
-                  <span className="machine-role">
-                    {machineRoleLabel(
-                      machine.peerId,
-                      machine.hostedComponentCount,
-                      machine.rpcReady,
-                      route,
-                      executionPlan,
-                      executionConfirmed,
-                      isRunning,
-                    )}
-                  </span>
-                  {developerMode ? <code>{machine.peerId}</code> : null}
-                </div>
+                <MachineStatusCard
+                  machine={machine}
+                  route={route}
+                  executionPlan={executionPlan}
+                  executionConfirmed={executionConfirmed}
+                  isRunning={isRunning}
+                  localTransfer={machine.isLocal ? activeTransfers[0] : undefined}
+                  developerMode={developerMode}
+                  key={machine.machineId ?? machine.peerId}
+                />
               ))}
             </div>
           )}
@@ -841,6 +842,136 @@ function ActivityDataRow({ label, value }: { label: string; value: string }) {
   );
 }
 
+function MachineStatusCard({
+  machine,
+  route,
+  executionPlan,
+  executionConfirmed,
+  isRunning,
+  localTransfer,
+  developerMode,
+}: {
+  machine: MachineView;
+  route: RouteHopView[];
+  executionPlan: ExecutionParticipantView[];
+  executionConfirmed: boolean;
+  isRunning: boolean;
+  localTransfer?: TransferActivity;
+  developerMode: boolean;
+}) {
+  const reconnecting = machine.connectionStatus === "reconnecting";
+  const unreachable = machine.connectionStatus === "unreachable";
+  const connectionState = unreachable
+    ? { className: "error", label: "Unreachable" }
+    : reconnecting
+      ? { className: "waiting", label: "Reconnecting" }
+      : { className: "connected", label: "Connected" };
+  const serving = machine.activeSessions > 0;
+  const busy = machine.maxSessions > 0 && machine.activeSessions >= machine.maxSessions;
+  const supportedBackend = machine.computeBackend === "cuda" || machine.computeBackend === "metal";
+  const computeState = unreachable
+    ? { className: "error", label: "Compute offline" }
+    : reconnecting
+    ? { className: "waiting", label: "Compute last seen" }
+    : serving
+      ? { className: "serving", label: "Serving a request" }
+      : machine.rpcReady
+        ? { className: "ready", label: "Compute ready" }
+        : busy
+          ? { className: "waiting", label: "Compute busy" }
+          : supportedBackend
+            ? { className: "error", label: "Compute unavailable" }
+            : { className: "muted", label: "No supported GPU" };
+  const modelState = localTransfer
+    ? { className: "waiting", label: "Downloading model" }
+    : unreachable && machine.hostedComponentCount > 0
+      ? { className: "error", label: "Model host offline" }
+    : machine.hostedComponentCount > 0
+      ? { className: "ready", label: "Hosting and sharing" }
+      : { className: "muted", label: "Compute only" };
+  const modelDetail = localTransfer
+    ? "The verified package will be shared after the download finishes."
+    : unreachable && machine.hostedComponentCount > 0
+      ? "This computer last reported the verified package, but it cannot be reached right now."
+    : machine.hostedComponentCount > 0
+      ? "Infernet Chat is verified and available for other computers to download while Infernet stays open."
+      : supportedBackend
+        ? "No full model download needed. This computer receives only its assigned model data in memory during a request."
+        : "This computer can discover the network, but it cannot run a distributed model segment.";
+  const executionRole = machineRoleLabel(
+    machine.peerId,
+    route,
+    executionPlan,
+    executionConfirmed,
+    isRunning,
+  );
+
+  return (
+    <div className="machine-row">
+      <div className="machine-row-main">
+        <span className={`machine-backend ${machine.computeBackend}`}>
+          {machineBackendLabel(machine.computeBackend)}
+        </span>
+        <div>
+          <strong>{machine.isLocal ? "This computer" : machine.deviceName}</strong>
+          <span>{machine.isLocal ? machine.deviceName : `${machine.logicalCpuCores} CPU cores`}</span>
+        </div>
+      </div>
+
+      <div className="machine-state-list" aria-label={`${machine.deviceName} status`}>
+        <span className={`machine-state ${connectionState.className}`}>
+          <i aria-hidden="true" />
+          {connectionState.label}
+        </span>
+        <span className={`machine-state ${computeState.className}`}>
+          <i aria-hidden="true" />
+          {computeState.label}
+        </span>
+        <span className={`machine-state ${modelState.className}`}>
+          <i aria-hidden="true" />
+          {modelState.label}
+        </span>
+      </div>
+
+      <p className="machine-model-detail">{modelDetail}</p>
+
+      {localTransfer ? (
+        <MachineTransferProgress activity={localTransfer} />
+      ) : null}
+
+      <div className="machine-capacity">
+        <strong>
+          {formatBytes(machine.availableMemoryBytes)} free of {formatBytes(machine.totalMemoryBytes)}
+        </strong>
+        <span>{machineLoadLabel(machine.activeSessions, machine.maxSessions, machine.queueDepth)}</span>
+      </div>
+      {executionRole ? <span className="machine-role">{executionRole}</span> : null}
+      {developerMode ? (
+        <code>
+          {machine.peerId} · last seen {machine.lastSeenSeconds}s ago
+        </code>
+      ) : null}
+    </div>
+  );
+}
+
+function MachineTransferProgress({ activity }: { activity: TransferActivity }) {
+  const percent = activity.totalBytes && activity.downloadedBytes > 0
+    ? Math.min(100, Math.round((activity.downloadedBytes / activity.totalBytes) * 100))
+    : null;
+
+  return (
+    <div className="machine-transfer-progress">
+      <ProgressBar progress={percent ?? 0} indeterminate={percent === null} />
+      <small>
+        {percent === null
+          ? humanTransferStage(activity.stage)
+          : `${percent}% · ${formatBytes(activity.downloadedBytes)} of ${formatBytes(activity.totalBytes ?? 0)}`}
+      </small>
+    </div>
+  );
+}
+
 function TransferActivityRow({
   activity,
   modelName,
@@ -850,7 +981,7 @@ function TransferActivityRow({
   modelName: string;
   developerMode: boolean;
 }) {
-  const percent = activity.totalBytes
+  const percent = activity.totalBytes && (activity.downloadedBytes > 0 || activity.status !== "active")
     ? Math.min(100, Math.round((activity.downloadedBytes / activity.totalBytes) * 100))
     : null;
   const stage = humanTransferStage(activity.stage);
@@ -942,7 +1073,7 @@ function ModelsPage({
                   <span>{curatedModelBasis(model)}</span>
                 </div>
                 <div className="library-status">
-                  <span>{installed ? "On this Mac" : "Available"}</span>
+                  <span>{installed ? "Stored on this computer" : "Available"}</span>
                   <ProgressBar progress={installed ? 100 : 0} />
                   <small>{model.runnable ? "Ready to chat" : "Preparing for this network"}</small>
                 </div>
@@ -982,6 +1113,10 @@ function DownloadsPage({
   const activeTransfers = transferActivities.filter((activity) => activity.status === "active");
   const recentTransfers = transferActivities.filter((activity) => activity.status !== "active").slice(0, 8);
   const localModels = groupLocalModels(snapshot);
+  const activeModelTransfer = activeTransfers.find((activity) => isOfficialModelId(activity.modelId));
+  const modelHosts = snapshot.machines.filter(
+    (machine) => machine.hostedComponentCount > 0 && machine.connectionStatus !== "unreachable",
+  );
   const storagePercent = distribution.maxStorageBytes > 0
     ? Math.min(100, Math.round((distribution.storageUsedBytes / distribution.maxStorageBytes) * 100))
     : 0;
@@ -990,7 +1125,7 @@ function DownloadsPage({
     <section className="downloads-screen">
       <div className="section-heading">
         <h2>Storage &amp; sharing</h2>
-        <p>Models stored and shared by this Mac.</p>
+        <p>See exactly which computer stores the model and which ones contribute compute.</p>
       </div>
 
       {activeTransfers.length > 0 ? (
@@ -1015,12 +1150,66 @@ function DownloadsPage({
         </div>
       ) : null}
 
+      <div className="download-panel network-model-panel">
+        <div className="network-model-heading">
+          <div>
+            <span className="section-eyebrow">Network model</span>
+            <strong>Infernet Chat</strong>
+            <p>
+              One computer hosts the verified 14.4 GB package. Compute-only computers do not need
+              the full model on disk.
+            </p>
+          </div>
+          <span className={`network-model-status ${
+            activeModelTransfer ? "downloading" : modelHosts.length > 0 ? "available" : "missing"
+          }`}>
+            <i aria-hidden="true" />
+            {activeModelTransfer
+              ? "Downloading here"
+              : modelHosts.length > 0
+                ? `Available from ${modelHosts.length} computer${modelHosts.length === 1 ? "" : "s"}`
+                : "No model host online"}
+          </span>
+        </div>
+
+        {snapshot.machines.length === 0 ? (
+          <div className="empty-state compact">Waiting for computers to report their status.</div>
+        ) : (
+          <div className="machine-list network-machine-list">
+            {snapshot.machines.map((machine) => (
+              <MachineStatusCard
+                machine={machine}
+                route={[]}
+                executionPlan={[]}
+                executionConfirmed={false}
+                isRunning={false}
+                localTransfer={machine.isLocal ? activeModelTransfer : undefined}
+                developerMode={developerMode}
+                key={machine.machineId ?? machine.peerId}
+              />
+            ))}
+          </div>
+        )}
+
+        {distribution.currentUploads > 0 || distribution.bytesServed > 0 ? (
+          <div className="model-serving-summary">
+            <div className={distribution.currentUploads > 0 ? "serving-pulse active" : "serving-pulse"}>
+              <i aria-hidden="true" />
+              <strong>{distribution.currentUploads > 0 ? "Sharing model now" : "Model sharing ready"}</strong>
+            </div>
+            <span>
+              {formatBytes(distribution.bytesServed)} sent in {distribution.chunksServed.toLocaleString()} verified chunks
+            </span>
+          </div>
+        ) : null}
+      </div>
+
       <div className="storage-overview">
         <div className="storage-overview-heading">
           <div className="storage-icon"><HardDrive size={20} /></div>
           <div>
             <strong>Model storage</strong>
-            <span>{localModels.length} model{localModels.length === 1 ? "" : "s"} on this Mac</span>
+            <span>{localModels.length} model{localModels.length === 1 ? "" : "s"} on this computer</span>
           </div>
           <b>{formatBytes(distribution.storageUsedBytes)}</b>
         </div>
@@ -1035,13 +1224,15 @@ function DownloadsPage({
       <div className="download-panel local-models-panel">
         <div className="download-panel-heading">
           <div>
-            <strong>Models on this Mac</strong>
-            <span>Ready for local use and sharing</span>
+            <strong>Models stored on this computer</strong>
+            <span>Verified packages this computer can share with the network</span>
           </div>
         </div>
         <div className="local-model-list">
           {localModels.length === 0 ? (
-            <div className="empty-state compact">Official models downloaded to this Mac will appear here.</div>
+            <div className="empty-state compact">
+              No model is stored here. That is normal for compute-only computers.
+            </div>
           ) : (
             localModels.map((item) => (
               <div className="local-model-row" key={item.modelId}>
@@ -1061,7 +1252,7 @@ function DownloadsPage({
                 </div>
                 <div className="local-model-meta">
                   <strong>{formatBytes(item.sizeBytes)}</strong>
-                  <span>{item.replicas <= 1 ? "Only on this Mac" : `Available from ${item.replicas} computers`}</span>
+                  <span>{item.replicas <= 1 ? "This computer is the only host" : `Available from ${item.replicas} computers`}</span>
                 </div>
               </div>
             ))
@@ -1377,13 +1568,11 @@ function machineLoadLabel(activeSessions: number, maxSessions: number, queueDept
 
 function machineRoleLabel(
   peerId: string,
-  hostedComponentCount: number,
-  rpcReady: boolean,
   route: RouteHopView[],
   executionPlan: ExecutionParticipantView[],
   executionConfirmed: boolean,
   isRunning: boolean,
-): string {
+): string | null {
   const participant = executionPlan.find((item) => item.peerId === peerId);
   if (participant?.role === "coordinator") {
     return executionConfirmed
@@ -1402,10 +1591,7 @@ function machineRoleLabel(
   if (assignment) {
     return `Assigned layers ${assignment.layerStart + 1}–${assignment.layerEnd}`;
   }
-  if (hostedComponentCount > 0) {
-    return `Stores ${hostedComponentCount} verified model part${hostedComponentCount === 1 ? "" : "s"}`;
-  }
-  return rpcReady ? "Ready for distributed inference" : "Compute service unavailable";
+  return null;
 }
 
 function friendlyActivityError(error: string): string {

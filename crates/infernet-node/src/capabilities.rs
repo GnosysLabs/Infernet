@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "linux")]
 use std::fs;
 
-use infernet_protocol::{LlamaRpcEndpoint, NodeCapabilities};
+use infernet_protocol::{LLAMA_RPC_TUNNEL_PROTOCOL, LlamaRpcEndpoint, NodeCapabilities};
 use sha2::{Digest, Sha256};
 
 const KIBIBYTE: u64 = 1024;
@@ -165,6 +165,12 @@ fn local_llama_rpc_endpoint() -> Option<LlamaRpcEndpoint> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .resolve(configured)
+}
+
+/// Returns the process-local loopback RPC target for the authenticated tunnel.
+/// The host/port are never serialized in node advertisements.
+pub fn local_llama_rpc_target() -> Option<LlamaRpcEndpoint> {
+    local_llama_rpc_endpoint()
 }
 
 /// Returns an advertised llama.cpp RPC endpoint only when its network address,
@@ -349,6 +355,7 @@ fn llama_rpc_endpoint_from_config(
         runtime_abi: runtime_abi.to_owned(),
         backend,
         ready: configured_ready(ready),
+        tunnel_protocol: Some(LLAMA_RPC_TUNNEL_PROTOCOL.to_owned()),
     };
     validate_llama_rpc_endpoint(&endpoint).ok()?;
     Some(endpoint)
@@ -615,6 +622,7 @@ mod tests {
             runtime_abi: "infernet-llama-rpc-v1".to_owned(),
             backend: "cuda".to_owned(),
             ready,
+            tunnel_protocol: Some(LLAMA_RPC_TUNNEL_PROTOCOL.to_owned()),
         }
     }
 
