@@ -37,7 +37,7 @@ use infernet_protocol::{
 use infernet_router::{
     CapacityPlanningConfig, FixedModelComponent, ShardRegistry, plan_fixed_components,
 };
-use libp2p::{Multiaddr, PeerId, identity};
+use libp2p::{Multiaddr, PeerId, identity, multiaddr::Protocol};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -743,6 +743,7 @@ async fn acquire_advertised_model_records(
         );
         let (mut config, _) = discovery_config_from_state(state)?;
         config.static_peers = static_peers.clone();
+        remove_relay_servers_from_download_targets(&mut config);
         // The persistent desktop node already owns the machine's stable
         // relay reservation. A one-shot download using the same PeerId creates
         // a competing reservation and can wait forever for readiness. Give
@@ -862,6 +863,7 @@ fn spawn_background_model_record_acquisition(
     merge_static_peer_advertisements(&mut static_peers, registry.advertisements());
     let (mut config, _) = discovery_config_from_state(state)?;
     config.static_peers = static_peers;
+    remove_relay_servers_from_download_targets(&mut config);
     config.keypair = identity::Keypair::generate_ed25519();
     config.advertisement = None;
 
@@ -2698,6 +2700,21 @@ fn default_relay_peer_addresses() -> Result<Vec<String>, String> {
         .collect())
 }
 
+fn remove_relay_servers_from_download_targets(config: &mut DiscoveryConfig) {
+    let relay_peer_ids = config
+        .relay_peers
+        .iter()
+        .filter_map(|address| address.parse::<Multiaddr>().ok())
+        .filter_map(|address| match address.iter().last() {
+            Some(Protocol::P2p(peer_id)) => Some(peer_id.to_string()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    config
+        .static_peers
+        .retain(|advertisement| !relay_peer_ids.contains(&advertisement.peer_id));
+}
+
 fn peer_address_labels(advertisement: &NodeAdvertisement) -> Vec<String> {
     advertisement
         .addresses
@@ -3571,5 +3588,25 @@ mod tests {
         assert!(selected_mac.is_empty());
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn download_targets_exclude_the_relay_server() {
+        let relay_key = identity::Keypair::generate_ed25519();
+        let relay_peer_id = relay_key.public().to_peer_id();
+        let mut config = DiscoveryConfig::new("infernet/test");
+        config.relay_peers = vec![format!("/ip4/217.77.11.197/tcp/9777/p2p/{relay_peer_id}")];
+        config.static_peers = vec![
+            empty_advertisement(
+                relay_peer_id.to_string(),
+                format!("/ip4/217.77.11.197/udp/9777/quic-v1/p2p/{relay_peer_id}"),
+            ),
+            empty_advertisement("model-seed".to_owned(), "/ip4/10.0.0.2/tcp/9777".to_owned()),
+        ];
+
+        remove_relay_servers_from_download_targets(&mut config);
+
+        assert_eq!(config.static_peers.len(), 1);
+        assert_eq!(config.static_peers[0].peer_id, "model-seed");
     }
 }
