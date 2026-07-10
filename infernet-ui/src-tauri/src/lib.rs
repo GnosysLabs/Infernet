@@ -25,7 +25,7 @@ use infernet_node::{
     clear_local_llama_rpc_endpoint, detect_node_capabilities, empty_advertisement,
     enrich_local_advertisement, fetch_model_shard_over_libp2p_with_progress,
     find_llama_rpc_server_binary, infer_over_libp2p, is_executable_shard_record,
-    local_capability_advertisement, model_serving_telemetry,
+    load_or_generate_keypair, local_capability_advertisement, model_serving_telemetry,
     run_model_distribution_node_with_readiness_and_registry, seed_manifest_for_network,
     set_local_inference_active, set_local_llama_rpc_endpoint, set_local_rpc_active,
     spawn_llama_rpc_server, stop_persistent_llama_server, stop_persistent_rpc_tunnels,
@@ -2882,6 +2882,13 @@ pub fn run() {
         .manage(UiState::default())
         .setup(|app| {
             let app_handle = app.handle().clone();
+            let identity_path = app.path().app_data_dir()?.join("identity.key");
+            let keypair = load_or_generate_keypair(&identity_path)?;
+            *app_handle
+                .state::<UiState>()
+                .keypair
+                .lock()
+                .expect("UI identity lock poisoned during startup") = keypair;
             let cache_config = cache_config_for_app(app.handle());
             monitor_llama_rpc_service(Arc::clone(&app_handle.state::<UiState>().llama_rpc_service));
             tauri::async_runtime::spawn(async move {

@@ -32,7 +32,15 @@ const bridgeSidecarPath = `${bridgeSidecarBase}-${targetTriple}${executableSuffi
 const rpcServerSidecarPath = `${rpcServerSidecarBase}-${targetTriple}${executableSuffix}`;
 const serverSidecarPath = `${serverSidecarBase}-${targetTriple}${executableSuffix}`;
 const runtimeStampPath = resolve(sidecarDir, `.infernet-llama-runtime-${targetTriple}.stamp`);
-const runtimeLockPath = resolve(sidecarDir, `.infernet-llama-runtime-${targetTriple}.lock`);
+// This file is created and removed during every runtime check. Keeping it in
+// src-tauri/binaries makes `tauri dev` rebuild the entire app, which starts
+// another runtime check and creates an endless hot-reload/peer-identity loop.
+const runtimeLockPath = resolve(
+  repoRoot,
+  "target",
+  "llama.cpp-runtime",
+  `.infernet-llama-runtime-${targetTriple}.lock`,
+);
 const runtimePatchVersion = "infernet-pinned-persistent-server-runtime-v8";
 const buildRoot = resolve(repoRoot, "target", "llama.cpp-runtime");
 const sourceDir = join(buildRoot, "llama.cpp");
