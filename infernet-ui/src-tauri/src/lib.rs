@@ -510,6 +510,7 @@ async fn run_demo_inference(
 ) -> Result<RunDemoResponse, String> {
     let cache_config = cache_config_for_app(&app);
     ensure_model_distribution_service(&state, cache_config.clone()).await?;
+    ensure_llama_rpc_service(&state, &cache_config).await?;
     let (registry, _, _, _) =
         discover_registry(&app, &state, &cache_config, DEFAULT_DISCOVERY_TIMEOUT_MS).await?;
     let manifest = manifest_for_model(model_id.as_deref(), &cache_config, Some(&registry))
@@ -3345,8 +3346,13 @@ pub fn run() {
             let cache_config = cache_config_for_app(app.handle());
             tauri::async_runtime::spawn(async move {
                 let state = app_handle.state::<UiState>();
-                if let Err(error) = ensure_model_distribution_service(&state, cache_config).await {
+                if let Err(error) =
+                    ensure_model_distribution_service(&state, cache_config.clone()).await
+                {
                     eprintln!("failed to start model distribution service: {error}");
+                }
+                if let Err(error) = ensure_llama_rpc_service(&state, &cache_config).await {
+                    eprintln!("failed to start llama.cpp RPC service: {error}");
                 }
             });
             Ok(())
