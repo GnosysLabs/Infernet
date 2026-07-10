@@ -744,6 +744,7 @@ async fn acquire_advertised_model_records(
         let (mut config, _) = discovery_config_from_state(state)?;
         config.static_peers = static_peers.clone();
         remove_relay_servers_from_download_targets(&mut config);
+        prefer_tcp_circuit_addresses_for_downloads(&mut config);
         // The persistent desktop node already owns the machine's stable
         // relay reservation. A one-shot download using the same PeerId creates
         // a competing reservation and can wait forever for readiness. Give
@@ -864,6 +865,7 @@ fn spawn_background_model_record_acquisition(
     let (mut config, _) = discovery_config_from_state(state)?;
     config.static_peers = static_peers;
     remove_relay_servers_from_download_targets(&mut config);
+    prefer_tcp_circuit_addresses_for_downloads(&mut config);
     config.keypair = identity::Keypair::generate_ed25519();
     config.advertisement = None;
 
@@ -2715,6 +2717,23 @@ fn remove_relay_servers_from_download_targets(config: &mut DiscoveryConfig) {
         .retain(|advertisement| !relay_peer_ids.contains(&advertisement.peer_id));
 }
 
+fn prefer_tcp_circuit_addresses_for_downloads(config: &mut DiscoveryConfig) {
+    for advertisement in &mut config.static_peers {
+        let mut circuit_addresses = advertisement
+            .addresses
+            .iter()
+            .filter(|address| address.contains("/tcp/") && address.contains("/p2p-circuit/"))
+            .cloned()
+            .collect::<Vec<_>>();
+        if circuit_addresses.is_empty() {
+            continue;
+        }
+        circuit_addresses.sort_by_key(|address| !address.starts_with("/ip4/"));
+        circuit_addresses.dedup();
+        advertisement.addresses = circuit_addresses;
+    }
+}
+
 fn peer_address_labels(advertisement: &NodeAdvertisement) -> Vec<String> {
     advertisement
         .addresses
@@ -3601,12 +3620,29 @@ mod tests {
                 relay_peer_id.to_string(),
                 format!("/ip4/217.77.11.197/udp/9777/quic-v1/p2p/{relay_peer_id}"),
             ),
-            empty_advertisement("model-seed".to_owned(), "/ip4/10.0.0.2/tcp/9777".to_owned()),
+            {
+                let mut seed = empty_advertisement(
+                    "model-seed".to_owned(),
+                    "/ip4/10.0.0.2/tcp/9777".to_owned(),
+                );
+                seed.addresses.push(
+                    "/ip4/217.77.11.197/udp/9777/quic-v1/p2p/relay/p2p-circuit/p2p/model-seed"
+                        .to_owned(),
+                );
+                seed.addresses.push(
+                    "/ip4/217.77.11.197/tcp/9777/p2p/relay/p2p-circuit/p2p/model-seed".to_owned(),
+                );
+                seed
+            },
         ];
 
         remove_relay_servers_from_download_targets(&mut config);
+        prefer_tcp_circuit_addresses_for_downloads(&mut config);
 
         assert_eq!(config.static_peers.len(), 1);
         assert_eq!(config.static_peers[0].peer_id, "model-seed");
+        assert_eq!(config.static_peers[0].addresses.len(), 1);
+        assert!(config.static_peers[0].addresses[0].contains("/tcp/"));
+        assert!(config.static_peers[0].addresses[0].contains("/p2p-circuit/"));
     }
 }
