@@ -143,11 +143,16 @@ static std::string format_chat_prompt(const llama_model * model, const std::stri
     if (!chat_template) return prompt;
     const llama_chat_message message = { "user", prompt.c_str() };
     std::vector<char> formatted(prompt.size() * 4 + 1024);
-    int32_t length = llama_chat_apply_template(chat_template, &message, 1, true, formatted.data(), static_cast<int32_t>(formatted.size()));
+    const char * applied_template = chat_template;
+    int32_t length = llama_chat_apply_template(applied_template, &message, 1, true, formatted.data(), static_cast<int32_t>(formatted.size()));
+    if (length < 0) {
+        applied_template = "gemma";
+        length = llama_chat_apply_template(applied_template, &message, 1, true, formatted.data(), static_cast<int32_t>(formatted.size()));
+    }
     if (length < 0) throw std::runtime_error("failed to apply the model chat template");
     if (static_cast<size_t>(length) > formatted.size()) {
         formatted.resize(static_cast<size_t>(length));
-        length = llama_chat_apply_template(chat_template, &message, 1, true, formatted.data(), static_cast<int32_t>(formatted.size()));
+        length = llama_chat_apply_template(applied_template, &message, 1, true, formatted.data(), static_cast<int32_t>(formatted.size()));
         if (length < 0 || static_cast<size_t>(length) > formatted.size()) {
             throw std::runtime_error("failed to resize the formatted chat prompt");
         }
