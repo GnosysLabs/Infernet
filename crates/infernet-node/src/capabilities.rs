@@ -115,10 +115,18 @@ pub fn detect_node_capabilities() -> NodeCapabilities {
     let available_memory = detect_available_memory(&capabilities);
     capabilities.available_ram_bytes = available_memory.ram_bytes.min(capabilities.total_ram_bytes);
     let contribution_limit = vram_contribution_limit_bytes();
+    // Apple-silicon GPU memory is the host's RAM. Treating every reclaimable
+    // byte as GPU capacity can push macOS itself into severe memory pressure.
+    // Keep at least half of physical RAM outside Infernet's automatic budget.
+    let effective_limit = effective_accelerator_contribution_limit(
+        capabilities.total_ram_bytes,
+        capabilities.unified_memory,
+        contribution_limit,
+    );
     capabilities.available_accelerator_memory_bytes = clamp_available_accelerator_memory(
         capabilities.total_accelerator_memory_bytes,
         available_memory.accelerator_bytes,
-        contribution_limit,
+        effective_limit,
     );
     capabilities.vram_contribution_limit_bytes = contribution_limit;
     capabilities.max_sessions = configured_u32("INFERNET_MAX_SESSIONS")
@@ -164,6 +172,19 @@ fn clamp_available_accelerator_memory(
     contribution_limit_bytes.map_or(physically_available, |limit| {
         physically_available.min(limit)
     })
+}
+
+fn effective_accelerator_contribution_limit(
+    total_ram_bytes: u64,
+    unified_memory: bool,
+    configured_limit: Option<u64>,
+) -> Option<u64> {
+    let safe_automatic_limit = unified_memory.then_some(total_ram_bytes / 2);
+    match (configured_limit, safe_automatic_limit) {
+        (Some(configured), Some(safe)) => Some(configured.min(safe)),
+        (Some(configured), None) => Some(configured),
+        (None, automatic) => automatic,
+    }
 }
 
 pub fn set_local_inference_active(active: bool) {
@@ -872,6 +893,26 @@ mod tests {
         assert_eq!(
             clamp_available_accelerator_memory(24_000, 30_000, Some(28_000)),
             24_000
+        );
+    }
+
+    #[test]
+    fn unified_memory_automatic_limit_keeps_half_of_ram_for_the_host() {
+        assert_eq!(
+            effective_accelerator_contribution_limit(16_000, true, None),
+            Some(8_000),
+        );
+        assert_eq!(
+            effective_accelerator_contribution_limit(16_000, true, Some(12_000)),
+            Some(8_000),
+        );
+        assert_eq!(
+            effective_accelerator_contribution_limit(16_000, true, Some(4_000)),
+            Some(4_000),
+        );
+        assert_eq!(
+            effective_accelerator_contribution_limit(16_000, false, None),
+            None,
         );
     }
 

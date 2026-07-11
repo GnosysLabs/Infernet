@@ -42,7 +42,7 @@ const runtimeLockPath = resolve(
   "llama.cpp-runtime",
   `.infernet-llama-runtime-${targetTriple}.lock`,
 );
-const runtimePatchVersion = "infernet-persistent-local-layer-workers-v14";
+const runtimePatchVersion = "infernet-persistent-local-layer-workers-v15";
 const buildRoot = resolve(repoRoot, "target", "llama.cpp-runtime");
 const downloadDir = join(buildRoot, "downloads");
 const prebuiltDir = join(buildRoot, `prebuilt-${targetTriple}`);
@@ -279,9 +279,13 @@ function buildFromSource() {
   ensureSourceBuildRequirements();
 
   mkdirSync(buildRoot, { recursive: true });
-  if (!existsSync(join(sourceDir, ".git"))) {
-    run("git", ["-c", "core.longpaths=true", "clone", "--depth", "1", "https://github.com/ggml-org/llama.cpp.git", sourceDir]);
-  }
+  // These paths are generated artifacts keyed by the complete patch hash. If
+  // a prior run was interrupted, its checkout may be only partly patched (or
+  // hold a stale Git lock). Recreate both directories instead of layering the
+  // patch over unknown intermediate state.
+  rmSync(sourceDir, { recursive: true, force: true });
+  rmSync(buildDir, { recursive: true, force: true });
+  run("git", ["-c", "core.longpaths=true", "clone", "--depth", "1", "https://github.com/ggml-org/llama.cpp.git", sourceDir]);
   // Recent llama.cpp revisions contain UI paths that exceed Windows' legacy
   // MAX_PATH limit. Keep long-path support local to this generated checkout.
   run("git", ["config", "core.longpaths", "true"], { cwd: sourceDir });
@@ -453,6 +457,21 @@ function validateInfernetSourcePatch() {
   )) {
     fail("patched llama.cpp graph registers sampling inputs on a non-final Infernet shard");
   }
+  const hiddenInputStart = graph.indexOf("ggml_tensor * llm_graph_context::build_inp_hidden() const {");
+  const hiddenInputEnd = graph.indexOf(
+    "ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {",
+    hiddenInputStart,
+  );
+  const hiddenInput = graph.slice(hiddenInputStart, hiddenInputEnd);
+  if (
+    !graph.includes("if (ubatch->token && tokens) {")
+    || !graph.includes("res &= (!params.ubatch.token) || !tokens || tokens->ne[0] == params.ubatch.n_tokens;")
+    || hiddenInputStart < 0
+    || hiddenInputEnd < 0
+    || hiddenInput.includes("inp->tokens")
+  ) {
+    fail("patched llama.cpp graph registers an unused token input on an Infernet continuation shard");
+  }
 }
 
 function copyInfernetBridgeExample() {
@@ -552,6 +571,12 @@ function patchLlamaGraph() {
   const cppPath = join(sourceDir, "src", "llama-graph.cpp");
   let text = readText(cppPath);
   text = replaceOnce(text,
+    "void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {\n    const int64_t n_tokens = ubatch->n_tokens;\n\n    if (ubatch->token) {\n        ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));\n    } else {",
+    "void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {\n    const int64_t n_tokens = ubatch->n_tokens;\n\n    // Infernet continuation graphs carry token IDs for architecture-specific\n    // side inputs, but their hidden-state input object intentionally has no\n    // token tensor. Never write through an absent/unallocated graph input.\n    if (ubatch->token && tokens) {\n        ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));\n    } else if (!ubatch->token) {");
+  text = replaceOnce(text,
+    "bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {\n    bool res = true;\n\n    res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);",
+    "bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {\n    bool res = true;\n\n    res &= (!params.ubatch.token) || !tokens || tokens->ne[0] == params.ubatch.n_tokens;");
+  text = replaceOnce(text,
     "ggml_tensor * llm_graph_context::build_inp_out_ids() const {\n",
     "ggml_tensor * llm_graph_context::build_inp_out_ids() const {\n    // Boundary-only shards return every hidden-state row and never sample.\n    // Do not register an out_ids input that is absent from their graph; the\n    // generic input setter otherwise dereferences an unallocated tensor.\n    if (infernet_is_partial() && !infernet_is_final_shard()) {\n        return nullptr;\n    }\n");
   text = replaceAll(
@@ -562,6 +587,9 @@ function patchLlamaGraph() {
   text = replaceOnce(text,
     "ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {\n",
     "int llm_graph_context::infernet_layer_start() const {\n    return cparams.infernet_partial ? (int) cparams.infernet_layer_start : 0;\n}\n\nint llm_graph_context::infernet_layer_end() const {\n    return cparams.infernet_partial ? std::min((int) cparams.infernet_layer_end, (int) n_layer) : (int) n_layer;\n}\n\nbool llm_graph_context::infernet_is_partial() const {\n    return cparams.infernet_partial;\n}\n\nbool llm_graph_context::infernet_is_final_shard() const {\n    return infernet_layer_end() >= n_layer;\n}\n\nggml_tensor * llm_graph_context::infernet_finish_or_forward(ggml_tensor * cur) const {\n    if (infernet_is_partial() && !infernet_is_final_shard()) {\n        cb(cur, \"infernet_boundary\", -1);\n        res->t_embd = cur;\n        ggml_build_forward_expand(gf, cur);\n        return cur;\n    }\n    return nullptr;\n}\n\nggml_tensor * llm_graph_context::build_inp_hidden() const {\n    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd);\n\n    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);\n    cb(inp->tokens, \"inp_tokens\", -1);\n    ggml_set_input(inp->tokens);\n    res->t_inp_tokens = inp->tokens;\n\n    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, ubatch.n_tokens);\n    cb(inp->embd, \"infernet_inp_hidden\", -1);\n    ggml_set_input(inp->embd);\n    inp->h = inp->embd;\n    res->t_inp_embd = inp->embd;\n\n    res->add_input(std::move(inp));\n    return res->t_inp_embd;\n}\n\nggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {\n");
+  text = replaceOnce(text,
+    "    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);\n    cb(inp->tokens, \"inp_tokens\", -1);\n    ggml_set_input(inp->tokens);\n    res->t_inp_tokens = inp->tokens;\n\n    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, ubatch.n_tokens);",
+    "    // Token IDs, when needed by the architecture, are registered by a\n    // separate build_inp_embd() object. This object owns only the boundary\n    // activation consumed by the continuation shard.\n    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, ubatch.n_tokens);");
   writeFileSync(cppPath, text);
 }
 

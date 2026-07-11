@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 
 const SAFETY_RESERVE_BYTES: u64 = 1024 * 1024 * 1024;
 const RUNTIME_SCRATCH_BYTES: u64 = 768 * 1024 * 1024;
+const UNIFIED_MEMORY_MAX_FRACTION_DENOMINATOR: u64 = 2;
 const MAX_PIPELINE_WORKERS: usize = 8;
 
 #[derive(Debug, Clone, Serialize)]
@@ -310,7 +311,9 @@ fn candidate(
     }
     let machine_id = advertisement_machine_id(advertisement)?.to_owned();
     let address = preferred_address(advertisement)?;
-    let available_memory_bytes = capabilities.available_accelerator_memory_bytes;
+    // Enforce the unified-memory ceiling again at planning time so an older
+    // peer cannot overcommit a host by advertising all reclaimable RAM.
+    let available_memory_bytes = safe_advertised_accelerator_memory(capabilities);
     let usable_memory_bytes = safe_model_memory(available_memory_bytes);
     let resident_layer_capacity = advertisement
         .hosted_shards
@@ -394,6 +397,16 @@ fn safe_model_memory(available_memory_bytes: u64) -> u64 {
         .saturating_sub(safety)
 }
 
+fn safe_advertised_accelerator_memory(capabilities: &NodeCapabilities) -> u64 {
+    if capabilities.unified_memory {
+        capabilities
+            .available_accelerator_memory_bytes
+            .min(capabilities.total_ram_bytes / UNIFIED_MEMORY_MAX_FRACTION_DENOMINATOR)
+    } else {
+        capabilities.available_accelerator_memory_bytes
+    }
+}
+
 fn short_peer_id(peer_id: &str) -> String {
     if peer_id.len() <= 16 {
         return peer_id.to_owned();
@@ -407,6 +420,21 @@ mod tests {
     use infernet_protocol::{NodeAdvertisement, NodeCapabilities, PROTOCOL_VERSION};
 
     use super::*;
+
+    #[test]
+    fn unified_memory_never_advertises_more_than_half_of_host_ram() {
+        let model = ModelManifest::infernet_chat_v1();
+        let mut peer = advertisement("worker-mac", 16, &model);
+        let capabilities = peer.capabilities.as_mut().unwrap();
+        capabilities.unified_memory = true;
+        capabilities.total_ram_bytes = 16 * 1024 * 1024 * 1024;
+        capabilities.available_accelerator_memory_bytes = 14 * 1024 * 1024 * 1024;
+
+        assert_eq!(
+            safe_advertised_accelerator_memory(capabilities),
+            8 * 1024 * 1024 * 1024,
+        );
+    }
 
     #[test]
     fn splits_across_every_ready_worker_even_when_one_can_host_the_model() {
