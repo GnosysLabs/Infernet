@@ -30,8 +30,9 @@ use infernet_node::{
     stop_persistent_llama_server, verify_coarse_location_request,
 };
 use infernet_protocol::{
-    ACTIVATION_PROTOCOL, CoarseLocationAssertion, LLAMA_RPC_TUNNEL_PROTOCOL, LlamaRpcEndpoint,
-    ModelShardInfo, NodeAdvertisement, NodeCapabilities, RouteHop,
+    ACTIVATION_PROTOCOL, CoarseLocationAssertion, INFERNET_CHAT_RUNTIME_ABI,
+    LLAMA_RPC_TUNNEL_PROTOCOL, LlamaRpcEndpoint, ModelShardInfo, NodeAdvertisement,
+    NodeCapabilities, RouteHop,
 };
 use infernet_router::ShardRegistry;
 use serde::Deserialize;
@@ -764,6 +765,7 @@ fn static_peer_capabilities(machine_id: String) -> NodeCapabilities {
         compute_backend: "manual".to_owned(),
         device_name: "Manual peer".to_owned(),
         machine_id: Some(machine_id),
+        chat_runtime_abi: INFERNET_CHAT_RUNTIME_ABI.to_owned(),
         logical_cpu_cores: 0,
         total_ram_bytes: 0,
         available_ram_bytes: 0,

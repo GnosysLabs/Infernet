@@ -48,8 +48,8 @@ use infernet_node::{
     run_model_distribution_node_with_readiness_and_registry, seed_manifest_for_network,
     set_local_coarse_location, set_local_image_rpc_endpoint, set_local_inference_active,
     set_local_llama_rpc_endpoint, set_local_model_components, set_local_rpc_active, sha256_file,
-    spawn_llama_rpc_server, stop_persistent_llama_server, stop_persistent_rpc_tunnels,
-    verify_coarse_location_assertion, vram_contribution_limit_bytes,
+    spawn_llama_rpc_server, stop_persistent_infernet_workers, stop_persistent_llama_server,
+    stop_persistent_rpc_tunnels, verify_coarse_location_assertion, vram_contribution_limit_bytes,
 };
 use infernet_protocol::{
     IMAGE_RPC_TUNNEL_PROTOCOL, LLAMA_RPC_TUNNEL_PROTOCOL, LlamaRpcEndpoint, ModelShardInfo,
@@ -4306,11 +4306,41 @@ fn short_peer_id(peer_id: &str) -> String {
     format!("{}...{}", &peer_id[..8], &peer_id[peer_id.len() - 6..])
 }
 
+fn stop_local_runtime_services(state: &UiState) -> Result<(), String> {
+    stop_persistent_infernet_workers();
+    stop_persistent_llama_server();
+    stop_persistent_rpc_tunnels();
+    *state
+        .llama_rpc_service
+        .lock()
+        .map_err(|_| "failed to lock llama.cpp RPC service while stopping".to_owned())? =
+        LlamaRpcServiceState::Stopped;
+    *state
+        .image_rpc_service
+        .lock()
+        .map_err(|_| "failed to lock image RPC service while stopping".to_owned())? =
+        ImageRpcServiceState::Stopped;
+    clear_local_llama_rpc_endpoint();
+    clear_local_image_rpc_endpoint();
+    set_local_inference_active(false);
+    set_local_rpc_active(false);
+    Ok(())
+}
+
+#[tauri::command]
+fn prepare_for_app_update(state: State<'_, UiState>) -> Result<(), String> {
+    stop_local_runtime_services(&state)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_process::init())
         .manage(UiState::default())
         .setup(|app| {
+            #[cfg(desktop)]
+            app.handle()
+                .plugin(tauri_plugin_updater::Builder::new().build())?;
             let app_handle = app.handle().clone();
             let app_data_dir = app.path().app_data_dir()?;
             let app_settings = AppSettingsStore::open(app_data_dir.join("app-settings-v1.json"))?;
@@ -4386,22 +4416,12 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
-                stop_persistent_llama_server();
-                stop_persistent_rpc_tunnels();
                 let state = window.state::<UiState>();
-                if let Ok(mut service) = state.llama_rpc_service.lock() {
-                    *service = LlamaRpcServiceState::Stopped;
-                }
-                if let Ok(mut service) = state.image_rpc_service.lock() {
-                    *service = ImageRpcServiceState::Stopped;
-                }
-                clear_local_llama_rpc_endpoint();
-                clear_local_image_rpc_endpoint();
-                set_local_inference_active(false);
-                set_local_rpc_active(false);
+                let _ = stop_local_runtime_services(&state);
             }
         })
         .invoke_handler(tauri::generate_handler![
+            prepare_for_app_update,
             get_vram_contribution_settings,
             set_vram_contribution,
             get_local_identity,

@@ -10,7 +10,8 @@ use infernet_model::{
     OfficialModelRelease, RuntimeKind, ShardDescriptor, validate_contiguous_coverage,
 };
 use infernet_protocol::{
-    MIN_DISTRIBUTED_MACHINE_COUNT, NodeAdvertisement, NodeCapabilities, RouteHop,
+    INFERNET_CHAT_RUNTIME_ABI, MIN_DISTRIBUTED_MACHINE_COUNT, NodeAdvertisement, NodeCapabilities,
+    RouteHop,
 };
 use thiserror::Error;
 
@@ -1082,6 +1083,7 @@ pub fn execution_advertisement_is_eligible(
         return false;
     };
     if !matches!(capabilities.compute_backend.as_str(), "cuda" | "metal")
+        || capabilities.chat_runtime_abi != INFERNET_CHAT_RUNTIME_ABI
         || capabilities.available_accelerator_memory_bytes == 0
         || advertisement.addresses.is_empty()
     {
@@ -1321,6 +1323,7 @@ mod tests {
                 compute_backend: compute_backend.to_owned(),
                 device_name: String::new(),
                 machine_id: None,
+                chat_runtime_abi: INFERNET_CHAT_RUNTIME_ABI.to_owned(),
                 logical_cpu_cores: 8,
                 total_ram_bytes: available_memory_bytes.saturating_add(2 * GIB),
                 available_ram_bytes: available_memory_bytes,

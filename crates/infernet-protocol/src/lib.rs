@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub const PROTOCOL_VERSION: u32 = 1;
+/// Persistent split-layer worker ABI. Peers without this exact value are kept
+/// visible for discovery and downloads but are never selected for chat work.
+pub const INFERNET_CHAT_RUNTIME_ABI: &str = "infernet-persistent-layer-worker-v2";
 /// A distributed Infernet job uses at least two physical machines. The only
 /// one-machine exception is execution entirely on the requester's own machine.
 pub const MIN_DISTRIBUTED_MACHINE_COUNT: usize = 2;
@@ -191,6 +194,9 @@ pub struct NodeCapabilities {
     /// avoid counting two app identities/interfaces as two computers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine_id: Option<String>,
+    /// Exact persistent chat worker ABI implemented by this application.
+    #[serde(default)]
+    pub chat_runtime_abi: String,
     pub logical_cpu_cores: u32,
     pub total_ram_bytes: u64,
     pub available_ram_bytes: u64,
@@ -608,6 +614,7 @@ mod tests {
             compute_backend: "cuda".to_owned(),
             device_name: "NVIDIA GeForce RTX 3090".to_owned(),
             machine_id: Some("machine-a".to_owned()),
+            chat_runtime_abi: INFERNET_CHAT_RUNTIME_ABI.to_owned(),
             logical_cpu_cores: 16,
             total_ram_bytes: 64 * 1024 * 1024 * 1024,
             available_ram_bytes: 48 * 1024 * 1024 * 1024,

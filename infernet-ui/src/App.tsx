@@ -63,6 +63,7 @@ import { createChatMessage } from "./chatHistory";
 import type { ChatMessage, ChatThread } from "./chatHistory";
 import { buildConversationPrompt } from "./conversationContext";
 import { usePersistentChatHistory } from "./usePersistentChatHistory";
+import { useAppUpdater, type AppUpdaterState } from "./useAppUpdater";
 
 type PrimaryMode = "chat" | "image";
 type Page = PrimaryMode | "activity" | "network" | "downloads" | "about" | "settings";
@@ -113,6 +114,7 @@ const EMPTY_LOCAL_NODE_ACTIVITY: LocalNodeActivitySnapshot = {
 };
 
 export default function App() {
+  const appUpdater = useAppUpdater();
   const [page, setPage] = useState<Page>("chat");
   const [primaryMode, setPrimaryMode] = useState<PrimaryMode>("chat");
   const {
@@ -726,6 +728,7 @@ export default function App() {
 
   return (
     <div className="app-shell">
+      <UpdateBanner updater={appUpdater} />
       <Sidebar
         threads={chatHistory.threads}
         activeThreadId={chatHistory.activeThreadId}
@@ -811,12 +814,49 @@ export default function App() {
         ) : null}
 
         {page === "settings" ? (
-          <SettingsPage snapshot={snapshot} imageRuntimeStatus={imageRuntimeStatus} />
+          <SettingsPage
+            snapshot={snapshot}
+            imageRuntimeStatus={imageRuntimeStatus}
+            appUpdater={appUpdater}
+          />
         ) : null}
 
         {page === "about" ? <AboutPage /> : null}
       </main>
     </div>
+  );
+}
+
+function UpdateBanner({ updater }: { updater: AppUpdaterState }) {
+  if (updater.phase === "idle") return null;
+
+  return (
+    <aside className={`update-banner ${updater.phase}`} role={updater.phase === "error" ? "alert" : "status"}>
+      <div>
+        <strong>
+          {updater.phase === "error"
+            ? "Infernet couldn’t update"
+            : updater.phase === "installing"
+              ? "Installing update…"
+              : `Infernet ${updater.version ?? "update"} is ready`}
+        </strong>
+        <span>
+          {updater.phase === "error"
+            ? updater.error
+            : updater.phase === "installing"
+              ? "Workers are stopping safely before Infernet restarts."
+              : "The update is signed and will preserve your models, settings, and chats."}
+        </span>
+      </div>
+      {updater.phase === "available" ? (
+        <button type="button" onClick={() => void updater.installAndRestart()}>
+          Install and restart
+        </button>
+      ) : null}
+      {updater.phase === "error" ? (
+        <button type="button" onClick={updater.dismissError}>Dismiss</button>
+      ) : null}
+    </aside>
   );
 }
 
@@ -2674,9 +2714,11 @@ function AboutPage() {
 function SettingsPage({
   snapshot,
   imageRuntimeStatus,
+  appUpdater,
 }: {
   snapshot: GridSnapshot;
   imageRuntimeStatus: ImageRuntimeStatus | null;
+  appUpdater: AppUpdaterState;
 }) {
   const [settings, setSettings] = useState<VramContributionSettings | null>(null);
   const [draftBytes, setDraftBytes] = useState(0);
@@ -2846,6 +2888,24 @@ function SettingsPage({
               {status ?? "Reading graphics memory…"}
             </span>
           )}
+        </div>
+
+        <div className="settings-row update-settings">
+          <div>
+            <strong>Application updates</strong>
+            <span>
+              Infernet checks GitHub Releases automatically and verifies every update signature
+              before installation.
+            </span>
+          </div>
+          <button
+            type="button"
+            className="secondary-button"
+            disabled={appUpdater.phase === "installing"}
+            onClick={() => void appUpdater.checkNow()}
+          >
+            {appUpdater.phase === "installing" ? "Installing…" : "Check for updates"}
+          </button>
         </div>
       </div>
     </section>

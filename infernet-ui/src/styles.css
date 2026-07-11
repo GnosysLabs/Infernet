@@ -194,6 +194,56 @@ button:disabled {
   color: var(--accent);
 }
 
+.update-banner {
+  position: fixed;
+  z-index: 1000;
+  top: 18px;
+  right: 18px;
+  width: min(430px, calc(100vw - 36px));
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: oklch(0.19 0 0 / 0.98);
+  box-shadow: var(--shadow);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 14px 16px;
+}
+
+.update-banner.error {
+  border-color: color-mix(in oklch, var(--danger) 55%, var(--border));
+}
+
+.update-banner div {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.update-banner strong,
+.update-banner span {
+  overflow-wrap: anywhere;
+}
+
+.update-banner span {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.update-banner button {
+  flex: none;
+  min-height: 34px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text);
+  padding: 0 12px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
 .status-pill {
   min-height: 34px;
   border: 1px solid var(--border-soft);
@@ -1107,6 +1157,14 @@ button:disabled {
 .vram-settings {
   max-width: 860px;
   align-items: flex-start;
+}
+
+.update-settings {
+  max-width: 860px;
+}
+
+.update-settings > div {
+  max-width: 560px;
 }
 
 .vram-settings-copy {

@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 use std::fs;
 
 use infernet_protocol::{
-    LLAMA_RPC_TUNNEL_PROTOCOL, LlamaRpcEndpoint, ModelComponentInfo, NodeCapabilities,
+    INFERNET_CHAT_RUNTIME_ABI, LLAMA_RPC_TUNNEL_PROTOCOL, LlamaRpcEndpoint, ModelComponentInfo,
+    NodeCapabilities,
 };
 use sha2::{Digest, Sha256};
 
@@ -341,6 +342,7 @@ fn detect_static_hardware() -> NodeCapabilities {
         compute_backend: "cpu".to_owned(),
         device_name: cpu_name,
         machine_id: detect_machine_id(),
+        chat_runtime_abi: INFERNET_CHAT_RUNTIME_ABI.to_owned(),
         logical_cpu_cores,
         total_ram_bytes: memory.total_bytes,
         available_ram_bytes: memory.available_bytes,

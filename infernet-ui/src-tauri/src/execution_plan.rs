@@ -1,6 +1,8 @@
 use infernet_model::{
     INFERNET_CHAT_KV_CACHE_BYTES_PER_LAYER, LayerRange, ModelManifest, OfficialModelRelease,
 };
+#[cfg(test)]
+use infernet_protocol::INFERNET_CHAT_RUNTIME_ABI;
 use infernet_protocol::{
     MIN_DISTRIBUTED_MACHINE_COUNT, NodeAdvertisement, NodeCapabilities, RouteHop,
 };
@@ -469,6 +471,18 @@ mod tests {
     }
 
     #[test]
+    fn ignores_workers_with_an_incompatible_chat_runtime() {
+        let model = ModelManifest::infernet_chat_v1();
+        let mut registry = ShardRegistry::new();
+        let mut stale = advertisement("stale-worker", 24, &model);
+        stale.capabilities.as_mut().unwrap().chat_runtime_abi =
+            "infernet-persistent-layer-worker-v1".to_owned();
+        registry.upsert(stale);
+
+        assert!(plan_worker_execution(&registry, &model, "stale-worker").is_err());
+    }
+
+    #[test]
     fn allows_the_requesters_own_machine_when_it_is_the_only_candidate() {
         let model = ModelManifest::infernet_chat_v1();
         let mut registry = ShardRegistry::new();
@@ -596,6 +610,7 @@ mod tests {
                 compute_backend: "cuda".to_owned(),
                 device_name: "GPU".to_owned(),
                 machine_id: Some(format!("machine-{peer_id}")),
+                chat_runtime_abi: INFERNET_CHAT_RUNTIME_ABI.to_owned(),
                 logical_cpu_cores: 16,
                 total_ram_bytes: memory,
                 available_ram_bytes: memory,
