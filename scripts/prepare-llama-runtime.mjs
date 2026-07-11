@@ -15,7 +15,8 @@ import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 
-const scriptDir = dirname(fileURLToPath(import.meta.url));
+const scriptPath = fileURLToPath(import.meta.url);
+const scriptDir = dirname(scriptPath);
 const repoRoot = resolve(scriptDir, "..");
 const quiet = process.argv.includes("--quiet");
 const targetTriple = process.env.TARGET || rustTargetTriple();
@@ -41,9 +42,8 @@ const runtimeLockPath = resolve(
   "llama.cpp-runtime",
   `.infernet-llama-runtime-${targetTriple}.lock`,
 );
-const runtimePatchVersion = "infernet-persistent-local-layer-workers-v12";
+const runtimePatchVersion = "infernet-persistent-local-layer-workers-v13";
 const buildRoot = resolve(repoRoot, "target", "llama.cpp-runtime");
-const sourceDir = join(buildRoot, "llama.cpp");
 const downloadDir = join(buildRoot, "downloads");
 const prebuiltDir = join(buildRoot, `prebuilt-${targetTriple}`);
 const llamaRef = process.env.LLAMA_CPP_REF || "049326a00025d00b08cc188ed716b681e984a3f8";
@@ -60,9 +60,21 @@ const bridgeSourceHash = createHash("sha256")
   .update(readFileSync(resolve(repoRoot, "llama-runtime", "infernet-bridge.cpp")))
   .digest("hex")
   .slice(0, 16);
+const patchScriptHash = createHash("sha256")
+  .update(readFileSync(scriptPath))
+  .digest("hex")
+  .slice(0, 16);
+// Patched llama.cpp checkouts are build artifacts, not source-of-truth. Give
+// every patch-generator revision a pristine checkout and CMake directory so a
+// stale edit from an older patch can never survive a rebuild.
+const runtimeSourceKey = `${runtimePatchVersion}-${patchScriptHash}`;
+const sourceDir = join(buildRoot, `llama.cpp-${runtimeSourceKey}`);
 const runtimeBackend = cudaEnabled ? `cuda-${cudaArchitectures}` : isMacos ? "metal" : "cpu";
-const buildDir = join(buildRoot, `build-${targetTriple}-${runtimeBackend.replaceAll(";", "-")}`);
-const runtimeStamp = `${runtimePatchVersion}:${llamaRef}:${runtimeBackend}:${bridgeSourceHash}`;
+const buildDir = join(
+  buildRoot,
+  `build-${targetTriple}-${runtimeBackend.replaceAll(";", "-")}-${runtimeSourceKey}`,
+);
+const runtimeStamp = `${runtimePatchVersion}:${patchScriptHash}:${llamaRef}:${runtimeBackend}:${bridgeSourceHash}`;
 
 if (process.argv.includes("--dry-run")) {
   printBuildPlan();
@@ -269,6 +281,7 @@ function buildFromSource() {
   run("git", ["fetch", "--depth", "1", "origin", llamaRef], { cwd: sourceDir, optional: true });
   run("git", ["checkout", llamaRef], { cwd: sourceDir });
   prepareInfernetBridgeSource();
+  validateInfernetSourcePatch();
 
   const cmakeArgs = [
     ...(windowsCudaGenerator ? ["-G", windowsCudaGenerator] : []),
@@ -402,6 +415,29 @@ function prepareInfernetBridgeSource() {
   patchLlamaGraph();
   patchModelLoader();
   patchDecoderGraphs();
+}
+
+function validateInfernetSourcePatch() {
+  const contextPath = join(sourceDir, "src", "llama-context.cpp");
+  const context = readText(contextPath);
+  const assignment = [
+    "    cparams.infernet_partial = params.infernet_partial;",
+    "    cparams.infernet_layer_start = params.infernet_layer_start;",
+    "    cparams.infernet_layer_end = params.infernet_layer_end;",
+  ].join("\n");
+  const assignmentIndex = context.indexOf(assignment);
+  const offloadIndex = context.indexOf("    cparams.offload_kqv", assignmentIndex);
+  if (assignmentIndex < 0 || offloadIndex < 0) {
+    fail("patched llama.cpp context does not preserve the requested Infernet layer range");
+  }
+  const constructorWindow = context.slice(assignmentIndex, offloadIndex);
+  if (
+    constructorWindow.includes("cparams.infernet_partial = false")
+    || constructorWindow.includes("cparams.infernet_layer_start = 0")
+    || constructorWindow.includes("cparams.infernet_layer_end = UINT32_MAX")
+  ) {
+    fail("patched llama.cpp context resets Infernet partial mode during construction");
+  }
 }
 
 function copyInfernetBridgeExample() {

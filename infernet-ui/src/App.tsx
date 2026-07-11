@@ -19,6 +19,7 @@ import {
   Download,
   Globe,
   HardDrive,
+  CircleHelp,
   Image as ImageIcon,
   Laptop2,
   Layers3,
@@ -64,7 +65,7 @@ import { buildConversationPrompt } from "./conversationContext";
 import { usePersistentChatHistory } from "./usePersistentChatHistory";
 
 type PrimaryMode = "chat" | "image";
-type Page = PrimaryMode | "activity" | "network" | "downloads" | "settings";
+type Page = PrimaryMode | "activity" | "network" | "downloads" | "about" | "settings";
 type TransferStatus = "active" | "complete" | "error";
 type TransferActivity = ModelImportProgress & {
   id: string;
@@ -812,6 +813,8 @@ export default function App() {
         {page === "settings" ? (
           <SettingsPage snapshot={snapshot} imageRuntimeStatus={imageRuntimeStatus} />
         ) : null}
+
+        {page === "about" ? <AboutPage /> : null}
       </main>
     </div>
   );
@@ -1283,6 +1286,12 @@ function AppHeader({
           <Activity size={16} />
           {hasActiveWork ? <i aria-hidden="true" /> : null}
         </button>
+        <HeaderIconButton
+          icon={<CircleHelp size={17} />}
+          label="Help"
+          active={page === "about"}
+          onClick={() => onNavigate("about")}
+        />
         <HeaderIconButton
           icon={<Settings size={17} />}
           label="Settings"
@@ -2561,6 +2570,107 @@ function DownloadsPage({
   );
 }
 
+function AboutPage() {
+  return (
+    <section className="about-screen">
+      <div className="about-document">
+        <header className="about-intro">
+          <span>About Infernet</span>
+          <h2>AI powered by computers that choose to work together.</h2>
+          <p>
+            Infernet is a local-first AI app connected to a shared compute network. It keeps the
+            familiar experience of chatting or creating an image while handling model setup,
+            machine discovery, and work distribution in the background.
+          </p>
+        </header>
+
+        <section className="about-section" aria-labelledby="about-request-title">
+          <span className="about-kicker">A request from start to finish</span>
+          <h3 id="about-request-title">How it works</h3>
+          <ol className="about-flow">
+            <li>
+              <b>1</b>
+              <div><strong>You make a request</strong><p>Enter a message or describe an image, just as you would in any AI app.</p></div>
+            </li>
+            <li>
+              <b>2</b>
+              <div><strong>Infernet finds eligible computers</strong><p>It checks which visible machines have the verified model, a compatible runtime, contributed memory, and room for another session.</p></div>
+            </li>
+            <li>
+              <b>3</b>
+              <div><strong>The work is planned</strong><p>When multiple eligible physical machines are available, Infernet divides the request across them. Multiple app processes on one computer still count as one machine.</p></div>
+            </li>
+            <li>
+              <b>4</b>
+              <div><strong>The result returns here</strong><p>The participating machines process their assigned work and the completed response appears in your conversation or Creations list.</p></div>
+            </li>
+          </ol>
+        </section>
+
+        <section className="about-section" aria-labelledby="about-placement-title">
+          <span className="about-kicker">Distribution rules</span>
+          <h3 id="about-placement-title">How Infernet chooses machines</h3>
+          <div className="about-prose">
+            <p>Physical computers, not peer IDs or app processes, are the unit of placement.</p>
+            <ul>
+              <li>If two or more eligible computers are available, the request is split across them.</li>
+              <li>If your computer and a remote computer are both eligible, both participate.</li>
+              <li>A request may run on only your computer when it is the sole eligible option.</li>
+              <li>Infernet never runs an entire request on one remote computer or silently falls back to one after a distributed plan fails.</li>
+            </ul>
+          </div>
+        </section>
+
+        <section className="about-section" aria-labelledby="about-network-title">
+          <span className="about-kicker">Connection and privacy</span>
+          <h3 id="about-network-title">What the relay does</h3>
+          <div className="about-prose">
+            <p>
+              The public relay helps computers find and reach one another when private networks or
+              routers prevent a direct connection. It forwards encrypted peer-to-peer traffic, but
+              it does not advertise itself as compute and does not perform inference.
+            </p>
+            <p>
+              For the globe, each node asks the relay for its own approximate region. The relay
+              returns short-lived signed coordinates rounded to a broad area. Other nodes receive
+              that coarse result, never the underlying public IP address.
+            </p>
+          </div>
+        </section>
+
+        <section className="about-section" aria-labelledby="about-models-title">
+          <span className="about-kicker">Models and contribution</span>
+          <h3 id="about-models-title">What lives on your computer</h3>
+          <div className="about-prose">
+            <p>
+              Infernet uses curated, versioned model packages. Packages are downloaded, checked
+              against pinned release information, and stored locally. A machine advertises a model
+              only after the required package is present and verified.
+            </p>
+            <p>
+              Your contribution setting controls how much GPU VRAM or Apple unified memory this
+              computer offers to the network. Turning contribution off removes it from compute
+              eligibility. Generated images remain stored on this computer and reappear in
+              Creations after restarting the app.
+            </p>
+          </div>
+        </section>
+
+        <section className="about-section about-faq" aria-labelledby="about-faq-title">
+          <span className="about-kicker">Useful distinctions</span>
+          <h3 id="about-faq-title">A few things to know</h3>
+          <dl>
+            <div><dt>Does every visible computer run every request?</dt><dd>No. It must be online, compatible, verified, contributing capacity, and available for the requested model.</dd></div>
+            <div><dt>Is the relay another compute node?</dt><dd>No. It provides discovery, relayed connections, and signed approximate regions only.</dd></div>
+            <div><dt>What does “allocated” memory mean?</dt><dd>It is the contribution ceiling a computer has committed to Infernet, not the amount that happens to be free at that moment.</dd></div>
+            <div><dt>Where can I see what is happening?</dt><dd>Activity shows work on this computer. Network shows visible physical machines and shared capacity. Downloads shows model storage and transfers.</dd></div>
+          </dl>
+        </section>
+      </div>
+    </section>
+  );
+}
+
 function SettingsPage({
   snapshot,
   imageRuntimeStatus,
@@ -2855,6 +2965,7 @@ function pageTitle(page: Page, chatTitle = "Chat"): string {
   if (page === "activity") return "Activity";
   if (page === "network") return "Network";
   if (page === "downloads") return "Downloads";
+  if (page === "about") return "Help";
   return "Settings";
 }
 
