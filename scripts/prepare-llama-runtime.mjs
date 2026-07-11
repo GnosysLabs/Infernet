@@ -67,7 +67,12 @@ const patchScriptHash = createHash("sha256")
 // Patched llama.cpp checkouts are build artifacts, not source-of-truth. Give
 // every patch-generator revision a pristine checkout and CMake directory so a
 // stale edit from an older patch can never survive a rebuild.
-const runtimeSourceKey = `${runtimePatchVersion}-${patchScriptHash}`;
+// MSBuild's file tracker still fails on deeply nested paths even when Git and
+// Windows long-path support are enabled. The hash already identifies the full
+// patch script, so omit the descriptive prefix from Windows cache paths.
+const runtimeSourceKey = isWindows
+  ? patchScriptHash
+  : `${runtimePatchVersion}-${patchScriptHash}`;
 const sourceDir = join(buildRoot, `llama.cpp-${runtimeSourceKey}`);
 const runtimeBackend = cudaEnabled ? `cuda-${cudaArchitectures}` : isMacos ? "metal" : "cpu";
 const buildDir = join(
@@ -275,8 +280,11 @@ function buildFromSource() {
 
   mkdirSync(buildRoot, { recursive: true });
   if (!existsSync(join(sourceDir, ".git"))) {
-    run("git", ["clone", "--depth", "1", "https://github.com/ggml-org/llama.cpp.git", sourceDir]);
+    run("git", ["-c", "core.longpaths=true", "clone", "--depth", "1", "https://github.com/ggml-org/llama.cpp.git", sourceDir]);
   }
+  // Recent llama.cpp revisions contain UI paths that exceed Windows' legacy
+  // MAX_PATH limit. Keep long-path support local to this generated checkout.
+  run("git", ["config", "core.longpaths", "true"], { cwd: sourceDir });
 
   run("git", ["fetch", "--depth", "1", "origin", llamaRef], { cwd: sourceDir, optional: true });
   run("git", ["checkout", llamaRef], { cwd: sourceDir });
