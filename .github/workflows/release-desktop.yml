@@ -7,6 +7,7 @@ on:
       - "app-v*"
 
 permissions:
+  actions: write
   contents: write
 
 concurrency:
@@ -110,3 +111,34 @@ jobs:
           releaseDraft: false
           prerelease: false
           args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+
+  cleanup:
+    name: Remove previous desktop releases and builds
+    needs: release
+    if: success()
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Keep only the latest desktop release and workflow run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          current_tag="app-v$(jq -r '.version' infernet-ui/src-tauri/tauri.conf.json)"
+
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq '.[] | select(.tag_name | startswith("app-v")) | .tag_name' |
+          while read -r tag; do
+            if [[ -n "$tag" && "$tag" != "$current_tag" ]]; then
+              gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes
+            fi
+          done
+
+          gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/release-desktop.yml/runs?status=completed&per_page=100" \
+            --jq '.workflow_runs[].id' |
+          while read -r run_id; do
+            gh api --method DELETE "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}"
+          done

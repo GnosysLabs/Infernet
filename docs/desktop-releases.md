@@ -37,6 +37,11 @@ The in-app updater checks:
 
 The release must be published—not left as a draft—for installed apps to discover it.
 
+After both installers publish successfully, the workflow deletes older `app-v*`
+GitHub Releases and older completed desktop-release workflow runs. Git tags are
+preserved as lightweight version history. This keeps only the latest installers,
+signatures, updater manifest, and build logs consuming GitHub storage.
+
 ## Local macOS release check
 
 The certificate and `AC_NOTARY` profile are already configured on this Mac. Tauri itself expects Apple ID notarization variables when it performs the full build, while `xcrun notarytool` can continue using `AC_NOTARY` for manual verification.
