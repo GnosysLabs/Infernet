@@ -42,7 +42,7 @@ const runtimeLockPath = resolve(
   "llama.cpp-runtime",
   `.infernet-llama-runtime-${targetTriple}.lock`,
 );
-const runtimePatchVersion = "infernet-persistent-local-layer-workers-v13";
+const runtimePatchVersion = "infernet-persistent-local-layer-workers-v14";
 const buildRoot = resolve(repoRoot, "target", "llama.cpp-runtime");
 const downloadDir = join(buildRoot, "downloads");
 const prebuiltDir = join(buildRoot, `prebuilt-${targetTriple}`);
@@ -438,6 +438,13 @@ function validateInfernetSourcePatch() {
   ) {
     fail("patched llama.cpp context resets Infernet partial mode during construction");
   }
+
+  const graph = readText(join(sourceDir, "src", "llama-graph.cpp"));
+  if (!graph.includes(
+    "if (infernet_is_partial() && !infernet_is_final_shard()) {\n        return nullptr;\n    }",
+  )) {
+    fail("patched llama.cpp graph registers sampling inputs on a non-final Infernet shard");
+  }
 }
 
 function copyInfernetBridgeExample() {
@@ -536,6 +543,9 @@ function patchLlamaGraph() {
 
   const cppPath = join(sourceDir, "src", "llama-graph.cpp");
   let text = readText(cppPath);
+  text = replaceOnce(text,
+    "ggml_tensor * llm_graph_context::build_inp_out_ids() const {\n",
+    "ggml_tensor * llm_graph_context::build_inp_out_ids() const {\n    // Boundary-only shards return every hidden-state row and never sample.\n    // Do not register an out_ids input that is absent from their graph; the\n    // generic input setter otherwise dereferences an unallocated tensor.\n    if (infernet_is_partial() && !infernet_is_final_shard()) {\n        return nullptr;\n    }\n");
   text = replaceAll(
     text,
     "std::min((int) cparams.infernet_layer_end, n_layer) : n_layer",
