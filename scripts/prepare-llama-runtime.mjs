@@ -97,6 +97,7 @@ function withRuntimeLock(task) {
 }
 
 function acquireRuntimeLock() {
+  mkdirSync(dirname(runtimeLockPath), { recursive: true });
   const waitBuffer = new Int32Array(new SharedArrayBuffer(4));
   while (true) {
     try {
