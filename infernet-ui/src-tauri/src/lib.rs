@@ -40,15 +40,16 @@ use infernet_node::{
     PAYLOAD_KIND_FULL_MODEL, PAYLOAD_KIND_GGUF_SHARD, PAYLOAD_KIND_INFERNET_SHARD, ShardCache,
     ShardCacheConfig, begin_local_node_activity, clear_local_image_rpc_endpoint,
     clear_local_llama_rpc_endpoint, detect_node_capabilities, empty_advertisement,
-    enrich_local_advertisement, fetch_model_shard_over_libp2p_with_progress,
-    find_llama_rpc_server_binary, generate_image_over_libp2p,
-    import_seed_model_from_file_consuming_verified, infer_over_libp2p, is_executable_shard_record,
-    load_or_generate_keypair, local_capability_advertisement, local_node_activity_snapshot,
-    model_serving_telemetry, persistent_infernet_worker_is_resident,
+    enrich_local_advertisement, fetch_coarse_location_assertion,
+    fetch_model_shard_over_libp2p_with_progress, find_llama_rpc_server_binary,
+    generate_image_over_libp2p, import_seed_model_from_file_consuming_verified, infer_over_libp2p,
+    is_executable_shard_record, load_or_generate_keypair, local_capability_advertisement,
+    local_node_activity_snapshot, model_serving_telemetry, persistent_infernet_worker_is_resident,
     run_model_distribution_node_with_readiness_and_registry, seed_manifest_for_network,
-    set_local_image_rpc_endpoint, set_local_inference_active, set_local_llama_rpc_endpoint,
-    set_local_model_components, set_local_rpc_active, sha256_file, spawn_llama_rpc_server,
-    stop_persistent_llama_server, stop_persistent_rpc_tunnels, vram_contribution_limit_bytes,
+    set_local_coarse_location, set_local_image_rpc_endpoint, set_local_inference_active,
+    set_local_llama_rpc_endpoint, set_local_model_components, set_local_rpc_active, sha256_file,
+    spawn_llama_rpc_server, stop_persistent_llama_server, stop_persistent_rpc_tunnels,
+    verify_coarse_location_assertion, vram_contribution_limit_bytes,
 };
 use infernet_protocol::{
     IMAGE_RPC_TUNNEL_PROTOCOL, LLAMA_RPC_TUNNEL_PROTOCOL, LlamaRpcEndpoint, ModelShardInfo,
@@ -81,6 +82,9 @@ const DEFAULT_BOOTSTRAP_PEERS: &[&str] = &[
     "12D3KooWRJrnpHPQTWdThpDGZMwRCHhEBL4JCAxFMwYMfFavxa2h@/ip4/217.77.11.197/tcp/9777/p2p/12D3KooWRJrnpHPQTWdThpDGZMwRCHhEBL4JCAxFMwYMfFavxa2h",
     "12D3KooWRJrnpHPQTWdThpDGZMwRCHhEBL4JCAxFMwYMfFavxa2h@/dns4/infernet.gnosyslabs.xyz/tcp/9777/p2p/12D3KooWRJrnpHPQTWdThpDGZMwRCHhEBL4JCAxFMwYMfFavxa2h",
 ];
+const DEFAULT_RELAY_PEER_ID: &str = "12D3KooWRJrnpHPQTWdThpDGZMwRCHhEBL4JCAxFMwYMfFavxa2h";
+const COARSE_LOCATION_ENDPOINT: &str =
+    "https://infernet.gnosyslabs.xyz/.well-known/infernet/coarse-location";
 
 enum ModelDistributionServiceState {
     Stopped,
@@ -242,6 +246,7 @@ struct MachineView {
     logical_cpu_cores: u32,
     total_memory_bytes: u64,
     available_memory_bytes: u64,
+    allocated_memory_bytes: u64,
     unified_memory: bool,
     max_sessions: u32,
     active_sessions: u32,
@@ -250,6 +255,15 @@ struct MachineView {
     measured_decode_tokens_per_second: Option<f32>,
     hosted_component_count: usize,
     rpc_ready: bool,
+    coarse_location: Option<CoarseLocationView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CoarseLocationView {
+    latitude: f64,
+    longitude: f64,
+    label: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2773,6 +2787,14 @@ fn machine_views_from_presence(
                     capabilities.available_ram_bytes,
                 )
             };
+            let allocated_memory_bytes = if use_accelerator_memory {
+                capabilities
+                    .vram_contribution_limit_bytes
+                    .unwrap_or(capabilities.total_accelerator_memory_bytes)
+                    .min(capabilities.total_accelerator_memory_bytes)
+            } else {
+                0
+            };
             let hosted_components = aliases
                 .iter()
                 .flat_map(|alias| {
@@ -2798,6 +2820,33 @@ fn machine_views_from_presence(
                     && worker_is_usable(capabilities)
                     && capabilities.active_sessions < capabilities.max_sessions
             });
+            let coarse_location = aliases.iter().find_map(|alias| {
+                let assertion = alias.advertisement.coarse_location.as_ref()?;
+                let trusted_relays = vec![DEFAULT_RELAY_PEER_ID.to_owned()];
+                verify_coarse_location_assertion(
+                    assertion,
+                    &alias.advertisement.peer_id,
+                    &trusted_relays,
+                    current_unix_ms_u64(),
+                )
+                .ok()?;
+                let label = [assertion.region.trim(), assertion.country.trim()]
+                    .into_iter()
+                    .filter(|part| !part.is_empty())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Some(CoarseLocationView {
+                    latitude: assertion.latitude_e4 as f64 / 10_000.0,
+                    longitude: assertion.longitude_e4 as f64 / 10_000.0,
+                    label: if label.is_empty() {
+                        "Approximate region".to_owned()
+                    } else {
+                        label
+                    },
+                })
+            });
 
             Some(MachineView {
                 peer_id: advertisement.peer_id.clone(),
@@ -2816,6 +2865,7 @@ fn machine_views_from_presence(
                 logical_cpu_cores: capabilities.logical_cpu_cores,
                 total_memory_bytes,
                 available_memory_bytes,
+                allocated_memory_bytes,
                 unified_memory: capabilities.unified_memory,
                 max_sessions: capabilities.max_sessions,
                 active_sessions: capabilities.active_sessions,
@@ -2824,6 +2874,7 @@ fn machine_views_from_presence(
                 measured_decode_tokens_per_second: capabilities.measured_decode_tokens_per_second,
                 hosted_component_count: hosted_components.len(),
                 rpc_ready,
+                coarse_location,
             })
         })
         .collect::<Vec<_>>();
@@ -3125,6 +3176,7 @@ fn local_cache_advertisement(
         hosted_shards,
         model_shards,
         model_components: Vec::new(),
+        coarse_location: None,
     })
 }
 
@@ -3993,6 +4045,9 @@ fn merge_peer_advertisement(existing: &mut NodeAdvertisement, peer: &NodeAdverti
     if peer.capabilities.is_some() {
         existing.capabilities = peer.capabilities.clone();
     }
+    if peer.coarse_location.is_some() {
+        existing.coarse_location = peer.coarse_location.clone();
+    }
 }
 
 fn default_bootstrap_peers() -> Result<Vec<NodeAdvertisement>, String> {
@@ -4285,11 +4340,33 @@ pub fn run() {
             }
             let identity_path = app_data_dir.join("identity.key");
             let keypair = load_or_generate_keypair(&identity_path)?;
+            let location_keypair = keypair.clone();
             *app_handle
                 .state::<UiState>()
                 .keypair
                 .lock()
                 .expect("UI identity lock poisoned during startup") = keypair;
+            tauri::async_runtime::spawn(async move {
+                let trusted_relays = vec![DEFAULT_RELAY_PEER_ID.to_owned()];
+                loop {
+                    match fetch_coarse_location_assertion(
+                        COARSE_LOCATION_ENDPOINT,
+                        &location_keypair,
+                        &trusted_relays,
+                    )
+                    .await
+                    {
+                        Ok(assertion) => {
+                            set_local_coarse_location(Some(assertion));
+                            sleep(Duration::from_secs(3 * 60 * 60)).await;
+                        }
+                        Err(error) => {
+                            eprintln!("failed to refresh relay-signed coarse location: {error:#}");
+                            sleep(Duration::from_secs(5 * 60)).await;
+                        }
+                    }
+                }
+            });
             let cache_config = cache_config_for_app(app.handle());
             tauri::async_runtime::spawn(async move {
                 let state = app_handle.state::<UiState>();
@@ -4712,6 +4789,23 @@ mod tests {
         assert!(machines[0].max_sessions > 0);
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn machine_view_reports_configured_accelerator_allocation_not_free_memory() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let mut advertisement = eligible_image_advertisement("peer-a", "machine-a");
+        advertisement
+            .capabilities
+            .as_mut()
+            .unwrap()
+            .vram_contribution_limit_bytes = Some(8 * GIB);
+
+        let machines = machine_views(&[advertisement], "local-peer");
+
+        assert_eq!(machines[0].total_memory_bytes, 16 * GIB);
+        assert_eq!(machines[0].available_memory_bytes, 12 * GIB);
+        assert_eq!(machines[0].allocated_memory_bytes, 8 * GIB);
     }
 
     #[test]

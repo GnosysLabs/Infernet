@@ -3129,21 +3129,6 @@ select:focus-visible {
   font-size: 11px;
 }
 
-.network-capacity-meter {
-  height: 5px;
-  border-radius: 999px;
-  background: var(--surface-2);
-  overflow: hidden;
-}
-
-.network-capacity-meter span {
-  height: 100%;
-  border-radius: inherit;
-  background: var(--soft);
-  display: block;
-  transition: width 220ms cubic-bezier(0.22, 1, 0.36, 1);
-}
-
 .network-fact-list {
   margin: 0;
   padding: 0;

@@ -53,6 +53,7 @@ export interface MachineView {
   logicalCpuCores: number;
   totalMemoryBytes: number;
   availableMemoryBytes: number;
+  allocatedMemoryBytes: number;
   unifiedMemory: boolean;
   maxSessions: number;
   activeSessions: number;
@@ -60,6 +61,11 @@ export interface MachineView {
   measuredPrefillTokensPerSecond?: number | null;
   measuredDecodeTokensPerSecond?: number | null;
   hostedComponentCount: number;
+  coarseLocation?: {
+    latitude: number;
+    longitude: number;
+    label: string;
+  } | null;
   rpcReady: boolean;
 }
 

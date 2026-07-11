@@ -232,6 +232,42 @@ pub struct NodeAdvertisement {
     pub model_shards: Vec<ModelShardInfo>,
     #[serde(default)]
     pub model_components: Vec<ModelComponentInfo>,
+    /// Short-lived, relay-signed display metadata. It is never consulted for
+    /// routing, placement, eligibility, or machine identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coarse_location: Option<CoarseLocationAssertion>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoarseLocationAssertion {
+    pub version: u32,
+    pub subject_peer_id: String,
+    pub latitude_e4: i32,
+    pub longitude_e4: i32,
+    pub region: String,
+    pub country: String,
+    pub issued_at_ms: u64,
+    pub expires_at_ms: u64,
+    pub relay_peer_id: String,
+    pub relay_public_key: Vec<u8>,
+    pub signature: Vec<u8>,
+}
+
+impl CoarseLocationAssertion {
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        format!(
+            "infernet-coarse-location-v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            self.subject_peer_id,
+            self.latitude_e4,
+            self.longitude_e4,
+            self.region,
+            self.country,
+            self.issued_at_ms,
+            self.expires_at_ms,
+            self.relay_peer_id,
+        )
+        .into_bytes()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -606,6 +642,7 @@ mod tests {
             hosted_shards: Vec::new(),
             model_shards: Vec::new(),
             model_components: Vec::new(),
+            coarse_location: None,
         };
 
         let bytes = serde_json::to_vec(&advertisement).unwrap();

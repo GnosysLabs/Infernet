@@ -1,18 +1,24 @@
 use std::{
     env, fs,
-    net::{IpAddr, Ipv4Addr, TcpListener, UdpSocket},
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, UdpSocket},
     path::PathBuf,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use anyhow::{Context, Result, anyhow};
+use axum::{
+    Json, Router,
+    extract::{ConnectInfo, State},
+    http::{HeaderMap, StatusCode},
+    routing::post,
+};
 use clap::{Args, Parser, Subcommand};
 use infernet_model::{
     GgufShardManifest, GgufSourceMetadata, LayerRange, ModelManifest, OfficialModelRelease,
     RuntimeKind, ShardDescriptor, ShardMetadata, TokenizerCompatibility, gguf,
 };
 use infernet_node::{
-    DiscoveryConfig, INFERNET_LLAMA_RPC_RUNTIME_ABI, LLAMA_RPC_DEFAULT_PORT,
+    CoarseLocationRequest, DiscoveryConfig, INFERNET_LLAMA_RPC_RUNTIME_ABI, LLAMA_RPC_DEFAULT_PORT,
     LLAMA_RPC_PROTOCOL_VERSION, LlamaRpcServer, LlamaRpcServerConfig, ShardCache, ShardCacheConfig,
     WorkerConfig, clear_local_llama_rpc_endpoint, detect_node_capabilities, discover_for,
     empty_advertisement, enrich_local_advertisement, fetch_model_shard_over_libp2p,
@@ -21,13 +27,14 @@ use infernet_node::{
     infer_over_libp2p, load_or_generate_keypair, local_capability_advertisement,
     run_model_distribution_node, run_worker_node, set_local_inference_active,
     set_local_llama_rpc_endpoint, set_local_rpc_active, spawn_llama_rpc_server,
-    stop_persistent_llama_server,
+    stop_persistent_llama_server, verify_coarse_location_request,
 };
 use infernet_protocol::{
-    ACTIVATION_PROTOCOL, LLAMA_RPC_TUNNEL_PROTOCOL, LlamaRpcEndpoint, ModelShardInfo,
-    NodeAdvertisement, NodeCapabilities, RouteHop,
+    ACTIVATION_PROTOCOL, CoarseLocationAssertion, LLAMA_RPC_TUNNEL_PROTOCOL, LlamaRpcEndpoint,
+    ModelShardInfo, NodeAdvertisement, NodeCapabilities, RouteHop,
 };
 use infernet_router::ShardRegistry;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 const DEFAULT_TOPIC: &str = "infernet/grid-demo/1";
@@ -68,6 +75,23 @@ struct BootstrapArgs {
     public_domain: Option<String>,
     #[arg(long)]
     public_ip: Option<String>,
+    #[arg(long, default_value = "127.0.0.1:9778")]
+    location_listen: SocketAddr,
+}
+
+#[derive(Clone)]
+struct LocationServiceState {
+    keypair: libp2p::identity::Keypair,
+    client: reqwest::Client,
+}
+
+#[derive(Deserialize)]
+struct GeoIpResponse {
+    success: Option<bool>,
+    region: Option<String>,
+    country: Option<String>,
+    latitude: Option<f64>,
+    longitude: Option<f64>,
 }
 
 #[derive(Debug, Args)]
@@ -275,8 +299,7 @@ async fn main() -> Result<()> {
             let requester_machine_id = detect_node_capabilities()
                 .machine_id
                 .ok_or_else(|| anyhow!("could not determine this computer's stable identity"))?;
-            let route =
-                registry.execution_route_for_model(&manifest, &requester_machine_id)?;
+            let route = registry.execution_route_for_model(&manifest, &requester_machine_id)?;
             print_route(&route);
             Ok(())
         }
@@ -297,6 +320,7 @@ async fn main() -> Result<()> {
 
 async fn bootstrap(args: BootstrapArgs) -> Result<()> {
     let keypair = load_or_generate_keypair(&args.identity_file)?;
+    let location_keypair = keypair.clone();
     let peer_id = keypair.public().to_peer_id().to_string();
     let tcp_port = tcp_port_from_multiaddr(&args.p2p_listen).unwrap_or("9777");
     let mut discovery = DiscoveryConfig::new(args.topic);
@@ -307,8 +331,10 @@ async fn bootstrap(args: BootstrapArgs) -> Result<()> {
     discovery.relay_advertisements = true;
     discovery.relay_server = true;
 
-    let mut bootstrap_advertisement =
-        local_capability_advertisement(peer_id.clone(), String::new());
+    // The public bootstrap is transport infrastructure, not an inference
+    // participant. Advertising host capabilities would make clients render
+    // the relay as an eligible-looking computer in the Network view.
+    let mut bootstrap_advertisement = empty_advertisement(peer_id.clone(), String::new());
     if let Some(ip) = args.public_ip.as_deref() {
         bootstrap_advertisement
             .addresses
@@ -342,8 +368,9 @@ async fn bootstrap(args: BootstrapArgs) -> Result<()> {
         println!("public_quic_multiaddr=/ip4/{ip}/udp/{tcp_port}/quic-v1/p2p/{peer_id}");
     }
     println!("relay_protocol=/libp2p/circuit/relay/0.2.0/hop");
+    println!("coarse_location_listen={}", args.location_listen);
 
-    run_model_distribution_node(
+    let relay = run_model_distribution_node(
         discovery,
         ShardCacheConfig {
             root: args.cache_dir,
@@ -352,8 +379,131 @@ async fn bootstrap(args: BootstrapArgs) -> Result<()> {
             pinned_models: Vec::new(),
             automatic_cleanup: true,
         },
+    );
+    let location_service = run_location_service(args.location_listen, location_keypair);
+    tokio::try_join!(relay, location_service)?;
+    Ok(())
+}
+
+async fn run_location_service(
+    listen: SocketAddr,
+    keypair: libp2p::identity::Keypair,
+) -> Result<()> {
+    if !listen.ip().is_loopback() {
+        return Err(anyhow!(
+            "coarse-location HTTP service must bind to loopback"
+        ));
+    }
+    let state = LocationServiceState {
+        keypair,
+        client: reqwest::Client::builder()
+            .timeout(Duration::from_secs(8))
+            .build()?,
+    };
+    let app = Router::new()
+        .route(
+            "/.well-known/infernet/coarse-location",
+            post(issue_coarse_location),
+        )
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind(listen).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .await
+    .await?;
+    Ok(())
+}
+
+async fn issue_coarse_location(
+    State(state): State<LocationServiceState>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(request): Json<CoarseLocationRequest>,
+) -> std::result::Result<Json<CoarseLocationAssertion>, (StatusCode, String)> {
+    let now_ms = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    verify_coarse_location_request(&request, now_ms)
+        .map_err(|error| (StatusCode::UNAUTHORIZED, error.to_string()))?;
+    let observed_ip = forwarded_ip(&headers, remote).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "missing observed public IP".to_owned(),
+        )
+    })?;
+    let response = state
+        .client
+        .get(format!("https://ipwho.is/{observed_ip}"))
+        .query(&[("fields", "success,region,country,latitude,longitude")])
+        .send()
+        .await
+        .map_err(internal_location_error)?
+        .error_for_status()
+        .map_err(internal_location_error)?
+        .json::<GeoIpResponse>()
+        .await
+        .map_err(internal_location_error)?;
+    let latitude = response.latitude.filter(|value| value.is_finite());
+    let longitude = response.longitude.filter(|value| value.is_finite());
+    if response.success != Some(true) || latitude.is_none() || longitude.is_none() {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "GeoIP lookup was unavailable".to_owned(),
+        ));
+    }
+    let coarse_e4 = |value: f64| (((value * 2.0).round() / 2.0) * 10_000.0) as i32;
+    let clean = |value: Option<String>| {
+        value
+            .unwrap_or_default()
+            .replace(['\n', '\r'], " ")
+            .chars()
+            .take(96)
+            .collect::<String>()
+    };
+    let relay_peer_id = state.keypair.public().to_peer_id().to_string();
+    let mut assertion = CoarseLocationAssertion {
+        version: 1,
+        subject_peer_id: request.peer_id,
+        latitude_e4: coarse_e4(latitude.unwrap()),
+        longitude_e4: coarse_e4(longitude.unwrap()),
+        region: clean(response.region),
+        country: clean(response.country),
+        issued_at_ms: now_ms,
+        expires_at_ms: now_ms + 6 * 60 * 60 * 1_000,
+        relay_peer_id,
+        relay_public_key: state.keypair.public().encode_protobuf(),
+        signature: Vec::new(),
+    };
+    assertion.signature = state
+        .keypair
+        .sign(&assertion.signing_bytes())
+        .map_err(internal_location_error)?;
+    Ok(Json(assertion))
+}
+
+fn forwarded_ip(headers: &HeaderMap, remote: SocketAddr) -> Option<IpAddr> {
+    if !remote.ip().is_loopback() {
+        return Some(remote.ip());
+    }
+    headers
+        .get("x-forwarded-for")?
+        .to_str()
+        .ok()?
+        .split(',')
+        .next()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn internal_location_error(error: impl std::fmt::Display) -> (StatusCode, String) {
+    eprintln!("coarse-location service error: {error}");
+    (
+        StatusCode::BAD_GATEWAY,
+        "Coarse location is temporarily unavailable".to_owned(),
+    )
 }
 
 fn add_local_model(args: ModelAddLocalArgs) -> Result<()> {
@@ -601,12 +751,8 @@ fn parse_static_peer(input: &str, manifest: &ModelManifest) -> Result<NodeAdvert
         .ok_or_else(|| anyhow!("static peer must include #start:end"))?;
     let layers = parse_layer_range(layers)?;
 
-    let mut advertisement = shard_descriptor_advertisement(
-        peer.to_owned(),
-        address.to_owned(),
-        manifest,
-        layers,
-    );
+    let mut advertisement =
+        shard_descriptor_advertisement(peer.to_owned(), address.to_owned(), manifest, layers);
     advertisement.capabilities = machine_id.map(static_peer_capabilities);
     Ok(advertisement)
 }

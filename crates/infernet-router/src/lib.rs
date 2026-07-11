@@ -1272,6 +1272,7 @@ mod tests {
             }],
             model_shards: Vec::new(),
             model_components: Vec::new(),
+            coarse_location: None,
         }
     }
 
@@ -1291,6 +1292,7 @@ mod tests {
             hosted_shards: vec![ShardDescriptor::for_manifest(manifest, layers)],
             model_shards: Vec::new(),
             model_components: Vec::new(),
+            coarse_location: None,
         }
     }
 
@@ -1337,6 +1339,7 @@ mod tests {
             hosted_shards: Vec::new(),
             model_shards: Vec::new(),
             model_components: Vec::new(),
+            coarse_location: None,
         }
     }
 
@@ -1370,6 +1373,7 @@ mod tests {
             )],
             model_shards: Vec::new(),
             model_components: Vec::new(),
+            coarse_location: None,
         }
     }
 

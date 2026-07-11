@@ -1272,12 +1272,6 @@ function AppHeader({
           active={page === "network"}
           onClick={() => onNavigate("network")}
         />
-        <HeaderIconButton
-          icon={<Settings size={17} />}
-          label="Settings"
-          active={page === "settings"}
-          onClick={() => onNavigate("settings")}
-        />
         <button
           className={page === "activity" ? "activity-toggle active" : "activity-toggle"}
           type="button"
@@ -1289,6 +1283,12 @@ function AppHeader({
           <Activity size={16} />
           {hasActiveWork ? <i aria-hidden="true" /> : null}
         </button>
+        <HeaderIconButton
+          icon={<Settings size={17} />}
+          label="Settings"
+          active={page === "settings"}
+          onClick={() => onNavigate("settings")}
+        />
       </div>
     </header>
   );
@@ -2036,7 +2036,7 @@ type NodeLocation = {
   latitude: number;
   longitude: number;
   label: string;
-  source: "geoip" | "illustrative";
+  source: "relay" | "illustrative";
 };
 
 type GeoPoint = [longitude: number, latitude: number];
@@ -2050,12 +2050,8 @@ function NetworkPage({ snapshot }: { snapshot: GridSnapshot }) {
   );
   const readyWorkers = onlineMachines.filter((machine) => machine.rpcReady);
   const modelHosts = onlineMachines.filter((machine) => machine.hostedComponentCount > 0);
-  const availableComputeBytes = acceleratorMachines.reduce(
-    (total, machine) => total + machine.availableMemoryBytes,
-    0,
-  );
-  const totalComputeBytes = acceleratorMachines.reduce(
-    (total, machine) => total + machine.totalMemoryBytes,
+  const allocatedComputeBytes = acceleratorMachines.reduce(
+    (total, machine) => total + machine.allocatedMemoryBytes,
     0,
   );
   const activeSessions = onlineMachines.reduce((total, machine) => total + machine.activeSessions, 0);
@@ -2066,21 +2062,25 @@ function NetworkPage({ snapshot }: { snapshot: GridSnapshot }) {
   const coveragePercent = snapshot.coverage.length > 0
     ? Math.round((coveredLayers / snapshot.coverage.length) * 100)
     : 0;
-  const capacityFreePercent = totalComputeBytes > 0
-    ? Math.round((availableComputeBytes / totalComputeBytes) * 100)
-    : 0;
-  const backendSummaries = ["cuda", "metal", "cpu"].map((backend) => {
+  const backendSummaries = ["cuda", "metal"].map((backend) => {
     const machines = onlineMachines.filter((machine) => machine.computeBackend === backend);
     return {
       backend,
       machines,
-      availableBytes: machines.reduce((total, machine) => total + machine.availableMemoryBytes, 0),
-      totalBytes: machines.reduce((total, machine) => total + machine.totalMemoryBytes, 0),
+      allocatedBytes: machines.reduce((total, machine) => total + machine.allocatedMemoryBytes, 0),
     };
   }).filter((summary) => summary.machines.length > 0);
-  const { locations, isLocating } = useNodeLocations(onlineMachines);
+  const locations = useMemo(
+    () => Object.fromEntries(onlineMachines.map((machine) => [
+      networkMachineKey(machine),
+      machine.coarseLocation
+        ? { ...machine.coarseLocation, source: "relay" as const }
+        : illustrativeNodeLocation(machine),
+    ])),
+    [onlineMachines],
+  );
   const locatedNodeCount = Object.values(locations).filter(
-    (location) => location.source === "geoip",
+    (location) => location.source === "relay",
   ).length;
 
   return (
@@ -2090,7 +2090,7 @@ function NetworkPage({ snapshot }: { snapshot: GridSnapshot }) {
           machines={onlineMachines}
           locations={locations}
           locatedNodeCount={locatedNodeCount}
-          isLocating={isLocating}
+          isLocating={false}
         />
 
         <section className="network-pulse" aria-labelledby="network-pulse-title">
@@ -2107,23 +2107,18 @@ function NetworkPage({ snapshot }: { snapshot: GridSnapshot }) {
           </h2>
           <p>
             {onlineMachines.length > 0
-              ? "A clear view of the capacity Infernet can use right now, without exposing precise device locations."
-              : "Online computers and their available capacity will appear here as Infernet discovers them."}
+              ? "A clear view of the accelerator capacity committed to Infernet."
+              : "Online computers and their allocated capacity will appear here as Infernet discovers them."}
           </p>
 
           <dl className="network-capacity-ledger">
             <div className="network-memory-fact">
               <dt>
                 <MemoryStick size={17} />
-                <span>Available VRAM + unified memory</span>
+                <span>VRAM + unified memory allocated</span>
               </dt>
               <dd>
-                <strong>{formatBytes(availableComputeBytes)}</strong>
-                <span>
-                  {totalComputeBytes > 0
-                    ? `${capacityFreePercent}% free of ${formatBytes(totalComputeBytes)}`
-                    : "Waiting for accelerator capacity"}
-                </span>
+                <strong>{formatBytes(allocatedComputeBytes)}</strong>
               </dd>
             </div>
             <NetworkPulseRow
@@ -2158,27 +2153,19 @@ function NetworkPage({ snapshot }: { snapshot: GridSnapshot }) {
 
           {backendSummaries.length > 0 ? (
             <div className="network-backend-list">
-              {backendSummaries.map((summary) => {
-                const availablePercent = summary.totalBytes > 0
-                  ? Math.round((summary.availableBytes / summary.totalBytes) * 100)
-                  : 0;
-                return (
+              {backendSummaries.map((summary) => (
                   <div className="network-backend-row" key={summary.backend}>
                     <div className="network-backend-copy">
                       <span className="machine-backend">{machineBackendLabel(summary.backend)}</span>
                       <div>
                         <strong>{summary.machines.length} node{summary.machines.length === 1 ? "" : "s"}</strong>
                         <span>
-                          {formatBytes(summary.availableBytes)} {summary.backend === "cpu" ? "RAM" : "available"}
+                          {formatBytes(summary.allocatedBytes)} allocated
                         </span>
                       </div>
                     </div>
-                    <div className="network-capacity-meter" aria-label={`${availablePercent}% available`}>
-                      <span style={{ width: `${availablePercent}%` }} />
-                    </div>
                   </div>
-                );
-              })}
+              ))}
             </div>
           ) : (
             <div className="network-empty-inline">
@@ -2211,7 +2198,7 @@ function NetworkPage({ snapshot }: { snapshot: GridSnapshot }) {
               <span>Nodes</span>
               <h3 id="network-node-directory-title">Visible computers</h3>
             </div>
-            <small>{locatedNodeCount} IP-located</small>
+            <small>{locatedNodeCount} relay-verified</small>
           </div>
 
           {onlineMachines.length > 0 ? (
@@ -2227,8 +2214,8 @@ function NetworkPage({ snapshot }: { snapshot: GridSnapshot }) {
                     </span>
                   </div>
                   <div className="network-node-capacity">
-                    <strong>{formatBytes(machine.availableMemoryBytes)}</strong>
-                    <span>{machine.unifiedMemory ? "unified memory free" : "available"}</span>
+                    <strong>{formatBytes(machine.allocatedMemoryBytes)}</strong>
+                    <span>{machine.unifiedMemory ? "unified memory allocated" : "allocated to Infernet"}</span>
                   </div>
                 </div>
               ))}
@@ -2291,13 +2278,18 @@ function NetworkGlobe({
       return {
         location: [location.latitude, location.longitude],
         size: machine.rpcReady ? 0.055 : 0.038,
-        color: location.source === "geoip"
+        color: location.source === "relay"
           ? [0.96, 0.96, 0.96]
           : [0.52, 0.52, 0.52],
       };
     }),
     [locations, machines],
   );
+  const markersRef = useRef(markers);
+
+  useEffect(() => {
+    markersRef.current = markers;
+  }, [markers]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -2323,7 +2315,7 @@ function NetworkGlobe({
       baseColor: [0.32, 0.32, 0.32],
       markerColor: [0.96, 0.96, 0.96],
       glowColor: [0.12, 0.12, 0.12],
-      markers,
+      markers: markersRef.current,
       markerElevation: 0.035,
       opacity: 0.76,
       scale: 0.98,
@@ -2343,8 +2335,8 @@ function NetworkGlobe({
     const animate = (now: number) => {
       const delta = Math.min(50, now - lastTime);
       lastTime = now;
-      phi = (phi + (delta * Math.PI * 2) / 64000) % (Math.PI * 2);
-      globe.update({ phi });
+      phi += (delta * Math.PI * 2) / 64000;
+      globe.update({ phi, markers: markersRef.current });
       frame = window.requestAnimationFrame(animate);
     };
     if (!reducedMotion) frame = window.requestAnimationFrame(animate);
@@ -2354,7 +2346,7 @@ function NetworkGlobe({
       resizeObserver.disconnect();
       globe.destroy();
     };
-  }, [markers]);
+  }, []);
 
   return (
     <figure className="network-globe-figure" aria-labelledby="network-globe-caption">
@@ -2368,170 +2360,13 @@ function NetworkGlobe({
         </div>
         <span>
           {isLocating
-            ? "Resolving public-IP regions"
+            ? "Resolving relay-verified regions"
             : locatedNodeCount > 0
-              ? `${locatedNodeCount} approximate IP location${locatedNodeCount === 1 ? "" : "s"}; private and relayed nodes are anonymized`
-              : "Private and relayed nodes use anonymous positions"}
+              ? `${locatedNodeCount} relay-verified approximate region${locatedNodeCount === 1 ? "" : "s"}`
+              : "Waiting for relay-verified approximate regions"}
         </span>
       </figcaption>
     </figure>
-  );
-}
-
-function useNodeLocations(machines: MachineView[]): {
-  locations: Record<string, NodeLocation>;
-  isLocating: boolean;
-} {
-  const [locations, setLocations] = useState<Record<string, NodeLocation>>(() =>
-    Object.fromEntries(machines.map((machine) => [networkMachineKey(machine), illustrativeNodeLocation(machine)])),
-  );
-  const [isLocating, setIsLocating] = useState(false);
-  const locationSignature = machines.map((machine) =>
-    `${networkMachineKey(machine)}:${machine.isLocal ? "local" : "remote"}:${machine.addresses.join(",")}`
-  ).join("|");
-
-  useEffect(() => {
-    const fallbackLocations = Object.fromEntries(
-      machines.map((machine) => [networkMachineKey(machine), illustrativeNodeLocation(machine)]),
-    );
-    setLocations(fallbackLocations);
-
-    const lookupTargets = machines.map((machine) => ({
-      machine,
-      ip: publicIpFromAddresses(machine.addresses),
-    })).filter((target) => target.ip || target.machine.isLocal);
-
-    if (lookupTargets.length === 0) {
-      setIsLocating(false);
-      return;
-    }
-
-    let disposed = false;
-    const controller = new AbortController();
-    setIsLocating(true);
-    Promise.all(lookupTargets.map(async ({ machine, ip }) => {
-      const location = await fetchGeoIpLocation(ip, controller.signal);
-      return { key: networkMachineKey(machine), location };
-    })).then((results) => {
-      if (disposed) return;
-      const resolved = results.reduce<Record<string, NodeLocation>>((next, result) => {
-        if (result.location) next[result.key] = result.location;
-        return next;
-      }, {});
-      setLocations((current) => ({ ...current, ...resolved }));
-    }).finally(() => {
-      if (!disposed) setIsLocating(false);
-    });
-
-    return () => {
-      disposed = true;
-      controller.abort();
-    };
-  }, [locationSignature]);
-
-  return { locations, isLocating };
-}
-
-async function fetchGeoIpLocation(ip: string | null, signal: AbortSignal): Promise<NodeLocation | null> {
-  const cacheKey = `infernet-geo-v1-${hashText(ip ?? "self").toString(16)}`;
-  try {
-    const cached = window.localStorage.getItem(cacheKey);
-    if (cached) {
-      const parsed = JSON.parse(cached) as NodeLocation & { cachedAt: number };
-      if (Date.now() - parsed.cachedAt < 7 * 24 * 60 * 60 * 1000) {
-        return parsed;
-      }
-    }
-  } catch {
-    // Location caching is an optimization; lookup still works without storage.
-  }
-
-  try {
-    const fields = "success,city,region,country,latitude,longitude";
-    const endpoint = ip
-      ? `https://ipwho.is/${encodeURIComponent(ip)}?fields=${fields}`
-      : `https://ipwho.is/?fields=${fields}`;
-    const response = await fetch(endpoint, { signal, referrerPolicy: "no-referrer" });
-    if (!response.ok) return null;
-    const data = await response.json() as {
-      success?: boolean;
-      city?: string;
-      region?: string;
-      country?: string;
-      latitude?: number;
-      longitude?: number;
-    };
-    if (
-      data.success !== true
-      || !Number.isFinite(data.latitude)
-      || !Number.isFinite(data.longitude)
-    ) {
-      return null;
-    }
-    const labelParts = [...new Set([data.city, data.region, data.country].filter(Boolean))];
-    const location: NodeLocation = {
-      latitude: data.latitude as number,
-      longitude: data.longitude as number,
-      label: labelParts.join(", ") || "Approximate public-IP region",
-      source: "geoip",
-    };
-    try {
-      window.localStorage.setItem(cacheKey, JSON.stringify({ ...location, cachedAt: Date.now() }));
-    } catch {
-      // Keep the in-memory result if persistent storage is unavailable.
-    }
-    return location;
-  } catch {
-    return null;
-  }
-}
-
-function publicIpFromAddresses(addresses: string[]): string | null {
-  for (const address of addresses) {
-    if (address.includes("/p2p-circuit")) continue;
-    const parts = address.split("/").filter(Boolean);
-    for (let index = 0; index < parts.length - 1; index += 1) {
-      if (parts[index] !== "ip4" && parts[index] !== "ip6") continue;
-      const ip = parts[index + 1];
-      if (isPublicIp(ip)) return ip;
-    }
-  }
-  return null;
-}
-
-function isPublicIp(ip: string): boolean {
-  if (ip.includes(".")) {
-    const octets = ip.split(".").map(Number);
-    if (octets.length !== 4 || octets.some((octet) => !Number.isInteger(octet) || octet < 0 || octet > 255)) {
-      return false;
-    }
-    const [a, b, c] = octets;
-    return !(
-      a === 0
-      || a === 10
-      || a === 127
-      || (a === 100 && b >= 64 && b <= 127)
-      || (a === 169 && b === 254)
-      || (a === 172 && b >= 16 && b <= 31)
-      || (a === 192 && b === 168)
-      || (a === 192 && b === 0 && (c === 0 || c === 2))
-      || (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100)))
-      || (a === 203 && b === 0 && c === 113)
-      || a >= 224
-    );
-  }
-
-  if (!ip.includes(":")) return false;
-  const normalized = ip.toLowerCase();
-  if (normalized.startsWith("::ffff:")) return isPublicIp(normalized.slice(7));
-  return !(
-    normalized === "::"
-    || normalized === "::1"
-    || normalized.startsWith("fc")
-    || normalized.startsWith("fd")
-    || /^fe[89ab]/.test(normalized)
-    || normalized.startsWith("ff")
-    || normalized.startsWith("2001:db8")
   );
 }
 

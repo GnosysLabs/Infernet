@@ -598,6 +598,7 @@ mod tests {
             }],
             model_shards: Vec::new(),
             model_components: Vec::new(),
+            coarse_location: None,
         }
     }
 }

@@ -31,10 +31,10 @@ use infernet_model::{
     SeedShardManifest, ShardDescriptor,
 };
 use infernet_protocol::{
-    ACTIVATION_PROTOCOL, ActivationRequest, ActivationResponse, IMAGE_RPC_TUNNEL_PROTOCOL,
-    MIN_DISTRIBUTED_MACHINE_COUNT, MODEL_BLOB_PROTOCOL, MODEL_PROTOCOL, ModelBlobRequest,
-    ModelBlobResponse, ModelShardInfo, ModelShardRequest, ModelShardResponse, NodeAdvertisement,
-    PROTOCOL_VERSION, PromptMetadata, RouteHop, TraceEvent,
+    ACTIVATION_PROTOCOL, ActivationRequest, ActivationResponse, CoarseLocationAssertion,
+    IMAGE_RPC_TUNNEL_PROTOCOL, MIN_DISTRIBUTED_MACHINE_COUNT, MODEL_BLOB_PROTOCOL, MODEL_PROTOCOL,
+    ModelBlobRequest, ModelBlobResponse, ModelShardInfo, ModelShardRequest, ModelShardResponse,
+    NodeAdvertisement, PROTOCOL_VERSION, PromptMetadata, RouteHop, TraceEvent,
 };
 use infernet_router::{RouterError, ShardRegistry, validate_execution_route};
 use infernet_runtime::{DemoRuntime, LayerRuntime, activation_checksum};
@@ -63,7 +63,7 @@ pub use model_distribution::{
     is_executable_shard_record, seed_manifest_for_network, sha256_bytes, sha256_file,
     source_cache_path, source_cache_root,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::time::{Instant, interval, sleep};
 
 pub use capabilities::{
@@ -95,6 +95,126 @@ pub use stable_diffusion_runtime::{
 
 pub type ModelDistributionReadiness = oneshot::Sender<std::result::Result<String, String>>;
 pub type ModelDistributionRegistryObserver = Arc<dyn Fn(ShardRegistry) + Send + Sync>;
+static LOCAL_COARSE_LOCATION: OnceLock<Mutex<Option<CoarseLocationAssertion>>> = OnceLock::new();
+
+pub fn set_local_coarse_location(assertion: Option<CoarseLocationAssertion>) {
+    if let Ok(mut current) = LOCAL_COARSE_LOCATION
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+    {
+        *current = assertion;
+    }
+}
+
+fn local_coarse_location() -> Option<CoarseLocationAssertion> {
+    LOCAL_COARSE_LOCATION
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|current| current.clone())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoarseLocationRequest {
+    pub version: u32,
+    pub peer_id: String,
+    pub public_key: Vec<u8>,
+    pub timestamp_ms: u64,
+    pub signature: Vec<u8>,
+}
+
+impl CoarseLocationRequest {
+    pub fn signing_bytes(peer_id: &str, timestamp_ms: u64) -> Vec<u8> {
+        format!("infernet-coarse-location-request-v1\n{peer_id}\n{timestamp_ms}").into_bytes()
+    }
+
+    pub fn new(keypair: &identity::Keypair, timestamp_ms: u64) -> Result<Self> {
+        let peer_id = keypair.public().to_peer_id().to_string();
+        let public_key = keypair.public().encode_protobuf();
+        let signature = keypair
+            .sign(&Self::signing_bytes(&peer_id, timestamp_ms))
+            .context("failed to sign coarse-location request")?;
+        Ok(Self {
+            version: 1,
+            peer_id,
+            public_key,
+            timestamp_ms,
+            signature,
+        })
+    }
+}
+
+pub fn verify_coarse_location_request(request: &CoarseLocationRequest, now_ms: u64) -> Result<()> {
+    if request.version != 1 || now_ms.abs_diff(request.timestamp_ms) > 5 * 60 * 1_000 {
+        bail!("coarse-location request is expired or unsupported");
+    }
+    let public_key = identity::PublicKey::try_decode_protobuf(&request.public_key)
+        .context("invalid coarse-location requester public key")?;
+    if public_key.to_peer_id().to_string() != request.peer_id
+        || !public_key.verify(
+            &CoarseLocationRequest::signing_bytes(&request.peer_id, request.timestamp_ms),
+            &request.signature,
+        )
+    {
+        bail!("invalid coarse-location requester signature");
+    }
+    Ok(())
+}
+
+pub fn verify_coarse_location_assertion(
+    assertion: &CoarseLocationAssertion,
+    subject_peer_id: &str,
+    trusted_relay_peer_ids: &[String],
+    now_ms: u64,
+) -> Result<()> {
+    if assertion.version != 1
+        || assertion.subject_peer_id != subject_peer_id
+        || assertion.issued_at_ms > now_ms.saturating_add(60_000)
+        || assertion.expires_at_ms <= now_ms
+        || assertion
+            .expires_at_ms
+            .saturating_sub(assertion.issued_at_ms)
+            > 24 * 60 * 60 * 1_000
+        || !(-900_000..=900_000).contains(&assertion.latitude_e4)
+        || !(-1_800_000..=1_800_000).contains(&assertion.longitude_e4)
+        || assertion.region.chars().count() > 96
+        || assertion.country.chars().count() > 96
+        || assertion.region.contains(['\n', '\r'])
+        || assertion.country.contains(['\n', '\r'])
+        || !trusted_relay_peer_ids.contains(&assertion.relay_peer_id)
+    {
+        bail!("invalid or expired coarse-location assertion");
+    }
+    let public_key = identity::PublicKey::try_decode_protobuf(&assertion.relay_public_key)
+        .context("invalid coarse-location relay public key")?;
+    if public_key.to_peer_id().to_string() != assertion.relay_peer_id
+        || !public_key.verify(&assertion.signing_bytes(), &assertion.signature)
+    {
+        bail!("invalid coarse-location relay signature");
+    }
+    Ok(())
+}
+
+pub async fn fetch_coarse_location_assertion(
+    endpoint: &str,
+    keypair: &identity::Keypair,
+    trusted_relay_peer_ids: &[String],
+) -> Result<CoarseLocationAssertion> {
+    let now_ms = model_serving_now_unix_ms();
+    let request = CoarseLocationRequest::new(keypair, now_ms)?;
+    let assertion = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?
+        .post(endpoint)
+        .json(&request)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<CoarseLocationAssertion>()
+        .await?;
+    verify_coarse_location_assertion(&assertion, &request.peer_id, trusted_relay_peer_ids, now_ms)?;
+    Ok(assertion)
+}
 
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
@@ -2707,6 +2827,7 @@ pub fn demo_advertisement(
         hosted_shards: vec![ShardDescriptor::demo(model_id, layers)],
         model_shards: Vec::new(),
         model_components: Vec::new(),
+        coarse_location: None,
     })
 }
 
@@ -2732,6 +2853,7 @@ pub fn shard_advertisement(
         hosted_shards: vec![ShardDescriptor::for_manifest(manifest, layers)],
         model_shards: Vec::new(),
         model_components: Vec::new(),
+        coarse_location: None,
     })
 }
 
@@ -2752,6 +2874,7 @@ pub fn empty_advertisement(peer_id: String, address: String) -> NodeAdvertisemen
         hosted_shards: Vec::new(),
         model_shards: Vec::new(),
         model_components: Vec::new(),
+        coarse_location: None,
     }
 }
 
@@ -2780,6 +2903,8 @@ pub fn refresh_local_advertisement_capabilities(
         .then_some(capabilities.available_accelerator_memory_bytes);
     advertisement.capabilities = Some(capabilities);
     advertisement.model_components = capabilities::local_model_components();
+    advertisement.coarse_location =
+        local_coarse_location().filter(|assertion| assertion.subject_peer_id == local_peer_id);
     true
 }
 
@@ -5359,7 +5484,12 @@ fn publish_local_advertisement(
         return Ok(());
     };
 
-    refresh_local_advertisement_capabilities(advertisement, local_peer_id);
+    // Capability-bearing nodes refresh their changing hardware/session state.
+    // Connection-only infrastructure (such as the public relay) deliberately
+    // starts without capabilities and must remain transport-only.
+    if advertisement.capabilities.is_some() {
+        refresh_local_advertisement_capabilities(advertisement, local_peer_id);
+    }
     for shard in &mut advertisement.hosted_shards {
         shard.resident = persistent_infernet_worker_is_resident(&shard.model_id, shard.layers);
     }
@@ -5695,6 +5825,84 @@ fn log_hop(trace_id: uuid::Uuid, event: &TraceEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relay_signed_coarse_location_is_bound_to_subject_and_expiry() {
+        let relay = identity::Keypair::generate_ed25519();
+        let subject = identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id()
+            .to_string();
+        let relay_peer_id = relay.public().to_peer_id().to_string();
+        let mut assertion = CoarseLocationAssertion {
+            version: 1,
+            subject_peer_id: subject.clone(),
+            latitude_e4: 340_000,
+            longitude_e4: -1_180_000,
+            region: "California".to_owned(),
+            country: "United States".to_owned(),
+            issued_at_ms: 1_000,
+            expires_at_ms: 2_000,
+            relay_peer_id: relay_peer_id.clone(),
+            relay_public_key: relay.public().encode_protobuf(),
+            signature: Vec::new(),
+        };
+        assertion.signature = relay.sign(&assertion.signing_bytes()).unwrap();
+
+        assert!(
+            verify_coarse_location_assertion(
+                &assertion,
+                &subject,
+                std::slice::from_ref(&relay_peer_id),
+                1_500,
+            )
+            .is_ok()
+        );
+        assert!(
+            verify_coarse_location_assertion(
+                &assertion,
+                "another-peer",
+                std::slice::from_ref(&relay_peer_id),
+                1_500,
+            )
+            .is_err()
+        );
+        assert!(
+            verify_coarse_location_assertion(&assertion, &subject, &[relay_peer_id], 2_000,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn coarse_location_request_proves_peer_identity() {
+        let keypair = identity::Keypair::generate_ed25519();
+        let mut request = CoarseLocationRequest::new(&keypair, 10_000).unwrap();
+        assert!(verify_coarse_location_request(&request, 10_100).is_ok());
+        request.peer_id = identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id()
+            .to_string();
+        assert!(verify_coarse_location_request(&request, 10_100).is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the live Infernet relay"]
+    async fn live_relay_issues_a_verifiable_coarse_location() {
+        let keypair = identity::Keypair::generate_ed25519();
+        let relay_peer_id = "12D3KooWRJrnpHPQTWdThpDGZMwRCHhEBL4JCAxFMwYMfFavxa2h".to_owned();
+        let assertion = fetch_coarse_location_assertion(
+            "https://infernet.gnosyslabs.xyz/.well-known/infernet/coarse-location",
+            &keypair,
+            std::slice::from_ref(&relay_peer_id),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(assertion.relay_peer_id, relay_peer_id);
+        assert_eq!(assertion.latitude_e4 % 5_000, 0);
+        assert_eq!(assertion.longitude_e4 % 5_000, 0);
+        assert!(!assertion.country.is_empty());
+    }
 
     fn worker(peer_id: &str, layers: LayerRange) -> WorkerConfig {
         WorkerConfig {
