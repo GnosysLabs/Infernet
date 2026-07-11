@@ -5,6 +5,9 @@ Infernet publishes two desktop installers:
 - Apple Silicon macOS: signed and notarized `Infernet_<version>_aarch64.dmg`.
 - Windows x64: unsigned current-user NSIS `Infernet_<version>_x64-setup.exe`.
 
+The release also contains signed updater archives and `latest.json`; users install
+the DMG or setup EXE rather than opening those updater-only files directly.
+
 There is intentionally no MSI build and no Windows Authenticode certificate. Windows users must choose **More info → Run anyway** the first time they install Infernet. Updater artifacts are still signed with Infernet's separate Tauri updater key.
 
 ## One-time GitHub secrets
